@@ -341,24 +341,148 @@ for drop_col in ["Jockey", "Trainer"]:
     if drop_col in metrics.columns:
         metrics = metrics.drop(columns=[drop_col])
 
-# ---- Group-class scoring (v3 with pace-pressure context) ----
-winner_time = None
-if "Finish_Pos" in metrics.columns and "RaceTime_s" in metrics.columns and not metrics["Finish_Pos"].isna().all():
-    try:
-        winner_time = metrics.loc[metrics["Finish_Pos"].idxmin(), "RaceTime_s"]
-    except Exception:
-        winner_time = None
+# ---- Distance-aware helpers ----
+def _distance_bucket(distance_m: float) -> str:
+    if distance_m <= 1400:
+        return "SPRINT"
+    if distance_m < 1800:
+        return "MILE"
+    if distance_m < 2200:
+        return "MIDDLE"
+    return "STAY"
 
-ctx = compute_pressure_context(metrics)
-spi_median = ctx["spi_median"]
-gci_scores, gci_reasons = [], []
-for _, r in metrics.iterrows():
-    gci, why = compute_gci_v3(r, ctx, winner_time_s=winner_time)
-    gci_scores.append(gci)
-    gci_reasons.append("; ".join(why))
-metrics["GCI"] = gci_scores
-metrics["GCI_Reasons"] = gci_reasons
-metrics["Group_Candidate"] = metrics["GCI"] >= 7.0
+def distance_profile(distance_m: float) -> dict:
+    """
+    Returns distance-specific weights and mapping parameters.
+    """
+    b = _distance_bucket(distance_m)
+    if b == "SPRINT":
+        return dict(
+            bucket=b,
+            wT=0.22, wPACE=0.38, wSS=0.20, wEFF=0.20,
+            lq_ref_w=0.70, lq_basic_w=0.30,
+            ss_lo=99.0, ss_hi=105.0,
+            lq_floor=0.35
+        )
+    if b == "STAY":
+        return dict(
+            bucket=b,
+            wT=0.30, wPACE=0.28, wSS=0.30, wEFF=0.12,
+            lq_ref_w=0.50, lq_basic_w=0.50,
+            ss_lo=97.5, ss_hi=104.5,
+            lq_floor=0.25
+        )
+    if b == "MIDDLE":
+        return dict(
+            bucket=b,
+            wT=0.27, wPACE=0.32, wSS=0.28, wEFF=0.13,
+            lq_ref_w=0.60, lq_basic_w=0.40,
+            ss_lo=98.0, ss_hi=105.0,
+            lq_floor=0.30
+        )
+    # MILE (default)
+    return dict(
+        bucket="MILE",
+        wT=0.25, wPACE=0.35, wSS=0.25, wEFF=0.15,
+        lq_ref_w=0.60, lq_basic_w=0.40,
+        ss_lo=98.0, ss_hi=105.0,
+        lq_floor=0.30
+    )
+
+def compute_gci_v31(row, ctx, distance_m: float, winner_time_s=None):
+    """
+    Distance-normalised, pace-pressure adjusted GCI on 0–10 scale.
+    Returns (score_0_10, reasons_list)
+    """
+    prof = distance_profile(float(distance_m))
+    reasons = [f"{prof['bucket'].title()} weighting"]
+
+    refined = row.get("Refined_FSP_%", np.nan)
+    basic   = row.get("Basic_FSP_%",   np.nan)
+    spi     = row.get("SPI_%",         np.nan)
+    epi     = row.get("EPI",           np.nan)
+    rtime   = row.get("RaceTime_s",    np.nan)
+
+    early_heat   = float(ctx.get("early_heat", 0.0))
+    pressure_rat = float(ctx.get("pressure_ratio", 0.0))
+    spi_median   = ctx.get("spi_median", np.nan)
+
+    fast_early  = (not pd.isna(spi_median)) and (spi_median >= 103)
+    sprint_home = (not pd.isna(spi_median)) and (spi_median <= 97)
+
+    # ---- T: Time vs winner
+    T = 0.0
+    if (winner_time_s is not None) and (not pd.isna(rtime)):
+        deficit = rtime - winner_time_s
+        if deficit <= 0.30:
+            T = 1.0; reasons.append("≤0.30s off winner")
+        elif deficit <= 0.60:
+            T = 0.7; reasons.append("0.31–0.60s off winner")
+        elif deficit <= 1.00:
+            T = 0.4; reasons.append("0.61–1.00s off winner")
+        else:
+            T = 0.2
+
+    # ---- LQ: Late Quality (distance-aware blend)
+    def map_pct(x): return max(0.0, min(1.0, (x - 98.0) / 6.0))  # 98→0, 104→1
+    LQ = 0.0
+    if not pd.isna(refined) and not pd.isna(basic):
+        LQ = prof["lq_ref_w"] * map_pct(refined) + prof["lq_basic_w"] * map_pct(basic)
+        if refined >= 103: reasons.append("strong late profile")
+        elif refined >= 101.5: reasons.append("useful late profile")
+
+    # ---- OP: On-pace merit (with pressure gates)
+    OP = 0.0
+    if not pd.isna(epi) and not pd.isna(basic):
+        on_speed = (epi <= 2.5)
+        handy    = (epi <= 3.5)
+        if handy and basic >= 99:
+            OP = 0.5
+        if on_speed and basic >= 100:
+            OP = max(OP, 0.7)
+        if on_speed and fast_early and (early_heat >= 0.7) and (pressure_rat >= 0.35) and basic >= 100:
+            OP = max(OP, 1.0); reasons.append("on-speed under genuine heat & pressure")
+
+    # ---- Leader Tax
+    LT = 0.0
+    if not pd.isna(epi) and epi <= 2.0:
+        soft_early = (early_heat < 0.5)
+        low_press  = (pressure_rat < 0.30)
+        weak_late  = (pd.isna(refined) or refined < 100.0) or (pd.isna(basic) or basic < 100.0)
+        if soft_early: LT += 0.25
+        if low_press:  LT += 0.20
+        if weak_late:  LT += 0.20
+        if sprint_home: LT += 0.15
+        LT = min(0.60, LT)
+        if LT > 0: reasons.append(f"leader tax applied ({LT:.2f})")
+
+    # ---- SS: Sustained speed (distance-aware mapping)
+    if pd.isna(spi) or pd.isna(basic):
+        SS = 0.0
+    else:
+        mean_sb = (spi + basic) / 2.0
+        SS = _to01(mean_sb, prof["ss_lo"], prof["ss_hi"])
+        if mean_sb >= (prof["ss_hi"] - 2.0):
+            reasons.append("strong sustained speed")
+
+    # ---- EFF: Efficiency
+    if pd.isna(refined):
+        EFF = 0.0
+    else:
+        EFF = max(0.0, 1.0 - abs(refined - 100.0) / 8.0)
+        if 99 <= refined <= 103: reasons.append("efficient sectional profile")
+
+    # ---- Combine pillars (distance-aware weights)
+    wT, wPACE, wSS, wEFF = prof["wT"], prof["wPACE"], prof["wSS"], prof["wEFF"]
+    PACE = max(LQ, OP) * (1.0 - LT)
+
+    # Late-quality floor varies by trip (sprinters need more genuine late work)
+    if LQ < prof["lq_floor"]:
+        PACE = min(PACE, 0.60)
+
+    score01 = (wT * T) + (wPACE * PACE) + (wSS * SS) + (wEFF * EFF)
+    score10 = round(10.0 * score01, 2)
+    return score10, reasons
 
 # ---------- Table ----------
 st.subheader("Sectional Metrics")
@@ -415,16 +539,26 @@ if sleepers.empty:
 else:
     st.dataframe(sleepers, use_container_width=True)
 
-# ---------- Group-class candidates ----------
-st.subheader("Potential Group-class candidates (GCI v3)")
-cands = metrics.loc[metrics["Group_Candidate"]].copy().sort_values(["GCI","Finish_Pos"], ascending=[False, True])
-if cands.empty:
-    st.write("No horses met the Group-class threshold today.")
-else:
-    st.dataframe(
-        round_display(cands[["Horse","Finish_Pos","RaceTime_s","Refined_FSP_%","Basic_FSP_%","SPI_%","Pos_Change","EPI","GCI","GCI_Reasons"]]),
-        use_container_width=True
-    )
+# ---- Group-class scoring (v3.1 distance-normalised) ----
+winner_time = None
+if "Finish_Pos" in metrics.columns and "RaceTime_s" in metrics.columns and not metrics["Finish_Pos"].isna().all():
+    try:
+        winner_time = metrics.loc[metrics["Finish_Pos"].idxmin(), "RaceTime_s"]
+    except Exception:
+        winner_time = None
+
+ctx = compute_pressure_context(metrics)
+spi_median = ctx["spi_median"]
+
+gci_scores, gci_reasons = [], []
+for _, r in metrics.iterrows():
+    gci, why = compute_gci_v31(r, ctx, distance_m=distance_m, winner_time_s=winner_time)  # <- NEW CALL
+    gci_scores.append(gci)
+    gci_reasons.append("; ".join(why))
+
+metrics["GCI"] = gci_scores
+metrics["GCI_Reasons"] = gci_reasons
+metrics["Group_Candidate"] = metrics["GCI"] >= 7.0
 
 # ---------- Runner-by-runner summaries ----------
 st.subheader("Runner-by-runner summaries")
