@@ -367,6 +367,7 @@ st.dataframe(disp, use_container_width=True)
 
 # ---------- Combined Pace Chart (Average + Top 8) ----------
 st.subheader("Pace Curves — Field Average (black) + Top 8 by Finish")
+
 avg_mid = metrics["Mid400_Speed"].mean()
 avg_fin = metrics["Final400_Speed"].mean()
 top8 = metrics.sort_values("Finish_Pos").head(8)
@@ -374,12 +375,18 @@ top8 = metrics.sort_values("Finish_Pos").head(8)
 fig, ax = plt.subplots()
 x_vals = [1, 2]
 
-# Plot field average in black (thicker)
+# Field average in black (thicker line)
 ax.plot(x_vals, [avg_mid, avg_fin], marker="o", linewidth=3, color="black", label="Average (Field)")
 
-# Plot top 8 finishers in distinct colours
+# Top 8 finishers in distinctive colours
 for _, row in top8.iterrows():
-    ax.plot(x_vals, [row["Mid400_Speed"], row["Final400_Speed"]], marker="o", linewidth=2, label=str(row["Horse"]))
+    ax.plot(
+        x_vals,
+        [row["Mid400_Speed"], row["Final400_Speed"]],
+        marker="o",
+        linewidth=2,
+        label=str(row.get("Horse", "Runner"))
+    )
 
 ax.set_xticks([1, 2])
 ax.set_xticklabels(["Mid 400 (800→400)", "Final 400 (400→Finish)"])
