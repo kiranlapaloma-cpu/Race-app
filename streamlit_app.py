@@ -29,20 +29,11 @@ def parse_race_time(val):
     except Exception:
         return np.nan
 
-def compute_metrics(df, distance_m=1400.0, apply_wind=False, wind_speed_kph=0.0, wind_dir="None"):
+def compute_metrics(df, distance_m=1400.0):
     out = df.copy()
     out["Race_AvgSpeed"]  = distance_m / out["RaceTime_s"]
     out["Mid400_Speed"]   = 400.0 / out["800-400"]
     out["Final400_Speed"] = 400.0 / out["400-Finish"]
-
-    # Optional small wind tweak to Final-400 only
-    if apply_wind and wind_speed_kph and wind_dir in {"Tail", "Head"}:
-        k = 0.0045
-        adj = k * float(wind_speed_kph)
-        if wind_dir == "Tail":
-            out["Final400_Speed"] *= (1.0 + adj)
-        elif wind_dir == "Head":
-            out["Final400_Speed"] *= (1.0 - adj)
 
     out["Basic_FSP_%"]   = (out["Final400_Speed"] / out["Race_AvgSpeed"]) * 100.0
     out["Refined_FSP_%"] = (out["Final400_Speed"] / out["Mid400_Speed"]) * 100.0
@@ -133,7 +124,6 @@ def compute_gci_v3(row, ctx, winner_time_s=None):
     basic   = row.get("Basic_FSP_%",   np.nan)
     spi     = row.get("SPI_%",         np.nan)
     epi     = row.get("EPI",           np.nan)
-    poschg  = row.get("Pos_Change",    np.nan)
     rtime   = row.get("RaceTime_s",    np.nan)
 
     early_heat   = float(ctx.get("early_heat", 0.0))        # 0..1
@@ -241,7 +231,7 @@ def kick_from_refined(refined):
     return "faded late"
 
 def pace_note(spi_med):
-    # kept for narrative flavour; not a toggle or simulation
+    # kept for narrative flavour only
     if pd.isna(spi_med):
         return "pace uncertain"
     if spi_med >= 103:
@@ -304,15 +294,12 @@ def runner_summary(row, spi_med):
 # ---------- UI ----------
 
 st.title("🏇 Race Analysis by Kiran")
-st.caption("Upload a race CSV/XLSX, compute FSP, Refined FSP, SPI, EPI, sleepers, and read per-runner summaries. GCI v3 uses pace-pressure context; no pace toggles or simulations.")
+st.caption("Upload a race CSV/XLSX, compute FSP, Refined FSP, SPI, EPI, sleepers, and read per-runner summaries. GCI v3 uses pace-pressure context. (Wind inputs removed; single combined pace chart.)")
 
 with st.sidebar:
     st.header("Race Inputs")
     uploaded = st.file_uploader("Upload Race File (CSV or XLSX)", type=["csv", "xlsx"])
     distance_m = st.number_input("Race Distance (m)", min_value=800, max_value=4000, value=1400, step=50)
-    wind_dir = st.selectbox("Wind Direction (optional)", ["None", "Head", "Tail"])
-    wind_speed = st.number_input("Wind Speed (kph, optional)", min_value=0.0, max_value=80.0, value=0.0, step=1.0)
-    apply_wind = st.checkbox("Apply wind adjustment to Final 400", value=False)
 
 if uploaded is None:
     st.info("Upload a race file to begin.")
@@ -345,8 +332,8 @@ for col in ["800-400", "400-Finish", "200_Pos", "400_Pos", "800_Pos", "1000_Pos"
     if col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-# Compute metrics (no pace scenario manipulation)
-metrics = compute_metrics(df, distance_m=distance_m, apply_wind=apply_wind, wind_speed_kph=wind_speed, wind_dir=wind_dir)
+# Compute metrics
+metrics = compute_metrics(df, distance_m=distance_m)
 metrics = flag_sleepers(metrics)
 
 # Drop Jockey/Trainer if present
@@ -362,7 +349,7 @@ if "Finish_Pos" in metrics.columns and "RaceTime_s" in metrics.columns and not m
     except Exception:
         winner_time = None
 
-ctx = compute_pressure_context(metrics)             # <-- new context
+ctx = compute_pressure_context(metrics)
 spi_median = ctx["spi_median"]
 gci_scores, gci_reasons = [], []
 for _, r in metrics.iterrows():
@@ -378,34 +365,31 @@ st.subheader("Sectional Metrics")
 disp = round_display(metrics.copy()).sort_values("Finish_Pos", na_position="last")
 st.dataframe(disp, use_container_width=True)
 
-# ---------- Charts ----------
-st.subheader("Pace Curve — Field Average")
+# ---------- Combined Pace Chart (Average + Top 8) ----------
+st.subheader("Pace Curves — Field Average (black) + Top 8 by Finish")
 avg_mid = metrics["Mid400_Speed"].mean()
 avg_fin = metrics["Final400_Speed"].mean()
-fig1, ax1 = plt.subplots()
-ax1.plot([1, 2], [avg_mid, avg_fin], marker="o")
-ax1.set_xticks([1, 2])
-ax1.set_xticklabels(["Mid 400 (800→400)", "Final 400 (400→Finish)"])
-ax1.set_ylabel("Speed (m/s)")
-ax1.set_title("Average Pace Curve")
-st.pyplot(fig1)
-
-st.subheader("Pace Curve — First 8 Finishers")
 top8 = metrics.sort_values("Finish_Pos").head(8)
-fig2, ax2 = plt.subplots()
-colors = plt.cm.tab10.colors  # distinct colours
+
+fig, ax = plt.subplots()
 x_vals = [1, 2]
-for idx, (_, row) in enumerate(top8.iterrows()):
-    y_vals = [row["Mid400_Speed"], row["Final400_Speed"]]
-    color = colors[idx % len(colors)]
-    ax2.plot(x_vals, y_vals, marker="o", label=str(row["Horse"]), color=color, linewidth=2)
-ax2.set_xticks([1, 2])
-ax2.set_xticklabels(["Mid 400 (800→400)", "Final 400 (400→Finish)"])
-ax2.set_ylabel("Speed (m/s)")
-ax2.set_title("Per-Horse Pace Curves (Top 8 by Finish)")
-ax2.grid(True, linestyle="--", alpha=0.3)
-fig2.legend(loc="lower center", ncol=4, bbox_to_anchor=(0.5, -0.12))
-st.pyplot(fig2)
+
+# Plot field average in black (thicker)
+ax.plot(x_vals, [avg_mid, avg_fin], marker="o", linewidth=3, color="black", label="Average (Field)")
+
+# Plot top 8 finishers in distinct colours
+for _, row in top8.iterrows():
+    ax.plot(x_vals, [row["Mid400_Speed"], row["Final400_Speed"]], marker="o", linewidth=2, label=str(row["Horse"]))
+
+ax.set_xticks([1, 2])
+ax.set_xticklabels(["Mid 400 (800→400)", "Final 400 (400→Finish)"])
+ax.set_ylabel("Speed (m/s)")
+ax.set_title("Average vs Top 8 Pace Curves")
+ax.grid(True, linestyle="--", alpha=0.3)
+
+# Legend below the chart
+fig.legend(loc="lower center", ncol=4, bbox_to_anchor=(0.5, -0.12))
+st.pyplot(fig)
 
 # ---------- Insights & Sleepers ----------
 st.subheader("Insights")
@@ -450,5 +434,5 @@ st.download_button("Download metrics as CSV", data=csv_bytes, file_name="race_se
 st.caption(
     "Legend: Basic FSP = Final400 / Race Avg; Refined FSP = Final400 / Mid400; "
     "SPI = Mid400 / Race Avg; EPI = early positioning index (lower = closer to lead); "
-    "Pos_Change = gain from 400m to finish. GCI v3 applies pace-pressure context (no manual pace scenarios)."
+    "Pos_Change = gain from 400m to finish. GCI v3 applies pace-pressure context."
 )
