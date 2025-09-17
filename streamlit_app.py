@@ -4,7 +4,7 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Race Analysis by Kiran", layout="wide")
+st.set_page_config(page_title="Race Analysis by Kiran (Auto Pace Detection)", layout="wide")
 
 # ---------- Helpers ----------
 
@@ -29,11 +29,20 @@ def parse_race_time(val):
     except Exception:
         return np.nan
 
-def compute_metrics(df, distance_m=1400.0):
+def compute_metrics(df, distance_m=1400.0, apply_wind=False, wind_speed_kph=0.0, wind_dir="None"):
     out = df.copy()
     out["Race_AvgSpeed"]  = distance_m / out["RaceTime_s"]
     out["Mid400_Speed"]   = 400.0 / out["800-400"]
     out["Final400_Speed"] = 400.0 / out["400-Finish"]
+
+    # Optional small wind tweak to Final-400 only
+    if apply_wind and wind_speed_kph and wind_dir in {"Tail", "Head"}:
+        k = 0.0045
+        adj = k * float(wind_speed_kph)
+        if wind_dir == "Tail":
+            out["Final400_Speed"] *= (1.0 + adj)
+        elif wind_dir == "Head":
+            out["Final400_Speed"] *= (1.0 - adj)
 
     out["Basic_FSP_%"]   = (out["Final400_Speed"] / out["Race_AvgSpeed"]) * 100.0
     out["Refined_FSP_%"] = (out["Final400_Speed"] / out["Mid400_Speed"]) * 100.0
@@ -67,6 +76,7 @@ def flag_sleepers(df):
     return out
 
 def apply_pace_scenario(df, scenario="Even"):
+    """Manual simulation of pace scenarios. Only used when the user overrides Auto."""
     out = df.copy()
     if scenario == "Slow Early / Sprint-Home":
         out["800-400"]    = out["800-400"] * 1.05
@@ -88,7 +98,45 @@ def round_display(df):
         df["RaceTime_s"] = df["RaceTime_s"].round(3)
     return df
 
-# ---------- Pace/Distance-aware Group-Class Index (GCI v2s) ----------
+# ---------- Auto pace detection (field-level, speeds-based) ----------
+
+def detect_pace_auto(metrics_df, fast_threshold=1.05, slow_threshold=0.95):
+    """
+    Detect pace by comparing field-average Mid400 speed vs Final400 speed.
+    Returns one of: "Even", "Slow Early / Sprint-Home", "Fast Early / Tough Late".
+    """
+    needed = ["Mid400_Speed", "Final400_Speed"]
+    if not all(col in metrics_df.columns for col in needed) or metrics_df[needed].isna().any().any():
+        return "Even", {"reason": "insufficient speeds/columns"}
+
+    early = float(metrics_df["Mid400_Speed"].mean())
+    late  = float(metrics_df["Final400_Speed"].mean())
+    if late <= 0 or early <= 0:
+        return "Even", {"reason": "non-positive speeds", "early": early, "late": late}
+
+    ratio = early / late
+    if ratio >= fast_threshold:
+        scen = "Fast Early / Tough Late"
+        rule = f"early/late {ratio:.3f} ≥ {fast_threshold:.3f}"
+    elif ratio <= slow_threshold:
+        scen = "Slow Early / Sprint-Home"
+        rule = f"early/late {ratio:.3f} ≤ {slow_threshold:.3f}"
+    else:
+        scen = "Even"
+        rule = f"{slow_threshold:.3f} < early/late {ratio:.3f} < {fast_threshold:.3f}"
+
+    dbg = {
+        "early_mean_mps": early,
+        "late_mean_mps": late,
+        "ratio_early_to_late": ratio,
+        "fast_threshold": fast_threshold,
+        "slow_threshold": slow_threshold,
+        "rule": rule,
+        "scenario": scen
+    }
+    return scen, dbg
+
+# ---------- Pace-aware Group-Class Index (GCI v2) ----------
 
 def _to01(val, lo, hi):
     """Clamp-linear map val in [lo,hi] to [0,1]."""
@@ -98,9 +146,9 @@ def _to01(val, lo, hi):
         return 0.0
     return float(min(1.0, max(0.0, (val - lo) / (hi - lo))))
 
-def compute_gci_v2s(row, spi_median, winner_time_s=None, distance_m=1400.0):
+def compute_gci_v2(row, spi_median, winner_time_s=None):
     """
-    Pace- and distance-aware Group-Class Index on 0–10 scale.
+    Pace-aware Group-Class Index on 0–10 scale.
     Returns (score_0_10, reasons_list).
     """
     reasons = []
@@ -109,14 +157,14 @@ def compute_gci_v2s(row, spi_median, winner_time_s=None, distance_m=1400.0):
     basic   = row.get("Basic_FSP_%",   np.nan)   # final 400 vs race avg
     spi     = row.get("SPI_%",         np.nan)   # mid 400 vs race avg
     epi     = row.get("EPI",           np.nan)   # early position (lower = closer to lead)
+    poschg  = row.get("Pos_Change",    np.nan)
     rtime   = row.get("RaceTime_s",    np.nan)
 
-    # ----- Race shape -----
+    # Race shape
     fast_early   = (not pd.isna(spi_median)) and (spi_median >= 103)
     sprint_home  = (not pd.isna(spi_median)) and (spi_median <= 97)
-    is_sprint    = distance_m <= 1200
 
-    # ----- T: Time vs winner (0..1) -----
+    # T: Time vs winner
     T = 0.0
     if (winner_time_s is not None) and (not pd.isna(rtime)):
         deficit = rtime - winner_time_s
@@ -129,7 +177,7 @@ def compute_gci_v2s(row, spi_median, winner_time_s=None, distance_m=1400.0):
         else:
             T = 0.2
 
-    # ----- LK: Late kick (0..1), pace & distance adjusted -----
+    # LK: Late kick (pace-adjusted)
     LK_raw = 0.0
     if not pd.isna(refined):
         if refined >= 106: LK_raw = 1.0; reasons.append("elite late kick (RefFSP≥106)")
@@ -137,52 +185,42 @@ def compute_gci_v2s(row, spi_median, winner_time_s=None, distance_m=1400.0):
         elif refined >= 102: LK_raw = 0.6; reasons.append("good late kick (102–104)")
         elif refined >= 100: LK_raw = 0.4; reasons.append("useful late work (100–102)")
         else: LK_raw = 0.2
-    # Downweight in sprint-home and, for pure sprints, slightly overall
-    lk_factor = 0.7 if sprint_home else 1.0
-    if is_sprint:
-        lk_factor *= 0.85
-    LK = LK_raw * lk_factor
+    LK = LK_raw * (0.7 if sprint_home else 1.0)
 
-    # ----- OP: On-pace merit (0..1) -----
+    # OP: On-pace merit
     OP = 0.0
     if not pd.isna(epi) and not pd.isna(basic):
         if fast_early and epi <= 2.5 and basic >= 98:
             OP = 1.0; reasons.append("on-speed under pressure (fast early)")
-        elif not fast_early and epi <= 3.5 and basic >= (99 if not is_sprint else 98.5):
+        elif not fast_early and epi <= 3.5 and basic >= 99:
             OP = 0.7; reasons.append("efficient on-speed/handy")
 
-    # ----- P: Pace merit as max(LK, OP) -----
     P = max(LK, OP)
 
-    # ----- SS: Sustained speed (0..1) from SPI & Basic FSP -----
+    # SS: Sustained speed
     if pd.isna(spi) or pd.isna(basic):
         SS = 0.0
     else:
         mean_sb = (spi + basic) / 2.0
-        # Slightly higher ceiling for sprints
-        hi = 106.0 if is_sprint else 105.0
-        SS = _to01(mean_sb, 98.0, hi)
+        # Map 98→0, 105→1.0
+        SS = _to01(mean_sb, 98.0, 105.0)
         if mean_sb >= 103:
             reasons.append("strong sustained speed")
 
-    # ----- EFF: Efficiency around 100% Refined FSP (0..1) -----
+    # EFF: Efficiency around 100% Refined FSP
     if pd.isna(refined):
         EFF = 0.0
     else:
-        # For sprints we tolerate a touch more >100 (late acceleration typical)
-        tol = 9.0 if is_sprint else 8.0
-        EFF = max(0.0, 1.0 - abs(refined - 100.0) / tol)
-        if (99 <= refined <= 103) or (is_sprint and 99 <= refined <= 104):
+        # 100% = perfect = 1.0; within ±4% still good; beyond ±8% → 0
+        EFF = max(0.0, 1.0 - abs(refined - 100.0) / 8.0)
+        if 99 <= refined <= 103:
             reasons.append("efficient sectional profile")
 
-    # ----- Combine pillars (weights sum to 1.0) -----
-    if is_sprint:
-        wT, wP, wSS, wEFF = 0.35, 0.35, 0.20, 0.10
-    else:
-        wT, wP, wSS, wEFF = 0.30, 0.30, 0.25, 0.15
-
+    # Combine pillars
+    wT, wP, wSS, wEFF = 0.30, 0.30, 0.25, 0.15
     score01 = (wT * T) + (wP * P) + (wSS * SS) + (wEFF * EFF)
     score10 = round(10.0 * score01, 2)
+
     return score10, reasons
 
 # ---------- Runner-by-runner summaries ----------
@@ -269,17 +307,25 @@ def runner_summary(row, spi_med):
 
 # ---------- UI ----------
 
-st.title("🏇 Race Analysis by Kiran")
-st.caption("Upload a race CSV/XLSX, compute FSP, Refined FSP, SPI, EPI, sleepers, simulate pace, and read per-runner summaries. GCI v2s is pace- & distance-aware.")
+st.title("🏇 Race Analysis by Kiran (Auto Pace Detection)")
+st.caption("Upload a race CSV/XLSX, compute FSP, Refined FSP, SPI, EPI, sleepers, simulate pace/wind, and read per-runner summaries. Group-class candidates are flagged via GCI v2 (pace-aware).")
 
 with st.sidebar:
     st.header("Race Inputs")
     uploaded = st.file_uploader("Upload Race File (CSV or XLSX)", type=["csv", "xlsx"])
     distance_m = st.number_input("Race Distance (m)", min_value=800, max_value=4000, value=1400, step=50)
+    wind_dir = st.selectbox("Wind Direction (optional)", ["None", "Head", "Tail"])
+    wind_speed = st.number_input("Wind Speed (kph, optional)", min_value=0.0, max_value=80.0, value=0.0, step=1.0)
+    apply_wind = st.checkbox("Apply wind adjustment to Final 400", value=False)
 
     st.divider()
     st.header("Pace Scenario")
-    pace_scenario = st.selectbox("Scenario", ["Even", "Slow Early / Sprint-Home", "Fast Early / Tough Late"])
+    pace_scenario = st.selectbox(
+        "Scenario",
+        ["Auto (Detect)", "Even", "Slow Early / Sprint-Home", "Fast Early / Tough Late"],
+        index=0,
+        help="Auto detects pace from Mid400 vs Final400 speeds; other options manually simulate pace."
+    )
 
 if uploaded is None:
     st.info("Upload a race file to begin.")
@@ -303,20 +349,23 @@ raw = raw.rename(columns={
     "400_Finish": "400-Finish",
     "Horse Name": "Horse",
     "Finish": "Finish_Pos",
-    "Placing": "Finish_Pos",
-    "Draw": "Draw",
-    "Barrier": "Draw"
+    "Placing": "Finish_Pos"
 })
 
 df = raw.copy()
 df["RaceTime_s"] = df["Race Time"].apply(parse_race_time)
-for col in ["800-400", "400-Finish", "200_Pos", "400_Pos", "800_Pos", "1000_Pos", "Finish_Pos", "Draw"]:
+for col in ["800-400", "400-Finish", "200_Pos", "400_Pos", "800_Pos", "1000_Pos", "Finish_Pos"]:
     if col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-# Apply pace scenario & compute metrics (wind removed entirely)
-df_scn = apply_pace_scenario(df, scenario=pace_scenario)
-metrics = compute_metrics(df_scn, distance_m=distance_m)
+# Apply manual pace simulation ONLY if user overrides Auto
+if pace_scenario == "Auto (Detect)":
+    df_scn = df.copy()
+else:
+    df_scn = apply_pace_scenario(df, scenario=pace_scenario)
+
+# Compute metrics
+metrics = compute_metrics(df_scn, distance_m=distance_m, apply_wind=apply_wind, wind_speed_kph=wind_speed, wind_dir=wind_dir)
 metrics = flag_sleepers(metrics)
 
 # Drop Jockey/Trainer if present
@@ -324,7 +373,7 @@ for drop_col in ["Jockey", "Trainer"]:
     if drop_col in metrics.columns:
         metrics = metrics.drop(columns=[drop_col])
 
-# ---- Group-class scoring (v2s) ----
+# ---- Group-class scoring (pace-aware v2) ----
 winner_time = None
 if "Finish_Pos" in metrics.columns and "RaceTime_s" in metrics.columns and not metrics["Finish_Pos"].isna().all():
     try:
@@ -335,57 +384,72 @@ if "Finish_Pos" in metrics.columns and "RaceTime_s" in metrics.columns and not m
 spi_median = metrics["SPI_%"].median()
 gci_scores, gci_reasons = [], []
 for _, r in metrics.iterrows():
-    gci, why = compute_gci_v2s(r, spi_median, winner_time_s=winner_time, distance_m=distance_m)
+    gci, why = compute_gci_v2(r, spi_median, winner_time_s=winner_time)
     gci_scores.append(gci)
     gci_reasons.append("; ".join(why))
 metrics["GCI"] = gci_scores
 metrics["GCI_Reasons"] = gci_reasons
 metrics["Group_Candidate"] = metrics["GCI"] >= 7.0
 
-# ---------- Sectional Metrics (original simple table) ----------
+# ---------- Auto pace detection readout ----------
+resolved_pace = pace_scenario
+dbg = {}
+if pace_scenario == "Auto (Detect)":
+    resolved_pace, dbg = detect_pace_auto(metrics)
+    st.success(f"Pace Scenario: Auto (Detected → **{resolved_pace}**)")
+    with st.expander("Detection details"):
+        st.json(dbg)
+else:
+    st.warning(f"Pace Scenario: **Manual override** → {pace_scenario}")
+
+# ---------- Table ----------
 st.subheader("Sectional Metrics")
 disp = round_display(metrics.copy()).sort_values("Finish_Pos", na_position="last")
 st.dataframe(disp, use_container_width=True)
 
 # ---------- Charts ----------
-# Field average
+st.subheader("Pace Curve — Field Average")
 avg_mid = metrics["Mid400_Speed"].mean()
 avg_fin = metrics["Final400_Speed"].mean()
+fig1, ax1 = plt.subplots()
+ax1.plot([1, 2], [avg_mid, avg_fin], marker="o")
+ax1.set_xticks([1, 2])
+ax1.set_xticklabels(["Mid 400 (800→400)", "Final 400 (400→Finish)"])
+ax1.set_ylabel("Speed (m/s)")
+ax1.set_title("Average Pace Curve")
+st.pyplot(fig1)
 
-st.subheader("Pace Curves")
-# Average curve
-fig, ax = plt.subplots()
-ax.plot([1, 2], [avg_mid, avg_fin], marker="o", label="Average (field)", color="black", linewidth=3)
-
-# Per-horse for first 8 finishers
+st.subheader("Pace Curve — First 8 Finishers")
 top8 = metrics.sort_values("Finish_Pos").head(8)
-colors = plt.cm.tab10.colors
+fig2, ax2 = plt.subplots()
+colors = plt.cm.tab10.colors  # distinct colours
 x_vals = [1, 2]
 for idx, (_, row) in enumerate(top8.iterrows()):
     y_vals = [row["Mid400_Speed"], row["Final400_Speed"]]
     color = colors[idx % len(colors)]
-    ax.plot(x_vals, y_vals, marker="o", label=str(row.get("Horse", f"H{idx+1}")), color=color, linewidth=2)
-
-ax.set_xticks([1, 2])
-ax.set_xticklabels(["Mid 400 (800→400)", "Final 400 (400→Finish)"])
-ax.set_ylabel("Speed (m/s)")
-ax.set_title("Average + Top 8 Finishers")
-ax.grid(True, linestyle="--", alpha=0.3)
-fig.legend(loc="lower center", ncol=5, bbox_to_anchor=(0.5, -0.12))
-st.pyplot(fig)
+    ax2.plot(x_vals, y_vals, marker="o", label=str(row["Horse"]), color=color, linewidth=2)
+ax2.set_xticks([1, 2])
+ax2.set_xticklabels(["Mid 400 (800→400)", "Final 400 (400→Finish)"])
+ax2.set_ylabel("Speed (m/s)")
+ax2.set_title("Per-Horse Pace Curves (Top 8 by Finish)")
+ax2.grid(True, linestyle="--", alpha=0.3)
+fig2.legend(loc="lower center", ncol=4, bbox_to_anchor=(0.5, -0.12))
+st.pyplot(fig2)
 
 # ---------- Insights & Sleepers ----------
 st.subheader("Insights")
 if pd.isna(spi_median):
     st.write("Insufficient data to infer race shape.")
 else:
+    # SPI-median readout for continuity
     if spi_median >= 103:
-        race_shape = "Fast Early / Tough Late"
+        race_shape_spi = "Fast Early / Tough Late"
     elif spi_median <= 97:
-        race_shape = "Slow Early / Sprint-Home"
+        race_shape_spi = "Slow Early / Sprint-Home"
     else:
-        race_shape = "Even"
-    st.write(f"**Race shape (by SPI median):** {race_shape} (median SPI {spi_median:.1f}%)")
+        race_shape_spi = "Even"
+    st.write(f"**Race shape (Auto detection):** {resolved_pace}")
+    st.write(f"**Race shape (SPI median):** {race_shape_spi} (median SPI {spi_median:.1f}%)")
 
 sleepers = disp[disp["Sleeper"] == True][["Horse","Finish_Pos","Refined_FSP_%","Pos_Change"]]
 st.subheader("Sleepers")
@@ -395,7 +459,7 @@ else:
     st.dataframe(sleepers, use_container_width=True)
 
 # ---------- Group-class candidates ----------
-st.subheader("Potential Group-class candidates (GCI v2s)")
+st.subheader("Potential Group-class candidates (GCI v2)")
 cands = metrics.loc[metrics["Group_Candidate"]].copy().sort_values(["GCI","Finish_Pos"], ascending=[False, True])
 if cands.empty:
     st.write("No horses met the Group-class threshold today.")
@@ -420,5 +484,5 @@ st.download_button("Download metrics as CSV", data=csv_bytes, file_name="race_se
 st.caption(
     "Legend: Basic FSP = Final400 / Race Avg; Refined FSP = Final400 / Mid400; "
     "SPI = Mid400 / Race Avg; EPI = early positioning index (lower = closer to lead); "
-    "Pos_Change = gain from 400m to finish. GCI v2s is pace- & distance-aware (≥7.0 flags candidates)."
+    "Pos_Change = gain from 400m to finish. GCI v2 is pace-aware (≥7.0 flags candidates)."
 )
