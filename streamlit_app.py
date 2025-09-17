@@ -1,5 +1,4 @@
 import io
-import math
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -30,23 +29,13 @@ def parse_race_time(val):
     except Exception:
         return np.nan
 
-def detect_halved_times(df, sectional_cols=("800-400", "400-Finish")):
-    flag = False
-    for col in sectional_cols:
-        if col in df.columns:
-            s = pd.to_numeric(df[col], errors="coerce")
-            if (s > 0).any() and (s.dropna() < 10.5).any():
-                flag = True
-                break
-    return flag
-
 def compute_metrics(df, distance_m=1400.0, apply_wind=False, wind_speed_kph=0.0, wind_dir="None"):
     out = df.copy()
     out["Race_AvgSpeed"]  = distance_m / out["RaceTime_s"]
     out["Mid400_Speed"]   = 400.0 / out["800-400"]
     out["Final400_Speed"] = 400.0 / out["400-Finish"]
 
-    # Optional wind tweak for Final-400 speed only (small linear factor)
+    # Optional small wind tweak to Final-400 only
     if apply_wind and wind_speed_kph and wind_dir in {"Tail", "Head"}:
         k = 0.0045
         adj = k * float(wind_speed_kph)
@@ -59,7 +48,7 @@ def compute_metrics(df, distance_m=1400.0, apply_wind=False, wind_speed_kph=0.0,
     out["Refined_FSP_%"] = (out["Final400_Speed"] / out["Mid400_Speed"]) * 100.0
     out["SPI_%"]         = (out["Mid400_Speed"]   / out["Race_AvgSpeed"]) * 100.0
 
-    # EPI (200 & 400 positions if available)
+    # Early Position Index (fallbacks)
     if ("200_Pos" in out.columns) and ("400_Pos" in out.columns):
         out["EPI"] = out["200_Pos"] * 0.6 + out["400_Pos"] * 0.4
     elif ("1000_Pos" in out.columns) and ("800_Pos" in out.columns):
@@ -69,7 +58,7 @@ def compute_metrics(df, distance_m=1400.0, apply_wind=False, wind_speed_kph=0.0,
     else:
         out["EPI"] = np.nan
 
-    # Pos change (400 to Finish) if available
+    # Late position change (400m to finish)
     if ("400_Pos" in out.columns) and ("Finish_Pos" in out.columns):
         out["Pos_Change"] = out["400_Pos"] - out["Finish_Pos"]
     elif "Finish_Pos" in out.columns:
@@ -108,10 +97,86 @@ def round_display(df):
         df["RaceTime_s"] = df["RaceTime_s"].round(3)
     return df
 
+# ---------- NEW: Natural-language summary generator ----------
+
+def style_from_epi(epi):
+    if pd.isna(epi):
+        return "position unknown"
+    if epi <= 2.0:
+        return "on-speed/leader"
+    if epi <= 5.0:
+        return "handy/midfield"
+    return "backmarker"
+
+def kick_from_refined(refined):
+    if pd.isna(refined):
+        return "—"
+    if refined >= 103.0:
+        return "accelerated strongly late"
+    if refined >= 100.0:
+        return "kept building late"
+    if refined >= 97.0:
+        return "flattened late"
+    return "faded late"
+
+def pace_note(spi_med):
+    if pd.isna(spi_med):
+        return "pace uncertain"
+    if spi_med >= 103:
+        return "fast early / tough late"
+    if spi_med <= 97:
+        return "slow early / sprint-home"
+    return "even tempo"
+
+def distance_hint(refined, pos_change, epi):
+    # Simple distance guidance
+    if pd.isna(refined) or pd.isna(pos_change) or pd.isna(epi):
+        return ""
+    if refined >= 102 and pos_change >= 2:
+        return "likely to appreciate a little further."
+    if refined < 98 and epi <= 2.5:
+        return "may prefer slightly shorter or a softer mid-race."
+    if refined >= 100 and epi >= 5:
+        return "effective if they can be ridden a touch closer."
+    return ""
+
+def runner_summary(row, spi_med):
+    name = str(row.get("Horse", ""))
+    fin  = row.get("Finish_Pos", np.nan)
+    rt   = row.get("RaceTime_s", np.nan)
+    epi  = row.get("EPI", np.nan)
+    ref  = row.get("Refined_FSP_%", np.nan)
+    bas  = row.get("Basic_FSP_%", np.nan)
+    spi  = row.get("SPI_%", np.nan)
+    pc   = row.get("Pos_Change", np.nan)
+    slp  = bool(row.get("Sleeper", False))
+
+    style = style_from_epi(epi)
+    kick  = kick_from_refined(ref)
+    pnote = pace_note(spi_med)
+    dhint = distance_hint(ref, pc, epi)
+
+    fin_txt = f"{int(fin)}" if not pd.isna(fin) else "—"
+    rt_txt  = f"{rt:.2f}s" if not pd.isna(rt) else "—"
+    epi_txt = f"{epi:.1f}" if not pd.isna(epi) else "—"
+    ref_txt = f"{ref:.1f}%" if not pd.isna(ref) else "—"
+    spi_txt = f"{spi:.1f}%" if not pd.isna(spi) else "—"
+    pc_txt  = f"{int(pc)}" if not pd.isna(pc) else "—"
+
+    sleeper_tag = " **(Sleeper)**" if slp else ""
+    bits = [
+        f"**{name}** — Finish: **{fin_txt}**, Time: **{rt_txt}**{sleeper_tag}",
+        f"Style: {style} (EPI {epi_txt}); Race shape: {pnote} (SPI median).",
+        f"Late profile: {kick} (Refined FSP {ref_txt}); Pos change 400–Finish: {pc_txt}.",
+    ]
+    if dhint:
+        bits.append(f"Note: {dhint}")
+    return "  \n".join(bits)
+
 # ---------- UI ----------
 
 st.title("🏇 Race Analysis by Kiran")
-st.caption("Upload a race CSV/XLSX, compute FSP, Refined FSP, SPI, EPI, sleepers, and simulate pace/wind.")
+st.caption("Upload a race CSV/XLSX, compute FSP, Refined FSP, SPI, EPI, sleepers, simulate pace/wind, and read per-runner summaries.")
 
 with st.sidebar:
     st.header("Race Inputs")
@@ -129,7 +194,7 @@ if uploaded is None:
     st.info("Upload a race file to begin.")
     st.stop()
 
-# Load
+# Load + standardize headers
 try:
     if uploaded.name.lower().endswith(".csv"):
         raw = pd.read_csv(uploaded)
@@ -139,7 +204,6 @@ except Exception as e:
     st.error(f"Could not read file: {e}")
     st.stop()
 
-# Standardize common header variants
 raw = raw.rename(columns={
     "Race time": "Race Time",
     "Race_Time": "Race Time",
@@ -152,53 +216,27 @@ raw = raw.rename(columns={
 })
 
 df = raw.copy()
-
-# Convert core fields
 df["RaceTime_s"] = df["Race Time"].apply(parse_race_time)
 for col in ["800-400", "400-Finish", "200_Pos", "400_Pos", "800_Pos", "1000_Pos", "Finish_Pos"]:
     if col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-# Halved times detector & optional fixer
-col1, col2 = st.columns([1,1])
-with col1:
-    halved_flag = detect_halved_times(df)
-    if halved_flag:
-        st.warning("⚠️ Sectional times look **halved** (a 400m split < 10.5s detected).")
-with col2:
-    fix_halved = st.checkbox("Fix halved sectionals (×2)", value=halved_flag)
-
-if fix_halved:
-    for col in ["800-400", "400-Finish"]:
-        if col in df.columns:
-            df[col] = df[col] * 2.0
-    # If total time also looks halved, offer to fix
-    suspicious_total = False
-    if not df["RaceTime_s"].isna().all():
-        m_rt = df["RaceTime_s"].median()
-        thresh = 50 if distance_m <= 1000 else 70 if distance_m <= 1400 else 90
-        if m_rt < thresh:
-            suspicious_total = True
-    fix_total = st.checkbox("Race Time also looks halved — fix total (×2)", value=suspicious_total)
-    if fix_total:
-        df["RaceTime_s"] = df["RaceTime_s"] * 2.0
-
-# Apply pace scenario then compute metrics
+# Apply pace scenario & compute metrics
 df_scn = apply_pace_scenario(df, scenario=pace_scenario)
 metrics = compute_metrics(df_scn, distance_m=distance_m, apply_wind=apply_wind, wind_speed_kph=wind_speed, wind_dir=wind_dir)
 metrics = flag_sleepers(metrics)
 
-# ----- Remove Jockey/Trainer columns if present -----
+# Drop Jockey/Trainer if present
 for drop_col in ["Jockey", "Trainer"]:
     if drop_col in metrics.columns:
         metrics = metrics.drop(columns=[drop_col])
 
-# Display table (sorted by finish)
+# ---------- Table ----------
 st.subheader("Sectional Metrics")
 disp = round_display(metrics.copy()).sort_values("Finish_Pos", na_position="last")
 st.dataframe(disp, use_container_width=True)
 
-# Average pace curve (field)
+# ---------- Charts ----------
 st.subheader("Pace Curve — Field Average")
 avg_mid = metrics["Mid400_Speed"].mean()
 avg_fin = metrics["Final400_Speed"].mean()
@@ -210,31 +248,24 @@ ax1.set_ylabel("Speed (m/s)")
 ax1.set_title("Average Pace Curve")
 st.pyplot(fig1)
 
-# NEW: Pace curve for the first 8 finishers (distinct colours)
 st.subheader("Pace Curve — First 8 Finishers")
 top8 = metrics.sort_values("Finish_Pos").head(8)
 fig2, ax2 = plt.subplots()
-
-# Use a qualitative colormap to ensure distinct colours
-colors = plt.cm.tab10.colors  # up to 10 distinct colours
-x_vals = [1, 2]  # Mid 400, Final 400
-
+colors = plt.cm.tab10.colors
+x_vals = [1, 2]
 for idx, (_, row) in enumerate(top8.iterrows()):
     y_vals = [row["Mid400_Speed"], row["Final400_Speed"]]
     color = colors[idx % len(colors)]
     ax2.plot(x_vals, y_vals, marker="o", label=str(row["Horse"]), color=color, linewidth=2)
-
 ax2.set_xticks([1, 2])
 ax2.set_xticklabels(["Mid 400 (800→400)", "Final 400 (400→Finish)"])
 ax2.set_ylabel("Speed (m/s)")
 ax2.set_title("Per-Horse Pace Curves (Top 8 by Finish)")
 ax2.grid(True, linestyle="--", alpha=0.3)
-
-# Place the legend below the graph (so it doesn't cover lines)
 fig2.legend(loc="lower center", ncol=4, bbox_to_anchor=(0.5, -0.12))
 st.pyplot(fig2)
 
-# Insights & sleepers
+# ---------- Insights & Sleepers ----------
 st.subheader("Insights")
 spi_med = metrics["SPI_%"].median()
 if pd.isna(spi_med):
@@ -255,11 +286,20 @@ if sleepers.empty:
 else:
     st.dataframe(sleepers, use_container_width=True)
 
-# Download
+# ---------- NEW: Runner-by-runner summaries ----------
+st.subheader("Runner-by-runner summaries")
+ordered = metrics.sort_values("Finish_Pos", na_position="last")
+for _, row in ordered.iterrows():
+    st.markdown(runner_summary(row, spi_med))
+    st.markdown("---")
+
+# ---------- Download ----------
 st.subheader("Download")
 csv_bytes = disp.to_csv(index=False).encode("utf-8")
 st.download_button("Download metrics as CSV", data=csv_bytes, file_name="race_sectional_metrics.csv", mime="text/csv")
 
-st.caption("Legend: Basic FSP = Final400 / Race Avg; Refined FSP = Final400 / Mid400; "
-           "SPI = Mid400 / Race Avg; EPI = early positioning index (lower = closer to lead); "
-           "Pos_Change = gain from 400m to finish.")
+st.caption(
+    "Legend: Basic FSP = Final400 / Race Avg; Refined FSP = Final400 / Mid400; "
+    "SPI = Mid400 / Race Avg; EPI = early positioning index (lower = closer to lead); "
+    "Pos_Change = gain from 400m to finish."
+)
