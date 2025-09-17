@@ -97,7 +97,61 @@ def round_display(df):
         df["RaceTime_s"] = df["RaceTime_s"].round(3)
     return df
 
-# ---------- NEW: Natural-language summary generator ----------
+# ---------- Group-Class Index (GCI) ----------
+
+def compute_gci(row, spi_median, winner_time_s=None, sex=None, weight_kg=None):
+    """Return (gci_score, reasons_list)."""
+    reasons = []
+    score = 0.0
+
+    refined = row.get("Refined_FSP_%", np.nan)
+    basic   = row.get("Basic_FSP_%",   np.nan)
+    epi     = row.get("EPI",           np.nan)
+    poschg  = row.get("Pos_Change",    np.nan)
+    rtime   = row.get("RaceTime_s",    np.nan)
+
+    # 1) Late kick
+    if not pd.isna(refined):
+        if refined >= 106: score, reasons = score+4, reasons+["elite late kick (Refined FSP ≥106)"]
+        elif refined >= 104: score, reasons = score+3, reasons+["strong late kick (104–106)"]
+        elif refined >= 102: score, reasons = score+2, reasons+["good late kick (102–104)"]
+        elif refined >= 100: score, reasons = score+1, reasons+["useful late work (100–102)"]
+
+    # 2) Finish vs winner
+    if (winner_time_s is not None) and (not pd.isna(rtime)):
+        deficit = rtime - winner_time_s
+        if deficit <= 0.30:
+            score += 2; reasons.append("finished ≤0.30s off winner")
+        elif deficit <= 0.60:
+            score += 1; reasons.append("finished 0.31–0.60s off winner")
+
+    # 3) Toughness in fast races
+    if (not pd.isna(spi_median)) and spi_median >= 103 and (not pd.isna(basic)):
+        if basic >= 99:
+            score += 2; reasons.append("held form in fast early race (Basic FSP ≥99)")
+        elif basic >= 97:
+            score += 1; reasons.append("coped with fast early race (Basic FSP 97–99)")
+
+    # 4) Position gain late
+    if not pd.isna(poschg):
+        if poschg >= 3:
+            score += 1; reasons.append("strong late gain (Pos_Change ≥+3)")
+        elif poschg == 2:
+            score += 0.5; reasons.append("late pass (+2)")
+
+    # 5) Tractability
+    if not pd.isna(epi) and 2.0 <= epi <= 6.0:
+        score += 0.5; reasons.append("versatile early position (EPI 2–6)")
+
+    # 6) Weight carried (optional)
+    if weight_kg is not None:
+        hi_cut = 56.0 if (sex and str(sex).lower().startswith("f")) else 58.0
+        if weight_kg >= hi_cut:
+            score += 0.5; reasons.append(f"carried {weight_kg}kg (high impost)")
+
+    return score, reasons
+
+# ---------- Runner-by-runner summaries ----------
 
 def style_from_epi(epi):
     if pd.isna(epi):
@@ -129,7 +183,6 @@ def pace_note(spi_med):
     return "even tempo"
 
 def distance_hint(refined, pos_change, epi):
-    # Simple distance guidance
     if pd.isna(refined) or pd.isna(pos_change) or pd.isna(epi):
         return ""
     if refined >= 102 and pos_change >= 2:
@@ -150,6 +203,8 @@ def runner_summary(row, spi_med):
     spi  = row.get("SPI_%", np.nan)
     pc   = row.get("Pos_Change", np.nan)
     slp  = bool(row.get("Sleeper", False))
+    gci  = row.get("GCI", np.nan)
+    gcand= bool(row.get("Group_Candidate", False))
 
     style = style_from_epi(epi)
     kick  = kick_from_refined(ref)
@@ -162,12 +217,17 @@ def runner_summary(row, spi_med):
     ref_txt = f"{ref:.1f}%" if not pd.isna(ref) else "—"
     spi_txt = f"{spi:.1f}%" if not pd.isna(spi) else "—"
     pc_txt  = f"{int(pc)}" if not pd.isna(pc) else "—"
+    gci_txt = f"{gci:.1f}" if not pd.isna(gci) else "—"
 
-    sleeper_tag = " **(Sleeper)**" if slp else ""
+    tags = []
+    if slp:  tags.append("Sleeper")
+    if gcand: tags.append("Group candidate")
+    tag_str = f" **[{', '.join(tags)}]**" if tags else ""
+
     bits = [
-        f"**{name}** — Finish: **{fin_txt}**, Time: **{rt_txt}**{sleeper_tag}",
-        f"Style: {style} (EPI {epi_txt}); Race shape: {pnote} (SPI median).",
-        f"Late profile: {kick} (Refined FSP {ref_txt}); Pos change 400–Finish: {pc_txt}.",
+        f"**{name}** — Finish: **{fin_txt}**, Time: **{rt_txt}**{tag_str}",
+        f"Style: {style} (EPI {epi_txt}); Race shape: {pnote}.",
+        f"Late profile: {kick} (Refined FSP {ref_txt}); Pos change 400–Finish: {pc_txt}; GCI: {gci_txt}.",
     ]
     if dhint:
         bits.append(f"Note: {dhint}")
@@ -176,7 +236,7 @@ def runner_summary(row, spi_med):
 # ---------- UI ----------
 
 st.title("🏇 Race Analysis by Kiran")
-st.caption("Upload a race CSV/XLSX, compute FSP, Refined FSP, SPI, EPI, sleepers, simulate pace/wind, and read per-runner summaries.")
+st.caption("Upload a race CSV/XLSX, compute FSP, Refined FSP, SPI, EPI, sleepers, simulate pace/wind, and read per-runner summaries. Group-class candidates are flagged via GCI.")
 
 with st.sidebar:
     st.header("Race Inputs")
@@ -231,6 +291,26 @@ for drop_col in ["Jockey", "Trainer"]:
     if drop_col in metrics.columns:
         metrics = metrics.drop(columns=[drop_col])
 
+# ---- Group-class scoring ----
+winner_time = None
+if "Finish_Pos" in metrics.columns and "RaceTime_s" in metrics.columns and not metrics["Finish_Pos"].isna().all():
+    try:
+        winner_time = metrics.loc[metrics["Finish_Pos"].idxmin(), "RaceTime_s"]
+    except Exception:
+        winner_time = None
+
+spi_median = metrics["SPI_%"].median()
+gci_scores, gci_reasons = [], []
+for _, r in metrics.iterrows():
+    sex = r.get("Sex", None)
+    wkg = r.get("Weight", None)  # change to your file's weight column if different
+    gci, why = compute_gci(r, spi_median, winner_time_s=winner_time, sex=sex, weight_kg=wkg)
+    gci_scores.append(gci)
+    gci_reasons.append("; ".join(why))
+metrics["GCI"] = np.round(gci_scores, 2)
+metrics["GCI_Reasons"] = gci_reasons
+metrics["Group_Candidate"] = metrics["GCI"] >= 7.0
+
 # ---------- Table ----------
 st.subheader("Sectional Metrics")
 disp = round_display(metrics.copy()).sort_values("Finish_Pos", na_position="last")
@@ -251,7 +331,7 @@ st.pyplot(fig1)
 st.subheader("Pace Curve — First 8 Finishers")
 top8 = metrics.sort_values("Finish_Pos").head(8)
 fig2, ax2 = plt.subplots()
-colors = plt.cm.tab10.colors
+colors = plt.cm.tab10.colors  # distinct colours
 x_vals = [1, 2]
 for idx, (_, row) in enumerate(top8.iterrows()):
     y_vals = [row["Mid400_Speed"], row["Final400_Speed"]]
@@ -267,17 +347,16 @@ st.pyplot(fig2)
 
 # ---------- Insights & Sleepers ----------
 st.subheader("Insights")
-spi_med = metrics["SPI_%"].median()
-if pd.isna(spi_med):
+if pd.isna(spi_median):
     st.write("Insufficient data to infer race shape.")
 else:
-    if spi_med >= 103:
+    if spi_median >= 103:
         race_shape = "Fast Early / Tough Late"
-    elif spi_med <= 97:
+    elif spi_median <= 97:
         race_shape = "Slow Early / Sprint-Home"
     else:
         race_shape = "Even"
-    st.write(f"**Race shape (by SPI median):** {race_shape} (median SPI {spi_med:.1f}%)")
+    st.write(f"**Race shape (by SPI median):** {race_shape} (median SPI {spi_median:.1f}%)")
 
 sleepers = disp[disp["Sleeper"] == True][["Horse","Finish_Pos","Refined_FSP_%","Pos_Change"]]
 st.subheader("Sleepers")
@@ -286,11 +365,22 @@ if sleepers.empty:
 else:
     st.dataframe(sleepers, use_container_width=True)
 
-# ---------- NEW: Runner-by-runner summaries ----------
+# ---------- Group-class candidates ----------
+st.subheader("Potential Group-class candidates")
+cands = metrics.loc[metrics["Group_Candidate"]].copy().sort_values(["GCI","Finish_Pos"], ascending=[False, True])
+if cands.empty:
+    st.write("No horses met the Group-class threshold today.")
+else:
+    st.dataframe(
+        round_display(cands[["Horse","Finish_Pos","RaceTime_s","Refined_FSP_%","Basic_FSP_%","SPI_%","Pos_Change","EPI","GCI","GCI_Reasons"]]),
+        use_container_width=True
+    )
+
+# ---------- Runner-by-runner summaries ----------
 st.subheader("Runner-by-runner summaries")
 ordered = metrics.sort_values("Finish_Pos", na_position="last")
 for _, row in ordered.iterrows():
-    st.markdown(runner_summary(row, spi_med))
+    st.markdown(runner_summary(row, spi_median))
     st.markdown("---")
 
 # ---------- Download ----------
@@ -301,5 +391,5 @@ st.download_button("Download metrics as CSV", data=csv_bytes, file_name="race_se
 st.caption(
     "Legend: Basic FSP = Final400 / Race Avg; Refined FSP = Final400 / Mid400; "
     "SPI = Mid400 / Race Avg; EPI = early positioning index (lower = closer to lead); "
-    "Pos_Change = gain from 400m to finish."
+    "Pos_Change = gain from 400m to finish. GCI ≥ 7.0 flags potential Group-class candidates."
 )
