@@ -97,59 +97,96 @@ def round_display(df):
         df["RaceTime_s"] = df["RaceTime_s"].round(3)
     return df
 
-# ---------- Group-Class Index (GCI) ----------
+# ---------- Pace-aware Group-Class Index (GCI v2) ----------
 
-def compute_gci(row, spi_median, winner_time_s=None, sex=None, weight_kg=None):
-    """Return (gci_score, reasons_list)."""
+def _to01(val, lo, hi):
+    """Clamp-linear map val in [lo,hi] to [0,1]."""
+    if pd.isna(val):
+        return 0.0
+    if hi == lo:
+        return 0.0
+    return float(min(1.0, max(0.0, (val - lo) / (hi - lo))))
+
+def compute_gci_v2(row, spi_median, winner_time_s=None):
+    """
+    Pace-aware Group-Class Index on 0–10 scale.
+    Returns (score_0_10, reasons_list).
+    """
     reasons = []
-    score = 0.0
-
-    refined = row.get("Refined_FSP_%", np.nan)
-    basic   = row.get("Basic_FSP_%",   np.nan)
-    epi     = row.get("EPI",           np.nan)
+    # Inputs
+    refined = row.get("Refined_FSP_%", np.nan)   # late kick vs mid
+    basic   = row.get("Basic_FSP_%",   np.nan)   # final 400 vs race avg
+    spi     = row.get("SPI_%",         np.nan)   # mid 400 vs race avg
+    epi     = row.get("EPI",           np.nan)   # early position (lower = closer to lead)
     poschg  = row.get("Pos_Change",    np.nan)
     rtime   = row.get("RaceTime_s",    np.nan)
 
-    # 1) Late kick
-    if not pd.isna(refined):
-        if refined >= 106: score, reasons = score+4, reasons+["elite late kick (Refined FSP ≥106)"]
-        elif refined >= 104: score, reasons = score+3, reasons+["strong late kick (104–106)"]
-        elif refined >= 102: score, reasons = score+2, reasons+["good late kick (102–104)"]
-        elif refined >= 100: score, reasons = score+1, reasons+["useful late work (100–102)"]
+    # ----- Race shape -----
+    fast_early   = (not pd.isna(spi_median)) and (spi_median >= 103)
+    sprint_home  = (not pd.isna(spi_median)) and (spi_median <= 97)
 
-    # 2) Finish vs winner
+    # ----- T: Time vs winner (0..1) -----
+    T = 0.0
     if (winner_time_s is not None) and (not pd.isna(rtime)):
         deficit = rtime - winner_time_s
         if deficit <= 0.30:
-            score += 2; reasons.append("finished ≤0.30s off winner")
+            T = 1.0; reasons.append("≤0.30s off winner")
         elif deficit <= 0.60:
-            score += 1; reasons.append("finished 0.31–0.60s off winner")
+            T = 0.7; reasons.append("0.31–0.60s off winner")
+        elif deficit <= 1.00:
+            T = 0.4; reasons.append("0.61–1.00s off winner")
+        else:
+            T = 0.2
 
-    # 3) Toughness in fast races
-    if (not pd.isna(spi_median)) and spi_median >= 103 and (not pd.isna(basic)):
-        if basic >= 99:
-            score += 2; reasons.append("held form in fast early race (Basic FSP ≥99)")
-        elif basic >= 97:
-            score += 1; reasons.append("coped with fast early race (Basic FSP 97–99)")
+    # ----- LK: Late kick (0..1), pace-adjusted -----
+    LK_raw = 0.0
+    if not pd.isna(refined):
+        if refined >= 106: LK_raw = 1.0; reasons.append("elite late kick (RefFSP≥106)")
+        elif refined >= 104: LK_raw = 0.8; reasons.append("strong late kick (104–106)")
+        elif refined >= 102: LK_raw = 0.6; reasons.append("good late kick (102–104)")
+        elif refined >= 100: LK_raw = 0.4; reasons.append("useful late work (100–102)")
+        else: LK_raw = 0.2
+    # Downweight late kick if sprint-home
+    LK = LK_raw * (0.7 if sprint_home else 1.0)
 
-    # 4) Position gain late
-    if not pd.isna(poschg):
-        if poschg >= 3:
-            score += 1; reasons.append("strong late gain (Pos_Change ≥+3)")
-        elif poschg == 2:
-            score += 0.5; reasons.append("late pass (+2)")
+    # ----- OP: On-pace merit (0..1) -----
+    OP = 0.0
+    if not pd.isna(epi) and not pd.isna(basic):
+        if fast_early and epi <= 2.5 and basic >= 98:
+            OP = 1.0; reasons.append("on-speed under pressure (fast early)")
+        elif not fast_early and epi <= 3.5 and basic >= 99:
+            OP = 0.7; reasons.append("efficient on-speed/handy")
 
-    # 5) Tractability
-    if not pd.isna(epi) and 2.0 <= epi <= 6.0:
-        score += 0.5; reasons.append("versatile early position (EPI 2–6)")
+    # ----- P: Pace merit as max(LK, OP) -----
+    P = max(LK, OP)
 
-    # 6) Weight carried (optional)
-    if weight_kg is not None:
-        hi_cut = 56.0 if (sex and str(sex).lower().startswith("f")) else 58.0
-        if weight_kg >= hi_cut:
-            score += 0.5; reasons.append(f"carried {weight_kg}kg (high impost)")
+    # ----- SS: Sustained speed (0..1) from SPI & Basic FSP -----
+    if pd.isna(spi) or pd.isna(basic):
+        SS = 0.0
+    else:
+        mean_sb = (spi + basic) / 2.0
+        # Map 98→0, 100→~0.33, 103→~0.83, 105→1.0
+        SS = _to01(mean_sb, 98.0, 105.0)
+        if mean_sb >= 103:
+            reasons.append("strong sustained speed")
 
-    return score, reasons
+    # ----- EFF: Efficiency around 100% Refined FSP (0..1) -----
+    if pd.isna(refined):
+        EFF = 0.0
+    else:
+        # 100% = perfect = 1.0; within ±4% still good; beyond ±8% drops to 0
+        EFF = max(0.0, 1.0 - abs(refined - 100.0) / 8.0)
+        if 99 <= refined <= 103:
+            reasons.append("efficient sectional profile")
+
+    # ----- Combine pillars (weights sum to 1.0) -----
+    wT, wP, wSS, wEFF = 0.30, 0.30, 0.25, 0.15
+    score01 = (wT * T) + (wP * P) + (wSS * SS) + (wEFF * EFF)
+
+    # Scale to 0..10
+    score10 = round(10.0 * score01, 2)
+
+    return score10, reasons
 
 # ---------- Runner-by-runner summaries ----------
 
@@ -236,7 +273,7 @@ def runner_summary(row, spi_med):
 # ---------- UI ----------
 
 st.title("🏇 Race Analysis by Kiran")
-st.caption("Upload a race CSV/XLSX, compute FSP, Refined FSP, SPI, EPI, sleepers, simulate pace/wind, and read per-runner summaries. Group-class candidates are flagged via GCI.")
+st.caption("Upload a race CSV/XLSX, compute FSP, Refined FSP, SPI, EPI, sleepers, simulate pace/wind, and read per-runner summaries. Group-class candidates are flagged via GCI v2 (pace-aware).")
 
 with st.sidebar:
     st.header("Race Inputs")
@@ -291,7 +328,7 @@ for drop_col in ["Jockey", "Trainer"]:
     if drop_col in metrics.columns:
         metrics = metrics.drop(columns=[drop_col])
 
-# ---- Group-class scoring ----
+# ---- Group-class scoring (pace-aware v2) ----
 winner_time = None
 if "Finish_Pos" in metrics.columns and "RaceTime_s" in metrics.columns and not metrics["Finish_Pos"].isna().all():
     try:
@@ -302,12 +339,10 @@ if "Finish_Pos" in metrics.columns and "RaceTime_s" in metrics.columns and not m
 spi_median = metrics["SPI_%"].median()
 gci_scores, gci_reasons = [], []
 for _, r in metrics.iterrows():
-    sex = r.get("Sex", None)
-    wkg = r.get("Weight", None)  # change to your file's weight column if different
-    gci, why = compute_gci(r, spi_median, winner_time_s=winner_time, sex=sex, weight_kg=wkg)
+    gci, why = compute_gci_v2(r, spi_median, winner_time_s=winner_time)
     gci_scores.append(gci)
     gci_reasons.append("; ".join(why))
-metrics["GCI"] = np.round(gci_scores, 2)
+metrics["GCI"] = gci_scores
 metrics["GCI_Reasons"] = gci_reasons
 metrics["Group_Candidate"] = metrics["GCI"] >= 7.0
 
@@ -366,7 +401,7 @@ else:
     st.dataframe(sleepers, use_container_width=True)
 
 # ---------- Group-class candidates ----------
-st.subheader("Potential Group-class candidates")
+st.subheader("Potential Group-class candidates (GCI v2)")
 cands = metrics.loc[metrics["Group_Candidate"]].copy().sort_values(["GCI","Finish_Pos"], ascending=[False, True])
 if cands.empty:
     st.write("No horses met the Group-class threshold today.")
@@ -391,5 +426,5 @@ st.download_button("Download metrics as CSV", data=csv_bytes, file_name="race_se
 st.caption(
     "Legend: Basic FSP = Final400 / Race Avg; Refined FSP = Final400 / Mid400; "
     "SPI = Mid400 / Race Avg; EPI = early positioning index (lower = closer to lead); "
-    "Pos_Change = gain from 400m to finish. GCI ≥ 7.0 flags potential Group-class candidates."
+    "Pos_Change = gain from 400m to finish. GCI v2 is pace-aware (≥7.0 flags candidates)."
 )
