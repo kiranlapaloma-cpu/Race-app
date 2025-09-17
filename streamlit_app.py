@@ -35,7 +35,6 @@ def compute_metrics(df, distance_m=1400.0, apply_wind=False, wind_speed_kph=0.0,
     out["Mid400_Speed"]   = 400.0 / out["800-400"]
     out["Final400_Speed"] = 400.0 / out["400-Finish"]
 
-    # Optional small wind tweak to Final-400 only
     if apply_wind and wind_speed_kph and wind_dir in {"Tail", "Head"}:
         k = 0.0045
         adj = k * float(wind_speed_kph)
@@ -48,7 +47,6 @@ def compute_metrics(df, distance_m=1400.0, apply_wind=False, wind_speed_kph=0.0,
     out["Refined_FSP_%"] = (out["Final400_Speed"] / out["Mid400_Speed"]) * 100.0
     out["SPI_%"]         = (out["Mid400_Speed"]   / out["Race_AvgSpeed"]) * 100.0
 
-    # Early Position Index (fallbacks)
     if ("200_Pos" in out.columns) and ("400_Pos" in out.columns):
         out["EPI"] = out["200_Pos"] * 0.6 + out["400_Pos"] * 0.4
     elif ("1000_Pos" in out.columns) and ("800_Pos" in out.columns):
@@ -58,7 +56,6 @@ def compute_metrics(df, distance_m=1400.0, apply_wind=False, wind_speed_kph=0.0,
     else:
         out["EPI"] = np.nan
 
-    # Late position change (400m to finish)
     if ("400_Pos" in out.columns) and ("Finish_Pos" in out.columns):
         out["Pos_Change"] = out["400_Pos"] - out["Finish_Pos"]
     elif "Finish_Pos" in out.columns:
@@ -79,7 +76,6 @@ def apply_pace_scenario(df, scenario="Even"):
     out = df.copy()
     if scenario == "Slow Early / Sprint-Home":
         out["800-400"]    = out["800-400"] * 1.05
-        out["400-Finish"] = out["400-Finish"] * 0.95
     elif scenario == "Fast Early / Tough Late":
         out["800-400"]    = out["800-400"] * 0.94
         out["400-Finish"] = out["400-Finish"] * 1.04
@@ -100,7 +96,6 @@ def round_display(df):
 # ---------- Pace-aware Group-Class Index (GCI v2) ----------
 
 def _to01(val, lo, hi):
-    """Clamp-linear map val in [lo,hi] to [0,1]."""
     if pd.isna(val):
         return 0.0
     if hi == lo:
@@ -108,24 +103,17 @@ def _to01(val, lo, hi):
     return float(min(1.0, max(0.0, (val - lo) / (hi - lo))))
 
 def compute_gci_v2(row, spi_median, winner_time_s=None):
-    """
-    Pace-aware Group-Class Index on 0–10 scale.
-    Returns (score_0_10, reasons_list).
-    """
     reasons = []
-    # Inputs
-    refined = row.get("Refined_FSP_%", np.nan)   # late kick vs mid
-    basic   = row.get("Basic_FSP_%",   np.nan)   # final 400 vs race avg
-    spi     = row.get("SPI_%",         np.nan)   # mid 400 vs race avg
-    epi     = row.get("EPI",           np.nan)   # early position (lower = closer to lead)
-    poschg  = row.get("Pos_Change",    np.nan)
+    refined = row.get("Refined_FSP_%", np.nan)
+    basic   = row.get("Basic_FSP_%",   np.nan)
+    spi     = row.get("SPI_%",         np.nan)
+    epi     = row.get("EPI",           np.nan)
     rtime   = row.get("RaceTime_s",    np.nan)
 
-    # ----- Race shape -----
-    fast_early   = (not pd.isna(spi_median)) and (spi_median >= 103)
-    sprint_home  = (not pd.isna(spi_median)) and (spi_median <= 97)
+    fast_early  = (not pd.isna(spi_median)) and (spi_median >= 103)
+    sprint_home = (not pd.isna(spi_median)) and (spi_median <= 97)
 
-    # ----- T: Time vs winner (0..1) -----
+    # T: Time vs winner
     T = 0.0
     if (winner_time_s is not None) and (not pd.isna(rtime)):
         deficit = rtime - winner_time_s
@@ -138,7 +126,7 @@ def compute_gci_v2(row, spi_median, winner_time_s=None):
         else:
             T = 0.2
 
-    # ----- LK: Late kick (0..1), pace-adjusted -----
+    # LK: Late kick (pace-adjusted)
     LK_raw = 0.0
     if not pd.isna(refined):
         if refined >= 106: LK_raw = 1.0; reasons.append("elite late kick (RefFSP≥106)")
@@ -146,10 +134,9 @@ def compute_gci_v2(row, spi_median, winner_time_s=None):
         elif refined >= 102: LK_raw = 0.6; reasons.append("good late kick (102–104)")
         elif refined >= 100: LK_raw = 0.4; reasons.append("useful late work (100–102)")
         else: LK_raw = 0.2
-    # Downweight late kick if sprint-home
     LK = LK_raw * (0.7 if sprint_home else 1.0)
 
-    # ----- OP: On-pace merit (0..1) -----
+    # OP: On-pace merit
     OP = 0.0
     if not pd.isna(epi) and not pd.isna(basic):
         if fast_early and epi <= 2.5 and basic >= 98:
@@ -157,35 +144,28 @@ def compute_gci_v2(row, spi_median, winner_time_s=None):
         elif not fast_early and epi <= 3.5 and basic >= 99:
             OP = 0.7; reasons.append("efficient on-speed/handy")
 
-    # ----- P: Pace merit as max(LK, OP) -----
     P = max(LK, OP)
 
-    # ----- SS: Sustained speed (0..1) from SPI & Basic FSP -----
+    # SS: Sustained speed
     if pd.isna(spi) or pd.isna(basic):
         SS = 0.0
     else:
         mean_sb = (spi + basic) / 2.0
-        # Map 98→0, 100→~0.33, 103→~0.83, 105→1.0
         SS = _to01(mean_sb, 98.0, 105.0)
         if mean_sb >= 103:
             reasons.append("strong sustained speed")
 
-    # ----- EFF: Efficiency around 100% Refined FSP (0..1) -----
+    # EFF: Efficiency (around 100% Refined FSP)
     if pd.isna(refined):
         EFF = 0.0
     else:
-        # 100% = perfect = 1.0; within ±4% still good; beyond ±8% drops to 0
         EFF = max(0.0, 1.0 - abs(refined - 100.0) / 8.0)
         if 99 <= refined <= 103:
             reasons.append("efficient sectional profile")
 
-    # ----- Combine pillars (weights sum to 1.0) -----
     wT, wP, wSS, wEFF = 0.30, 0.30, 0.25, 0.15
     score01 = (wT * T) + (wP * P) + (wSS * SS) + (wEFF * EFF)
-
-    # Scale to 0..10
     score10 = round(10.0 * score01, 2)
-
     return score10, reasons
 
 # ---------- Runner-by-runner summaries ----------
@@ -273,7 +253,7 @@ def runner_summary(row, spi_med):
 # ---------- UI ----------
 
 st.title("🏇 Race Analysis by Kiran")
-st.caption("Upload a race CSV/XLSX, compute FSP, Refined FSP, SPI, EPI, sleepers, simulate pace/wind, and read per-runner summaries. Group-class candidates are flagged via GCI v2 (pace-aware).")
+st.caption("Upload a race CSV/XLSX, compute FSP, Refined FSP, SPI, EPI, sleepers, simulate pace/wind, and read per-runner summaries. GCI v2 is pace-aware.")
 
 with st.sidebar:
     st.header("Race Inputs")
@@ -309,14 +289,16 @@ raw = raw.rename(columns={
     "400_Finish": "400-Finish",
     "Horse Name": "Horse",
     "Finish": "Finish_Pos",
-    "Placing": "Finish_Pos"
+    "Placing": "Finish_Pos",
+    "Drawn": "Draw",  # normalize common variants
+    "Barrier": "Draw"
 })
 
 df = raw.copy()
 df["RaceTime_s"] = df["Race Time"].apply(parse_race_time)
-for col in ["800-400", "400-Finish", "200_Pos", "400_Pos", "800_Pos", "1000_Pos", "Finish_Pos"]:
+for col in ["800-400", "400-Finish", "200_Pos", "400_Pos", "800_Pos", "1000_Pos", "Finish_Pos", "Draw"]:
     if col in df.columns:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        df[col] = pd.to_numeric(df[col], errors="coerce") if col != "Horse" else df[col]
 
 # Apply pace scenario & compute metrics
 df_scn = apply_pace_scenario(df, scenario=pace_scenario)
@@ -346,39 +328,55 @@ metrics["GCI"] = gci_scores
 metrics["GCI_Reasons"] = gci_reasons
 metrics["Group_Candidate"] = metrics["GCI"] >= 7.0
 
-# ---------- Table ----------
+# ---------- Table (Horse/Draw frozen workaround + search) ----------
 st.subheader("Sectional Metrics")
-disp = round_display(metrics.copy()).sort_values("Finish_Pos", na_position="last")
+# Quick filter
+col_search1, col_search2 = st.columns([1, 3])
+with col_search1:
+    q = st.text_input("Filter by horse name (contains):", value="")
+if q:
+    filt = metrics["Horse"].astype(str).str.contains(q, case=False, na=False) if "Horse" in metrics.columns else pd.Series([True]*len(metrics))
+    metrics_disp = metrics.loc[filt].copy()
+else:
+    metrics_disp = metrics.copy()
+
+# Reorder so Horse/Draw are first; then duplicate at right for readability while scrolled
+left_cols = [c for c in ["Horse", "Draw"] if c in metrics_disp.columns]
+other_cols = [c for c in metrics_disp.columns if c not in left_cols]
+disp = metrics_disp[left_cols + other_cols].copy()
+# Append duplicates at the end (if present)
+if "Horse" in metrics_disp.columns:
+    disp["Horse↔"] = metrics_disp["Horse"]
+if "Draw" in metrics_disp.columns:
+    disp["Draw↔"] = metrics_disp["Draw"]
+
+disp = round_display(disp).sort_values("Finish_Pos", na_position="last")
 st.dataframe(disp, use_container_width=True)
 
-# ---------- Charts ----------
-st.subheader("Pace Curve — Field Average")
+# ---------- Combined Pace Chart (avg + first 8 finishers) ----------
+st.subheader("Combined Pace Curve — Average (black) + First 8 Finishers")
 avg_mid = metrics["Mid400_Speed"].mean()
 avg_fin = metrics["Final400_Speed"].mean()
-fig1, ax1 = plt.subplots()
-ax1.plot([1, 2], [avg_mid, avg_fin], marker="o")
-ax1.set_xticks([1, 2])
-ax1.set_xticklabels(["Mid 400 (800→400)", "Final 400 (400→Finish)"])
-ax1.set_ylabel("Speed (m/s)")
-ax1.set_title("Average Pace Curve")
-st.pyplot(fig1)
-
-st.subheader("Pace Curve — First 8 Finishers")
 top8 = metrics.sort_values("Finish_Pos").head(8)
-fig2, ax2 = plt.subplots()
-colors = plt.cm.tab10.colors  # distinct colours
+
+fig, ax = plt.subplots()
 x_vals = [1, 2]
+# Average in thick black
+ax.plot(x_vals, [avg_mid, avg_fin], marker="o", color="black", linewidth=3, label="Field Average")
+
+# First 8 finishers in distinct colours
+colors = plt.cm.tab10.colors
 for idx, (_, row) in enumerate(top8.iterrows()):
     y_vals = [row["Mid400_Speed"], row["Final400_Speed"]]
-    color = colors[idx % len(colors)]
-    ax2.plot(x_vals, y_vals, marker="o", label=str(row["Horse"]), color=color, linewidth=2)
-ax2.set_xticks([1, 2])
-ax2.set_xticklabels(["Mid 400 (800→400)", "Final 400 (400→Finish)"])
-ax2.set_ylabel("Speed (m/s)")
-ax2.set_title("Per-Horse Pace Curves (Top 8 by Finish)")
-ax2.grid(True, linestyle="--", alpha=0.3)
-fig2.legend(loc="lower center", ncol=4, bbox_to_anchor=(0.5, -0.12))
-st.pyplot(fig2)
+    ax.plot(x_vals, y_vals, marker="o", linewidth=2, color=colors[idx % len(colors)], label=str(row["Horse"]))
+
+ax.set_xticks([1, 2])
+ax.set_xticklabels(["Mid 400 (800→400)", "Final 400 (400→Finish)"])
+ax.set_ylabel("Speed (m/s)")
+ax.set_title("Pace Curves")
+ax.grid(True, linestyle="--", alpha=0.3)
+fig.legend(loc="lower center", ncol=5, bbox_to_anchor=(0.5, -0.18))
+st.pyplot(fig)
 
 # ---------- Insights & Sleepers ----------
 st.subheader("Insights")
@@ -393,9 +391,9 @@ else:
         race_shape = "Even"
     st.write(f"**Race shape (by SPI median):** {race_shape} (median SPI {spi_median:.1f}%)")
 
-sleepers = disp[disp["Sleeper"] == True][["Horse","Finish_Pos","Refined_FSP_%","Pos_Change"]]
+sleepers = disp[disp["Sleeper"] == True][["Horse","Finish_Pos","Refined_FSP_%","Pos_Change"]] if "Sleeper" in disp.columns else pd.DataFrame()
 st.subheader("Sleepers")
-if sleepers.empty:
+if sleepers is None or sleepers.empty:
     st.write("No clear sleepers flagged under current thresholds.")
 else:
     st.dataframe(sleepers, use_container_width=True)
