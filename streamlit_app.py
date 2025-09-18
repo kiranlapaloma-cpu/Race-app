@@ -1,4 +1,3 @@
-import io
 import re
 from pathlib import Path
 
@@ -38,58 +37,78 @@ def _dbg(label, obj=None):
             st.write(obj)
 
 # =========================================================
-# Helpers: parsing, headers, metrics, GCI v3.1
+# Helpers: parsing, metrics, GCI v3.1, narratives
 # =========================================================
 def parse_race_time(val):
-    """Parse time in seconds, 'M:SS(.ms)', or 'H:MM:SS(.ms)'. Returns float seconds or NaN."""
+    """
+    Accepts:
+      - seconds as float/int:  "72.45"
+      - M:SS(.ms):            "1:12.45"
+      - H:MM:SS(.ms):         "0:01:12.45"
+      - M:SS:ms (TPD-style):  "01:24:510"  -> 84.510 seconds
+    """
     if pd.isna(val):
         return np.nan
     s = str(val).strip()
-    # direct float seconds?
+
+    # plain seconds?
     try:
         return float(s)
     except Exception:
         pass
+
     parts = s.split(":")
     try:
-        if len(parts) == 2:  # M:SS(.ms)
+        if len(parts) == 2:
             m, sec = parts
             return int(m) * 60 + float(sec)
-        if len(parts) == 3:  # H:MM:SS(.ms)
-            h, m, sec = parts
-            return int(h) * 3600 + int(m) * 60 + float(sec)
+
+        if len(parts) == 3:
+            a, b, c = parts
+
+            # Heuristic for M:SS:ms (no dot in last piece, <=3 digits, a<60, b<60)
+            if (c.replace(" ", "").isdigit() and "." not in c and len(c) <= 3
+                and b.replace(" ", "").isdigit() and int(b) < 60
+                and a.replace(" ", "").isdigit() and int(a) < 60):
+                return int(a) * 60 + int(b) + (int(c) / 1000.0)
+
+            # Otherwise treat as H:MM:SS(.ms)
+            return int(a) * 3600 + int(b) * 60 + float(c)
+
     except Exception:
         return np.nan
-    return np.nan
 
-def _norm_header(s: str) -> str:
-    """Lowercase & strip punctuation/spaces to match variants."""
-    s = str(s).lower().strip()
-    for ch in [",", " ", "(", ")", "–", "-", "/", "\\"]:
-        s = s.replace(ch, "")
-    return s
+    return np.nan
 
 def compute_metrics(df, distance_m=1400.0):
     out = df.copy()
-    out["Race_AvgSpeed"]  = distance_m / out["RaceTime_s"]
-    out["Mid400_Speed"]   = 400.0 / out["800-400"]
-    out["Final400_Speed"] = 400.0 / out["400-Finish"]
 
-    out["Basic_FSP_%"]   = (out["Final400_Speed"] / out["Race_AvgSpeed"]) * 100.0
-    out["Refined_FSP_%"] = (out["Final400_Speed"] / out["Mid400_Speed"]) * 100.0
-    out["SPI_%"]         = (out["Mid400_Speed"]   / out["Race_AvgSpeed"]) * 100.0
+    # Ensure numeric for required inputs
+    for c in ["RaceTime_s", "800-400", "400-Finish"]:
+        out[c] = pd.to_numeric(out.get(c, np.nan), errors="coerce")
 
-    # Early Position Index (fallbacks, include common alternates)
-    def _get(col, alts):
-        for c in [col] + alts:
-            if c in out.columns:
-                return out[c]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        out["Race_AvgSpeed"]  = distance_m / out["RaceTime_s"]
+        out["Mid400_Speed"]   = 400.0 / out["800-400"]
+        out["Final400_Speed"] = 400.0 / out["400-Finish"]
+
+        out["Basic_FSP_%"]   = (out["Final400_Speed"] / out["Race_AvgSpeed"]) * 100.0
+        out["Refined_FSP_%"] = (out["Final400_Speed"] / out["Mid400_Speed"]) * 100.0
+        out["SPI_%"]         = (out["Mid400_Speed"]   / out["Race_AvgSpeed"]) * 100.0
+
+    out.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    # Early Position Index (fallbacks + common alternates)
+    def _pick(series, *names):
+        for n in names:
+            if n in out.columns:
+                return pd.to_numeric(out[n], errors="coerce")
         return None
 
-    p200 = _get("200_Pos", ["Pos200", "200Pos", "P200"])
-    p400 = _get("400_Pos", ["Pos400", "400Pos", "P400"])
-    p800 = _get("800_Pos", ["Pos800", "800Pos", "P800"])
-    p1000= _get("1000_Pos",["Pos1000","1000Pos","P1000"])
+    p200  = _pick(out, "200_Pos", "Pos200", "200Pos", "P200")
+    p400  = _pick(out, "400_Pos", "Pos400", "400Pos", "P400")
+    p800  = _pick(out, "800_Pos", "Pos800", "800Pos", "P800")
+    p1000 = _pick(out, "1000_Pos","Pos1000","1000Pos","P1000")
 
     if (p200 is not None) and (p400 is not None):
         out["EPI"] = p200 * 0.6 + p400 * 0.4
@@ -102,7 +121,7 @@ def compute_metrics(df, distance_m=1400.0):
 
     # Late position change (400m to finish)
     if ("400_Pos" in out.columns) and ("Finish_Pos" in out.columns):
-        out["Pos_Change"] = out["400_Pos"] - out["Finish_Pos"]
+        out["Pos_Change"] = pd.to_numeric(out["400_Pos"], errors="coerce") - pd.to_numeric(out["Finish_Pos"], errors="coerce")
     elif "Finish_Pos" in out.columns:
         out["Pos_Change"] = np.nan
 
@@ -258,7 +277,6 @@ def compute_gci_v31(row, ctx, distance_m: float, winner_time_s=None):
     score10 = round(10.0 * score01, 2)
     return score10, reasons
 
-# Narrative helpers
 def style_from_epi(epi):
     if pd.isna(epi): return "position unknown"
     if epi <= 2.0:   return "on-speed/leader"
@@ -321,7 +339,7 @@ def runner_summary(row, spi_med):
 # UI: Inputs & Flow (CSV or Manual only)
 # ===================
 st.title("🏇 The Sharpest Edge")
-st.caption("Choose CSV upload or enter values manually. URL and paste ingestion removed for a cleaner workflow.")
+st.caption("CSV upload or manual input. URL and paste ingestion removed.")
 
 with st.sidebar:
     st.header("Data Source")
@@ -355,7 +373,7 @@ try:
     else:
         # ---------- Manual input ----------
         st.subheader("Manual input")
-        st.write("Fill the grid. Time may be seconds (e.g., `72.45`) or `M:SS.ms` (e.g., `1:12.45`).")
+        st.write("Time fields accept seconds (e.g., 72.45) or formats like 1:12.45 or 01:24:510.")
         n_rows = st.number_input("Rows", min_value=1, max_value=30, value=6, step=1)
         if "manual_df" not in st.session_state or st.session_state.get("manual_df_rows", 0) != n_rows:
             st.session_state["manual_df"] = _empty_manual_frame(n_rows)
@@ -363,12 +381,12 @@ try:
 
         if show_example and st.session_state["manual_df"]["Horse"].eq("").all():
             ex = _empty_manual_frame(6)
-            ex.loc[0, ["Horse","Race Time","800-400","400-Finish","200_Pos","400_Pos"]] = ["Runner A","72.40","25.2","23.8",2,3]
-            ex.loc[1, ["Horse","Race Time","800-400","400-Finish","200_Pos","400_Pos"]] = ["Runner B","72.55","25.3","23.9",3,4]
-            ex.loc[2, ["Horse","Race Time","800-400","400-Finish","200_Pos","400_Pos"]] = ["Runner C","73.10","25.7","24.0",6,6]
-            ex.loc[3, ["Horse","Race Time","800-400","400-Finish","200_Pos","400_Pos"]] = ["Runner D","72.90","25.4","24.2",1,2]
-            ex.loc[4, ["Horse","Race Time","800-400","400-Finish","200_Pos","400_Pos"]] = ["Runner E","73.60","26.0","24.3",8,7]
-            ex.loc[5, ["Horse","Race Time","800-400","400-Finish","200_Pos","400_Pos"]] = ["Runner F","73.30","25.9","24.2",5,5]
+            ex.loc[0, ["Horse","Race Time","800-400","400-Finish","200_Pos","400_Pos"]] = ["Runner A","01:24:510","25.2","23.8",2,3]
+            ex.loc[1, ["Horse","Race Time","800-400","400-Finish","200_Pos","400_Pos"]] = ["Runner B","01:24:640","25.3","23.9",3,4]
+            ex.loc[2, ["Horse","Race Time","800-400","400-Finish","200_Pos","400_Pos"]] = ["Runner C","01:24:680","25.7","24.0",6,6]
+            ex.loc[3, ["Horse","Race Time","800-400","400-Finish","200_Pos","400_Pos"]] = ["Runner D","01:24:850","25.4","24.2",1,2]
+            ex.loc[4, ["Horse","Race Time","800-400","400-Finish","200_Pos","400_Pos"]] = ["Runner E","01:25:180","26.0","24.3",8,7]
+            ex.loc[5, ["Horse","Race Time","800-400","400-Finish","200_Pos","400_Pos"]] = ["Runner F","01:25:230","25.9","24.2",5,5]
             st.session_state["manual_df"] = ex
 
         manual_df = st.data_editor(
@@ -378,7 +396,7 @@ try:
             column_config={
                 "Horse": st.column_config.TextColumn(required=True, help="Runner name"),
                 "Finish_Pos": st.column_config.NumberColumn(format="%d", help="Optional (we infer from time if missing)"),
-                "Race Time": st.column_config.TextColumn(help="Seconds or M:SS.ms"),
+                "Race Time": st.column_config.TextColumn(help="Seconds or M:SS(.ms) or M:SS:ms"),
                 "800-400": st.column_config.TextColumn(help="Seconds for 800→400 segment"),
                 "400-Finish": st.column_config.TextColumn(help="Seconds for 400→Finish segment"),
                 "200_Pos": st.column_config.NumberColumn(format="%.1f", help="Optional"),
@@ -413,9 +431,9 @@ except Exception as e:
 st.subheader("Raw table preview")
 st.dataframe(df_raw.head(12), use_container_width=True)
 _dbg("Raw columns", list(df_raw.columns))
+_dbg("Raw dtypes", df_raw.dtypes)
 
 # --- Final normalization so the rest of the app works the same ---
-# Map common alt headers just in case a user’s CSV uses variants
 df = df_raw.rename(columns={
     "Race time": "Race Time", "Race_Time": "Race Time", "RaceTime": "Race Time",
     "800_400": "800-400", "400_Finish": "400-Finish",
@@ -435,6 +453,17 @@ if _missing:
 
 # Parse times safely
 df["RaceTime_s"] = df["Race Time"].apply(parse_race_time)
+
+# Safety net: fix any absurd values (>10 minutes) as M:SS:ms if possible
+mask = df["RaceTime_s"] > 600
+if mask.any():
+    def _m_ss_ms_fallback(x):
+        p = str(x).strip().split(":")
+        if len(p) == 3 and p[2].isdigit() and len(p[2]) <= 3:
+            return int(p[0]) * 60 + int(p[1]) + int(p[2]) / 1000.0
+        return np.nan
+    df.loc[mask, "RaceTime_s"] = df.loc[mask, "Race Time"].apply(_m_ss_ms_fallback).fillna(df.loc[mask, "RaceTime_s"])
+
 for col in ["800-400", "400-Finish"]:
     df[col] = pd.to_numeric(df[col].apply(parse_race_time), errors="coerce")
 
@@ -451,6 +480,7 @@ if ("Finish_Pos" not in df.columns) or df["Finish_Pos"].isna().all():
 
 st.subheader("Converted table (ready for analysis)")
 st.dataframe(df.head(12), use_container_width=True)
+_dbg("Normalized dtypes", df.dtypes)
 
 # ===================
 # Analysis Pipeline
@@ -463,92 +493,124 @@ except Exception as e:
     if DEBUG: st.exception(e)
     st.stop()
 
-# Drop optional columns that clutter
 for drop_col in ["Jockey", "Trainer"]:
     if drop_col in metrics.columns:
         metrics = metrics.drop(columns=[drop_col])
 
 winner_time = None
-if "Finish_Pos" in metrics.columns and "RaceTime_s" in metrics.columns and not metrics["Finish_Pos"].isna().all():
-    try:
+try:
+    if "Finish_Pos" in metrics.columns and "RaceTime_s" in metrics.columns and not metrics["Finish_Pos"].isna().all():
         winner_time = metrics.loc[metrics["Finish_Pos"].idxmin(), "RaceTime_s"]
-    except Exception:
-        winner_time = None
+except Exception as e:
+    if DEBUG: st.exception(e)
 
 ctx = compute_pressure_context(metrics)
 spi_median = ctx["spi_median"]
 
-gci_scores, gci_reasons = [], []
-for _, r in metrics.iterrows():
-    gci, why = compute_gci_v31(r, ctx, distance_m=distance_m, winner_time_s=winner_time)
-    gci_scores.append(gci)
-    gci_reasons.append("; ".join(why))
-metrics["GCI"] = gci_scores
-metrics["GCI_Reasons"] = gci_reasons
-metrics["Group_Candidate"] = metrics["GCI"] >= 7.0
+try:
+    gci_scores, gci_reasons = [], []
+    for _, r in metrics.iterrows():
+        gci, why = compute_gci_v31(r, ctx, distance_m=distance_m, winner_time_s=winner_time)
+        gci_scores.append(gci)
+        gci_reasons.append("; ".join(why))
+    metrics["GCI"] = gci_scores
+    metrics["GCI_Reasons"] = gci_reasons
+    metrics["Group_Candidate"] = metrics["GCI"] >= 7.0
+except Exception as e:
+    st.error("GCI computation failed.")
+    if DEBUG: st.exception(e)
+    st.stop()
 
 # ===================
 # Outputs
 # ===================
-st.subheader("Sectional Metrics")
-disp = round_display(metrics.copy()).sort_values("Finish_Pos", na_position="last")
-st.dataframe(disp, use_container_width=True)
+try:
+    st.subheader("Sectional Metrics")
+    disp = round_display(metrics.copy()).sort_values("Finish_Pos", na_position="last")
+    st.dataframe(disp, use_container_width=True)
+except Exception as e:
+    st.error("Displaying the metrics table failed.")
+    if DEBUG: st.exception(e)
 
-st.subheader("Pace Curves — Field Average (black) + Top 8 by Finish")
-avg_mid = metrics["Mid400_Speed"].mean()
-avg_fin = metrics["Final400_Speed"].mean()
-top8 = metrics.sort_values("Finish_Pos").head(8).copy()
-top8["HorseShort"] = top8["Horse"].astype(str).str.slice(0, 20)
+try:
+    st.subheader("Pace Curves — Field Average (black) + Top 8 by Finish")
+    avg_mid = metrics["Mid400_Speed"].mean()
+    avg_fin = metrics["Final400_Speed"].mean()
+    top8 = metrics.sort_values("Finish_Pos").head(8).copy()
+    top8["HorseShort"] = top8["Horse"].astype(str).str.slice(0, 20)
 
-fig, ax = plt.subplots()
-x_vals = [1, 2]
-ax.plot(x_vals, [avg_mid, avg_fin], marker="o", linewidth=3, color="black", label="Average (Field)")
-for _, row in top8.iterrows():
-    ax.plot(x_vals, [row["Mid400_Speed"], row["Final400_Speed"]], marker="o", linewidth=2, label=row["HorseShort"])
-ax.set_xticks([1, 2]); ax.set_xticklabels(["Mid 400 (800→400)", "Final 400 (400→Finish)"])
-ax.set_ylabel("Speed (m/s)"); ax.set_title("Average vs Top 8 Pace Curves")
-ax.grid(True, linestyle="--", alpha=0.3)
-fig.subplots_adjust(bottom=0.22)
-fig.legend(loc="lower center", ncol=4, bbox_to_anchor=(0.5, 0.0), frameon=False)
-st.pyplot(fig)
+    fig, ax = plt.subplots()
+    x_vals = [1, 2]
+    ax.plot(x_vals, [avg_mid, avg_fin], marker="o", linewidth=3, color="black", label="Average (Field)")
+    for _, row in top8.iterrows():
+        ax.plot(x_vals, [row["Mid400_Speed"], row["Final400_Speed"]], marker="o", linewidth=2, label=row["HorseShort"])
+    ax.set_xticks([1, 2]); ax.set_xticklabels(["Mid 400 (800→400)", "Final 400 (400→Finish)"])
+    ax.set_ylabel("Speed (m/s)"); ax.set_title("Average vs Top 8 Pace Curves")
+    ax.grid(True, linestyle="--", alpha=0.3)
+    fig.subplots_adjust(bottom=0.22)
+    fig.legend(loc="lower center", ncol=4, bbox_to_anchor=(0.5, 0.0), frameon=False)
+    st.pyplot(fig)
+except Exception as e:
+    st.error("Plotting pace curves failed.")
+    if DEBUG: st.exception(e)
 
-st.subheader("Insights")
-if pd.isna(spi_median):
-    st.write("Insufficient data to infer pace context.")
-else:
-    st.write(
-        f"**SPI median:** {spi_median:.1f}%  |  "
-        f"**Early heat (0–1):** {ctx['early_heat']:.2f}  |  "
-        f"**Pressure ratio (EPI≤3.0):** {ctx['pressure_ratio']:.2f}  |  "
-        f"**Field size:** {ctx['field_size']}"
-    )
+try:
+    st.subheader("Insights")
+    if pd.isna(spi_median):
+        st.write("Insufficient data to infer pace context.")
+    else:
+        st.write(
+            f"**SPI median:** {spi_median:.1f}%  |  "
+            f"**Early heat (0–1):** {ctx['early_heat']:.2f}  |  "
+            f"**Pressure ratio (EPI≤3.0):** {ctx['pressure_ratio']:.2f}  |  "
+            f"**Field size:** {ctx['field_size']}"
+        )
+except Exception as e:
+    st.error("Rendering insights failed.")
+    if DEBUG: st.exception(e)
 
-st.subheader("Sleepers")
-sleepers = disp[disp["Sleeper"] == True][["Horse","Finish_Pos","Refined_FSP_%","Pos_Change"]]
-if sleepers.empty:
-    st.write("No clear sleepers flagged under current thresholds.")
-else:
-    st.dataframe(sleepers, use_container_width=True)
+try:
+    st.subheader("Sleepers")
+    sleepers = disp[disp["Sleeper"] == True][["Horse","Finish_Pos","Refined_FSP_%","Pos_Change"]] if 'disp' in locals() else pd.DataFrame()
+    if sleepers.empty:
+        st.write("No clear sleepers flagged under current thresholds.")
+    else:
+        st.dataframe(sleepers, use_container_width=True)
+except Exception as e:
+    st.error("Rendering sleepers table failed.")
+    if DEBUG: st.exception(e)
 
-st.subheader("Potential Group-class candidates (GCI v3.1)")
-cands = metrics.loc[metrics["Group_Candidate"]].copy().sort_values(["GCI","Finish_Pos"], ascending=[False, True])
-if cands.empty:
-    st.write("No horses met the Group-class threshold today.")
-else:
-    st.dataframe(
-        round_display(cands[["Horse","Finish_Pos","RaceTime_s","Refined_FSP_%","Basic_FSP_%","SPI_%","Pos_Change","EPI","GCI","GCI_Reasons"]]),
-        use_container_width=True
-    )
+try:
+    st.subheader("Potential Group-class candidates (GCI v3.1)")
+    cands = metrics.loc[metrics["Group_Candidate"]].copy().sort_values(["GCI","Finish_Pos"], ascending=[False, True])
+    if cands.empty:
+        st.write("No horses met the Group-class threshold today.")
+    else:
+        st.dataframe(
+            round_display(cands[["Horse","Finish_Pos","RaceTime_s","Refined_FSP_%","Basic_FSP_%","SPI_%","Pos_Change","EPI","GCI","GCI_Reasons"]]),
+            use_container_width=True
+        )
+except Exception as e:
+    st.error("Rendering candidates table failed.")
+    if DEBUG: st.exception(e)
 
-st.subheader("Runner-by-runner summaries")
-ordered = metrics.sort_values("Finish_Pos", na_position="last")
-for _, row in ordered.iterrows():
-    st.markdown(runner_summary(row, spi_median))
-    st.markdown("---")
+try:
+    st.subheader("Runner-by-runner summaries")
+    ordered = metrics.sort_values("Finish_Pos", na_position="last")
+    for _, row in ordered.iterrows():
+        st.markdown(runner_summary(row, spi_median))
+        st.markdown("---")
+except Exception as e:
+    st.error("Rendering runner summaries failed.")
+    if DEBUG: st.exception(e)
 
-st.subheader("Download")
-csv_bytes = disp.to_csv(index=False).encode("utf-8")
-st.download_button("Download metrics as CSV", data=csv_bytes, file_name="race_sectional_metrics.csv", mime="text/csv")
+try:
+    st.subheader("Download")
+    csv_bytes = disp.to_csv(index=False).encode("utf-8") if 'disp' in locals() else b""
+    st.download_button("Download metrics as CSV", data=csv_bytes, file_name="race_sectional_metrics.csv", mime="text/csv", disabled=(csv_bytes==b""))
+except Exception as e:
+    st.error("Preparing download failed.")
+    if DEBUG: st.exception(e)
 
 st.caption(
     "Legend: Basic FSP = Final400 / Race Avg; Refined FSP = Final400 / Mid400; "
