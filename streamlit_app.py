@@ -313,9 +313,28 @@ def segments_to_mid_final_400(seg_cols: list[str]) -> tuple[list[str], list[str]
 with st.sidebar:
     st.header("Data Source")
     source = st.radio("Choose input type", ["Upload CSV", "Manual input"], index=1)
-    distance_m = st.number_input("Race distance (m)", min_value=800, max_value=4000, value=1200, step=200, help="Multiples of 200 only")
-    num_horses = st.number_input("Number of horses (manual)", min_value=1, max_value=30, value=8, step=1, disabled=(source != "Manual input"))
-    st.caption("Manual mode shows countdown 200 m segments. Upload mode expects your CSV schema (Race Time, 800-400, 400-Finish).")
+
+    # Accept ANY distance; round grid to nearest 200 upward
+    distance_input = st.number_input(
+        "Race distance (m)",
+        min_value=800, max_value=4000, value=1200, step=10,
+        help="Enter any distance; manual grid rounds UP to nearest 200 m."
+    )
+
+    # Round up for grid; keep true distance for metrics
+    if distance_input % 200 != 0:
+        grid_distance_m = int(np.ceil(distance_input / 200.0) * 200)
+    else:
+        grid_distance_m = int(distance_input)
+    distance_m = float(distance_input)  # used for all metric calculations
+
+    num_horses = st.number_input(
+        "Number of horses (manual)",
+        min_value=1, max_value=30, value=8, step=1,
+        disabled=(source != "Manual input")
+    )
+
+    st.caption("Manual grid uses the rounded distance for 200 m splits; metrics use the exact distance you entered.")
 
 # ===================
 # Collect data (Upload vs Manual)
@@ -330,10 +349,11 @@ if source == "Upload CSV":
         st.stop()
     df_raw = pd.read_csv(uploaded)
     st.success("File loaded.")
+
 else:
     # ----- Manual mode: dynamic grid -----
     try:
-        seg_headers = make_countdown_headers(int(distance_m))
+        seg_headers = make_countdown_headers(int(grid_distance_m))
     except ValueError as e:
         st.error(str(e))
         st.stop()
@@ -348,7 +368,10 @@ else:
         st.session_state["manual_cols"] = tuple(seg_headers)
 
     st.subheader("Manual input (countdown 200 m segments)")
-    st.write(f"Columns: {' | '.join(seg_headers)} — enter **segment times** (seconds or M:SS.ms / M:SS:ms).")
+    seg_list = " | ".join(seg_headers)
+    if distance_m != float(grid_distance_m):
+        st.info(f"Manual grid rounded up: **{int(distance_m)} m → {grid_distance_m} m** for 200 m segments.")
+    st.write(f"Columns: {seg_list} — enter **segment times** (seconds or M:SS.ms / M:SS:ms).")
 
     # 🔧 Force text-compatible dtypes for editor
     manual_source = st.session_state["manual_df"].copy()
@@ -463,6 +486,7 @@ _dbg("Dtypes", df.dtypes)
 # Analysis: metrics + Sleepers + GCI
 # ===================
 try:
+    # ⚠️ Metrics use the exact user-entered distance (not the rounded grid distance)
     metrics = compute_metrics(df, distance_m=float(distance_m))
 
     # Winner time (best Finish_Pos if provided, else fastest RaceTime_s)
@@ -526,14 +550,15 @@ st.pyplot(fig)
 st.subheader("Insights")
 ctx_vals = compute_pressure_context(metrics)
 ctx_spi = ctx_vals.get("spi_median", np.nan)
+grid_note = "" if distance_m == float(grid_distance_m) else f"  •  Grid rounded to {grid_distance_m} m"
 if pd.isna(ctx_spi):
-    st.write("SPI median: —  |  Early heat: —  |  Pressure ratio (EPI≤3.0): —  |  Field size:", ctx_vals.get("field_size", 0))
+    st.write(f"SPI median: —  |  Early heat: —  |  Pressure ratio (EPI≤3.0): —  |  Field size: {ctx_vals.get('field_size', 0)}{grid_note}")
 else:
     st.write(
         f"**SPI median:** {ctx_spi:.1f}%  |  "
         f"**Early heat (0–1):** {ctx_vals['early_heat']:.2f}  |  "
         f"**Pressure ratio (EPI≤3.0):** {ctx_vals['pressure_ratio']:.2f}  |  "
-        f"**Field size:** {ctx_vals['field_size']}"
+        f"**Field size:** {ctx_vals['field_size']}{grid_note}"
     )
 
 st.subheader("Sleepers")
@@ -561,7 +586,8 @@ csv_bytes = disp.to_csv(index=False).encode("utf-8")
 st.download_button("Download metrics as CSV", data=csv_bytes, file_name="race_sectional_metrics.csv", mime="text/csv")
 
 st.caption(
-    "Manual mode uses countdown 200 m segment times (typed as seconds or M:SS.ms / M:SS:ms). We derive RaceTime (seconds), Mid400 and Final400, then compute SPI / Basic FSP / Refined FSP, flag Sleepers, and compute GCI v3.1. "
+    "Manual grid rounds UP to the nearest 200 m for clean 200 m segments; metrics use the exact distance you entered. "
+    "Manual mode: type segment times as seconds or M:SS.ms / M:SS:ms. "
     "Upload mode expects: Horse, Race Time, 800-400, 400-Finish (Finish_Pos optional). "
     "EPI/position fields are optional; when absent, GCI ignores on-pace/leader adjustments."
 )
