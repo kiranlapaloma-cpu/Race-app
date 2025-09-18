@@ -267,15 +267,18 @@ def compute_gci_v31(row, ctx, distance_m: float, winner_time_s=None):
 # =========================================================
 # Manual-mode grid utilities (countdown 200 m segments)
 # =========================================================
-def make_countdown_headers(distance_m: int):
-    """Return segment headers in countdown order, e.g. 1400 -> ['1200m','1000m','800m','600m','400m','200m','Finish']"""
-    if distance_m % 200 != 0 or distance_m < 800:
-        raise ValueError("Distance must be a multiple of 200 and at least 800 m.")
-    headers = []
-    for d in range(distance_m - 200, 0, -200):
-        headers.append(f"{d}m")
+def make_countdown_headers_any(distance_m: float) -> tuple[list[str], int]:
+    """
+    Accept ANY distance (>=800). Rounds UP to the nearest 200 m for the grid.
+    Returns (segment_headers, rounded_distance).
+    Example: 1160 -> headers for 1200 m, and 1200 returned as the rounded distance.
+    """
+    rounded = int(np.ceil(float(distance_m) / 200.0) * 200)
+    if rounded < 800:
+        rounded = 800
+    headers = [f"{d}m" for d in range(rounded - 200, 0, -200)]
     headers.append("Finish")
-    return headers
+    return headers, rounded
 
 def build_manual_frame(n_rows: int, seg_headers: list, keep: pd.DataFrame | None = None) -> pd.DataFrame:
     """
@@ -283,17 +286,14 @@ def build_manual_frame(n_rows: int, seg_headers: list, keep: pd.DataFrame | None
     Seed segment columns as empty strings (object dtype) so TextColumn is allowed.
     """
     cols = ["Horse"] + seg_headers + ["Finish_Pos"]
-    data = {}
-    data["Horse"] = ["" for _ in range(n_rows)]
+    data = {"Horse": ["" for _ in range(n_rows)], "Finish_Pos": [np.nan for _ in range(n_rows)]}
     for h in seg_headers:
-        data[h] = ["" for _ in range(n_rows)]              # object dtype
-    data["Finish_Pos"] = [np.nan for _ in range(n_rows)]   # numeric optional
+        data[h] = ["" for _ in range(n_rows)]  # text/object dtype
     df = pd.DataFrame(data)
     if keep is not None:
         for c in set(keep.columns) & set(cols):
             n = min(n_rows, len(keep))
             df.loc[:n-1, c] = keep.loc[:n-1, c].values
-    # belt-and-braces: enforce object dtype for text columns
     df["Horse"] = df["Horse"].astype("object")
     for h in seg_headers:
         df[h] = df[h].astype("object")
@@ -303,8 +303,8 @@ def segments_to_mid_final_400(seg_cols: list[str]) -> tuple[list[str], list[str]
     """Given countdown segment column names, return mid400 (3rd & 4th from end) and final400 (last two)."""
     if len(seg_cols) < 4:
         return [], []
-    final400_cols = seg_cols[-2:]            # e.g., ['200m','Finish']
-    mid400_cols   = seg_cols[-4:-2]          # e.g., ['600m','400m']
+    final400_cols = seg_cols[-2:]   # e.g., ['200m','Finish']
+    mid400_cols   = seg_cols[-4:-2] # e.g., ['600m','400m']
     return mid400_cols, final400_cols
 
 # ===================
@@ -314,19 +314,12 @@ with st.sidebar:
     st.header("Data Source")
     source = st.radio("Choose input type", ["Upload CSV", "Manual input"], index=1)
 
-    # Accept ANY distance; round grid to nearest 200 upward
-    distance_input = st.number_input(
+    # Accept ANY distance; manual grid will round UP internally
+    distance_m = st.number_input(
         "Race distance (m)",
         min_value=800, max_value=4000, value=1200, step=10,
-        help="Enter any distance; manual grid rounds UP to nearest 200 m."
+        help="Enter any distance. Manual grid rounds UP to the nearest 200 m."
     )
-
-    # Round up for grid; keep true distance for metrics
-    if distance_input % 200 != 0:
-        grid_distance_m = int(np.ceil(distance_input / 200.0) * 200)
-    else:
-        grid_distance_m = int(distance_input)
-    distance_m = float(distance_input)  # used for all metric calculations
 
     num_horses = st.number_input(
         "Number of horses (manual)",
@@ -334,7 +327,7 @@ with st.sidebar:
         disabled=(source != "Manual input")
     )
 
-    st.caption("Manual grid uses the rounded distance for 200 m splits; metrics use the exact distance you entered.")
+    st.caption("Manual grid uses rounded distance for 200 m splits; metrics use the exact distance you entered.")
 
 # ===================
 # Collect data (Upload vs Manual)
@@ -351,12 +344,8 @@ if source == "Upload CSV":
     st.success("File loaded.")
 
 else:
-    # ----- Manual mode: dynamic grid -----
-    try:
-        seg_headers = make_countdown_headers(int(grid_distance_m))
-    except ValueError as e:
-        st.error(str(e))
-        st.stop()
+    # ----- Manual mode: dynamic grid (headers always round up) -----
+    seg_headers, grid_distance_m = make_countdown_headers_any(distance_m)
 
     # Persist / rebuild editor frame when controls change
     key_rows = ("manual_rows" not in st.session_state) or (st.session_state["manual_rows"] != int(num_horses))
@@ -368,10 +357,9 @@ else:
         st.session_state["manual_cols"] = tuple(seg_headers)
 
     st.subheader("Manual input (countdown 200 m segments)")
-    seg_list = " | ".join(seg_headers)
-    if distance_m != float(grid_distance_m):
+    if float(distance_m) != float(grid_distance_m):
         st.info(f"Manual grid rounded up: **{int(distance_m)} m → {grid_distance_m} m** for 200 m segments.")
-    st.write(f"Columns: {seg_list} — enter **segment times** (seconds or M:SS.ms / M:SS:ms).")
+    st.write(f"Columns: {' | '.join(seg_headers)} — enter **segment times** (seconds or M:SS.ms / M:SS:ms).")
 
     # 🔧 Force text-compatible dtypes for editor
     manual_source = st.session_state["manual_df"].copy()
@@ -550,7 +538,7 @@ st.pyplot(fig)
 st.subheader("Insights")
 ctx_vals = compute_pressure_context(metrics)
 ctx_spi = ctx_vals.get("spi_median", np.nan)
-grid_note = "" if distance_m == float(grid_distance_m) else f"  •  Grid rounded to {grid_distance_m} m"
+grid_note = "" if float(distance_m) == float(make_countdown_headers_any(distance_m)[1]) else f"  •  Grid rounded to {make_countdown_headers_any(distance_m)[1]} m"
 if pd.isna(ctx_spi):
     st.write(f"SPI median: —  |  Early heat: —  |  Pressure ratio (EPI≤3.0): —  |  Field size: {ctx_vals.get('field_size', 0)}{grid_note}")
 else:
