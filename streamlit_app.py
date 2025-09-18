@@ -53,6 +53,7 @@ def parse_time_any(val):
     s = s.replace("：", ":")
     s = re.sub(r"[^\d:\.\s]", "", s)
     s = re.sub(r"\s+", "", s)
+    # seconds?
     try:
         return float(s)
     except Exception:
@@ -76,7 +77,7 @@ def parse_time_any(val):
 # Core metric helpers
 # =========================================================
 def compute_metrics(df, distance_m=1400.0):
-    """Assumes df has numeric RaceTime_s, 800-400, 400-Finish columns; optional positions."""
+    """Assumes df has numeric RaceTime_s, 800-400, 400-Finish; optional positions."""
     out = df.copy()
 
     for c in ["RaceTime_s", "800-400", "400-Finish"]:
@@ -134,10 +135,8 @@ def round_display(df):
 # =========================================================
 def flag_sleepers(df):
     """
-    Flags 'Sleeper' if:
-      - Refined_FSP_% >= 102, OR
-      - Pos_Change >= 3 (when available)
-    And (if Finish_Pos present) finished outside top 3.
+    Sleeper = Refined_FSP_% >= 102 OR Pos_Change >= 3 (if available),
+    and (if Finish_Pos present) finished outside top 3.
     """
     out = df.copy()
     out["Sleeper"] = False
@@ -281,19 +280,23 @@ def make_countdown_headers(distance_m: int):
 def build_manual_frame(n_rows: int, seg_headers: list, keep: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Create an empty manual-entry frame with Horse + seg columns (+ optional Finish_Pos).
-    IMPORTANT: seed segment columns as empty strings (object dtype) so TextColumn is allowed.
+    Seed segment columns as empty strings (object dtype) so TextColumn is allowed.
     """
     cols = ["Horse"] + seg_headers + ["Finish_Pos"]
     data = {}
     data["Horse"] = ["" for _ in range(n_rows)]
     for h in seg_headers:
-        data[h] = ["" for _ in range(n_rows)]              # <-- object dtype (text)
+        data[h] = ["" for _ in range(n_rows)]              # object dtype
     data["Finish_Pos"] = [np.nan for _ in range(n_rows)]   # numeric optional
     df = pd.DataFrame(data)
     if keep is not None:
         for c in set(keep.columns) & set(cols):
             n = min(n_rows, len(keep))
             df.loc[:n-1, c] = keep.loc[:n-1, c].values
+    # belt-and-braces: enforce object dtype for text columns
+    df["Horse"] = df["Horse"].astype("object")
+    for h in seg_headers:
+        df[h] = df[h].astype("object")
     return df
 
 def segments_to_mid_final_400(seg_cols: list[str]) -> tuple[list[str], list[str]]:
@@ -345,9 +348,19 @@ else:
         st.session_state["manual_cols"] = tuple(seg_headers)
 
     st.subheader("Manual input (countdown 200 m segments)")
-    st.write(f"Columns: {' | '.join(seg_headers)}  — enter **segment times** (seconds or M:SS.ms / M:SS:ms).")
+    st.write(f"Columns: {' | '.join(seg_headers)} — enter **segment times** (seconds or M:SS.ms / M:SS:ms).")
+
+    # 🔧 Force text-compatible dtypes for editor
+    manual_source = st.session_state["manual_df"].copy()
+    manual_source["Horse"] = manual_source["Horse"].astype("object")
+    for h in seg_headers:
+        if h in manual_source.columns:
+            manual_source[h] = manual_source[h].astype("object")
+    if "Finish_Pos" in manual_source.columns:
+        manual_source["Finish_Pos"] = manual_source["Finish_Pos"].astype("object")
+
     manual_df = st.data_editor(
-        st.session_state["manual_df"],
+        manual_source,
         width="stretch",
         num_rows="dynamic",
         key="manual_editor",
@@ -357,6 +370,9 @@ else:
             "Finish_Pos": st.column_config.NumberColumn(format="%d", help="Optional"),
         },
     )
+
+    # Persist edits back to session so they stick on reruns
+    st.session_state["manual_df"] = manual_df
 
     # Clean blank rows (no Horse)
     df_raw = manual_df.copy()
@@ -415,7 +431,7 @@ else:
         st.error("No segment columns found. Please enter 200 m times in the manual editor.")
         st.stop()
 
-    # Parse each segment to seconds (they are strings in the editor)
+    # Parse each segment to seconds (editor gave us strings)
     for c in seg_cols:
         df[c] = pd.to_numeric(df[c].apply(parse_time_any), errors="coerce")
 
@@ -508,8 +524,8 @@ fig.legend(loc="lower center", ncol=4, bbox_to_anchor=(0.5, 0.0), frameon=False)
 st.pyplot(fig)
 
 st.subheader("Insights")
-ctx_spi = compute_pressure_context(metrics).get("spi_median", np.nan)
 ctx_vals = compute_pressure_context(metrics)
+ctx_spi = ctx_vals.get("spi_median", np.nan)
 if pd.isna(ctx_spi):
     st.write("SPI median: —  |  Early heat: —  |  Pressure ratio (EPI≤3.0): —  |  Field size:", ctx_vals.get("field_size", 0))
 else:
@@ -521,7 +537,7 @@ else:
     )
 
 st.subheader("Sleepers")
-sleepers = disp[disp["Sleeper"] == True][["Horse","Finish_Pos","Refined_FSP_%","Pos_Change"]] if 'disp' in locals() else pd.DataFrame()
+sleepers = disp[disp["Sleeper"] == True][["Horse","Finish_Pos","Refined_FSP_%","Pos_Change"]]
 if sleepers.empty:
     st.write("No clear sleepers flagged under current thresholds.")
 else:
