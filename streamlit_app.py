@@ -418,7 +418,7 @@ elif source == "Web URL":
         st.stop()
 
 else:
-    # ---------- Paste table (robust for squashed TPD text) ----------
+    # ---------- Paste table (robust for compact/fused TPD text) ----------
     st.markdown("Run your bookmarklet → a white box appears → Select All → Copy → paste **everything** below.")
     pasted = st.text_area("Paste table here (raw)", height=280)
     if not pasted.strip():
@@ -433,10 +433,17 @@ else:
         """
         Turn 'one huge line of headers + numbers' into a TSV with real columns.
         Output headers: Result, No.(Draw), Horse, 800m, 600m, 400m, 200m, Finish
+        Handles fused tokens like:
+          '158.37','613.78','910.81','1113.55','1212.64' → keep only the time part.
         """
         lines = [ln for ln in txt.splitlines() if ln.strip()]
         if not lines:
             return txt
+
+        # helper: defuse leading position stuck to a float (1–2 digits allowed)
+        def _defuse_fused_number(tok: str) -> str:
+            m = re.match(r'^(\d{1,2})(\d+\.\d{1,3})$', tok)
+            return m.group(2) if m else tok
 
         # Find header line (contains 800m/600m/400m/200m)
         hdr_idx = 0
@@ -449,14 +456,17 @@ else:
         header = ["Result", "No.(Draw)", "Horse", "800m", "600m", "400m", "200m", "Finish"]
         out = ["\t".join(header)]
 
-        time_pat = re.compile(r"^(?:\d+:\d{2}\.\d{1,3}|\d+\.\d{1,3}|NR)$")
+        time_pat     = re.compile(r"^(?:\d+:\d{2}\.\d{1,3}|\d+\.\d{1,3}|NR)$")
         pos_draw_pat = re.compile(r"^\d+\(\d+\)$")
-        float_pat = re.compile(r"\d+\.\d{1,3}")
+        float_pat    = re.compile(r"\d+\.\d{1,3}")
 
         for ln in rows:
             toks = ln.strip().split()
             if not toks:
                 continue
+
+            # defuse fused tokens first (e.g. '1113.55' -> '13.55')
+            toks = [_defuse_fused_number(t) for t in toks]
 
             # 1) Result/time (or NR): first token that matches time/NR
             t_res = ""
@@ -484,10 +494,13 @@ else:
                     horse_parts.append(tok)
             horse = " ".join(horse_parts).strip()
 
+            # defuse again inside the segment tokens (safety)
+            seg_tokens = [_defuse_fused_number(t) for t in seg_tokens]
+
             # 4) Pull floats from segment tokens. Expect at least 5 floats; if more, take the last 5.
             floats = [ft for tok in seg_tokens for ft in float_pat.findall(tok)]
             if len(floats) >= 5:
-                seg_vals = floats[-5:]  # assume order corresponds to 800m, 600m, 400m, 200m, Finish
+                seg_vals = floats[-5:]  # assume order: 800m, 600m, 400m, 200m, Finish
             else:
                 seg_vals = floats + [""] * (5 - len(floats))
 
@@ -541,7 +554,7 @@ if _missing:
         "Missing: " + ", ".join(_missing) +
         "\n\nTips:\n"
         "• Make sure you pasted the actual table text (not a screenshot).\n"
-        "• The parser now handles compact TPD pastes and tab-separated text.\n"
+        "• The parser now handles compact TPD pastes, fused position+time tokens, and tabs.\n"
         "• Check the Raw preview above to see how headers came through."
     )
     st.stop()
