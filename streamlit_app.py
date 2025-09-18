@@ -41,41 +41,35 @@ def _dbg(label, obj=None):
 # =========================================================
 # Time parsing (seconds, M:SS.ms, M:SS:ms like 01:37:620, H:MM:SS(.ms))
 # =========================================================
-_M_SS_MS_RE   = re.compile(r"^(?P<m>\d{1,2}):(?P<s>\d{2}):(?P<ms>\d{2,3})$")      # 01:37:620
-_M_SS_DMS_RE  = re.compile(r"^(?P<m>\d{1,2}):(?P<s>\d{2}\.\d+)$")                  # 1:12.45
-_H_MM_SS_RE   = re.compile(r"^(?P<h>\d+):(?P<m>\d{2}):(?P<s>\d{2}(?:\.\d+)?)$")    # 0:01:12.45
+_M_SS_MS_RE   = re.compile(r"^(?P<m>\d{1,2}):(?P<s>\d{2}):(?P<ms>\d{2,3})$")
+_M_SS_DMS_RE  = re.compile(r"^(?P<m>\d{1,2}):(?P<s>\d{2}\.\d+)$")
+_H_MM_SS_RE   = re.compile(r"^(?P<h>\d+):(?P<m>\d{2}):(?P<s>\d{2}(?:\.\d+)?)$")
 
 def parse_time_any(val):
     """Return seconds (float) from seconds, M:SS.ms, M:SS:ms, or H:MM:SS(.ms)."""
     if pd.isna(val):
         return np.nan
     s = str(val).strip()
-    s = s.replace("：", ":")                         # normalize unicode colon
-    s = re.sub(r"[^\d:\.\s]", "", s)                # keep digits/colon/dot/space
+    s = s.replace("：", ":")
+    s = re.sub(r"[^\d:\.\s]", "", s)
     s = re.sub(r"\s+", "", s)
-
-    # plain seconds?
     try:
         return float(s)
     except Exception:
         pass
-
     m = _M_SS_MS_RE.match(s)
     if m:
         mm, ss, ms = int(m.group("m")), int(m.group("s")), int(m.group("ms"))
         if ss < 60 and ms < 1000:
             return mm * 60 + ss + ms / 1000.0
-
     m = _M_SS_DMS_RE.match(s)
     if m:
         mm, sec = int(m.group("m")), float(m.group("s"))
         return mm * 60 + sec
-
     m = _H_MM_SS_RE.match(s)
     if m:
         hh, mm, sec = int(m.group("h")), int(m.group("m")), float(m.group("s"))
         return hh * 3600 + mm * 60 + sec
-
     return np.nan
 
 # =========================================================
@@ -104,7 +98,7 @@ def compute_metrics(df, distance_m=1400.0):
 
     out.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-    # EPI (optional; only if positions exist)
+    # EPI (optional)
     if ("200_Pos" in out.columns) and ("400_Pos" in out.columns):
         out["EPI"] = out["200_Pos"] * 0.6 + out["400_Pos"] * 0.4
     elif ("1000_Pos" in out.columns) and ("800_Pos" in out.columns):
@@ -127,9 +121,10 @@ def round_display(df):
     for c in ["Basic_FSP_%", "Refined_FSP_%", "SPI_%", "Race_AvgSpeed", "Mid400_Speed", "Final400_Speed"]:
         if c in df.columns:
             df.loc[:, c] = df[c].round(2)
-    for c in ["RaceTime_s", "EPI"]:
-        if c in df.columns:
-            df.loc[:, c] = df[c].round(3 if c == "RaceTime_s" else 1)
+    if "RaceTime_s" in df.columns:
+        df.loc[:, "RaceTime_s"] = df["RaceTime_s"].round(3)
+    if "EPI" in df.columns:
+        df.loc[:, "EPI"] = df["EPI"].round(1)
     if "Pos_Change" in df.columns:
         df.loc[:, "Pos_Change"] = df["Pos_Change"].round(0).astype("Int64")
     return df
@@ -143,7 +138,6 @@ def flag_sleepers(df):
       - Refined_FSP_% >= 102, OR
       - Pos_Change >= 3 (when available)
     And (if Finish_Pos present) finished outside top 3.
-    Works even without positions (then uses the first rule only).
     """
     out = df.copy()
     out["Sleeper"] = False
@@ -175,23 +169,20 @@ def compute_pressure_context(metrics_df):
     return {"early_heat": early_heat, "pressure_ratio": pressure_ratio, "field_size": field_size, "spi_median": spi_med}
 
 def _distance_bucket(distance_m: float) -> str:
-    if distance_m <= 1400:
-        return "SPRINT"
-    if distance_m < 1800:
-        return "MILE"
-    if distance_m < 2200:
-        return "MIDDLE"
+    if distance_m <= 1400: return "SPRINT"
+    if distance_m < 1800:  return "MILE"
+    if distance_m < 2200:  return "MIDDLE"
     return "STAY"
 
 def distance_profile(distance_m: float) -> dict:
     b = _distance_bucket(distance_m)
     if b == "SPRINT":
-        return dict(bucket=b, wT=0.22, wPACE=0.38, wSS=0.20, wEFF=0.20, lq_ref_w=0.70, lq_basic_w=0.30, ss_lo=99.0, ss_hi=105.0, lq_floor=0.35)
+        return dict(bucket=b, wT=0.22, wPACE=0.38, wSS=0.20, wEFF=0.20, lq_ref_w=0.70, lq_basic_w=0.30, ss_lo=99.0,  ss_hi=105.0, lq_floor=0.35)
     if b == "STAY":
         return dict(bucket=b, wT=0.30, wPACE=0.28, wSS=0.30, wEFF=0.12, lq_ref_w=0.50, lq_basic_w=0.50, ss_lo=97.5, ss_hi=104.5, lq_floor=0.25)
     if b == "MIDDLE":
-        return dict(bucket=b, wT=0.27, wPACE=0.32, wSS=0.28, wEFF=0.13, lq_ref_w=0.60, lq_basic_w=0.40, ss_lo=98.0, ss_hi=105.0, lq_floor=0.30)
-    return dict(bucket="MILE", wT=0.25, wPACE=0.35, wSS=0.25, wEFF=0.15, lq_ref_w=0.60, lq_basic_w=0.40, ss_lo=98.0, ss_hi=105.0, lq_floor=0.30)
+        return dict(bucket=b, wT=0.27, wPACE=0.32, wSS=0.28, wEFF=0.13, lq_ref_w=0.60, lq_basic_w=0.40, ss_lo=98.0,  ss_hi=105.0, lq_floor=0.30)
+    return dict(bucket="MILE", wT=0.25, wPACE=0.35, wSS=0.25, wEFF=0.15, lq_ref_w=0.60, lq_basic_w=0.40, ss_lo=98.0,  ss_hi=105.0, lq_floor=0.30)
 
 def compute_gci_v31(row, ctx, distance_m: float, winner_time_s=None):
     prof = distance_profile(float(distance_m))
@@ -214,38 +205,30 @@ def compute_gci_v31(row, ctx, distance_m: float, winner_time_s=None):
     T = 0.0
     if (winner_time_s is not None) and (not pd.isna(rtime)):
         deficit = rtime - winner_time_s
-        if deficit <= 0.30:
-            T = 1.0; reasons.append("≤0.30s off winner")
-        elif deficit <= 0.60:
-            T = 0.7; reasons.append("0.31–0.60s off winner")
-        elif deficit <= 1.00:
-            T = 0.4; reasons.append("0.61–1.00s off winner")
-        else:
-            T = 0.2
+        if deficit <= 0.30: T = 1.0; reasons.append("≤0.30s off winner")
+        elif deficit <= 0.60: T = 0.7; reasons.append("0.31–0.60s off winner")
+        elif deficit <= 1.00: T = 0.4; reasons.append("0.61–1.00s off winner")
+        else: T = 0.2
 
     # LQ: Late quality (distance-aware blend)
     def map_pct(x): return max(0.0, min(1.0, (x - 98.0) / 6.0))  # 98→0, 104→1
     LQ = 0.0
     if not pd.isna(refined) and not pd.isna(basic):
         LQ = prof["lq_ref_w"] * map_pct(refined) + prof["lq_basic_w"] * map_pct(basic)
-        if refined >= 103:
-            reasons.append("strong late profile")
-        elif refined >= 101.5:
-            reasons.append("useful late profile")
+        if refined >= 103: reasons.append("strong late profile")
+        elif refined >= 101.5: reasons.append("useful late profile")
 
     # OP: On-pace merit (with pressure gates)
     OP = 0.0
     if not pd.isna(epi) and not pd.isna(basic):
         on_speed = (epi <= 2.5)
         handy    = (epi <= 3.5)
-        if handy and basic >= 99:
-            OP = 0.5
-        if on_speed and basic >= 100:
-            OP = max(OP, 0.7)
+        if handy and basic >= 99: OP = 0.5
+        if on_speed and basic >= 100: OP = max(OP, 0.7)
         if on_speed and fast_early and (early_heat >= 0.7) and (pressure_rat >= 0.35) and basic >= 100:
             OP = max(OP, 1.0); reasons.append("on-speed under genuine heat & pressure")
 
-    # Leader Tax (applies only when we can infer early lead & soft conditions)
+    # Leader Tax
     LT = 0.0
     if not pd.isna(epi) and epi <= 2.0:
         soft_early = (early_heat < 0.5)
@@ -264,20 +247,17 @@ def compute_gci_v31(row, ctx, distance_m: float, winner_time_s=None):
     else:
         mean_sb = (spi + basic) / 2.0
         SS = _to01(mean_sb, prof["ss_lo"], prof["ss_hi"])
-        if mean_sb >= (prof["ss_hi"] - 2.0):
-            reasons.append("strong sustained speed")
+        if mean_sb >= (prof["ss_hi"] - 2.0): reasons.append("strong sustained speed")
 
     # EFF: Efficiency
     if pd.isna(refined):
         EFF = 0.0
     else:
         EFF = max(0.0, 1.0 - abs(refined - 100.0) / 8.0)
-        if 99 <= refined <= 103:
-            reasons.append("efficient sectional profile")
+        if 99 <= refined <= 103: reasons.append("efficient sectional profile")
 
     wT, wPACE, wSS, wEFF = prof["wT"], prof["wPACE"], prof["wSS"], prof["wEFF"]
     PACE = max(LQ, OP) * (1.0 - LT)
-
     if LQ < prof["lq_floor"]:
         PACE = min(PACE, 0.60)
 
@@ -296,13 +276,20 @@ def make_countdown_headers(distance_m: int):
     for d in range(distance_m - 200, 0, -200):
         headers.append(f"{d}m")
     headers.append("Finish")
-    return headers  # each header is a 200 m segment time
+    return headers
 
 def build_manual_frame(n_rows: int, seg_headers: list, keep: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Create an empty manual-entry frame with Horse + seg columns (+ optional Finish_Pos). Preserve overlapping data from `keep`."""
+    """
+    Create an empty manual-entry frame with Horse + seg columns (+ optional Finish_Pos).
+    IMPORTANT: seed segment columns as empty strings (object dtype) so TextColumn is allowed.
+    """
     cols = ["Horse"] + seg_headers + ["Finish_Pos"]
-    df = pd.DataFrame({c: [np.nan]*n_rows for c in cols})
-    df["Horse"] = ""
+    data = {}
+    data["Horse"] = ["" for _ in range(n_rows)]
+    for h in seg_headers:
+        data[h] = ["" for _ in range(n_rows)]              # <-- object dtype (text)
+    data["Finish_Pos"] = [np.nan for _ in range(n_rows)]   # numeric optional
+    df = pd.DataFrame(data)
     if keep is not None:
         for c in set(keep.columns) & set(cols):
             n = min(n_rows, len(keep))
@@ -310,8 +297,7 @@ def build_manual_frame(n_rows: int, seg_headers: list, keep: pd.DataFrame | None
     return df
 
 def segments_to_mid_final_400(seg_cols: list[str]) -> tuple[list[str], list[str]]:
-    """Given countdown segment column names, return two lists of column names to sum:
-       mid400 uses the 3rd and 4th from the end; final400 uses last two."""
+    """Given countdown segment column names, return mid400 (3rd & 4th from end) and final400 (last two)."""
     if len(seg_cols) < 4:
         return [], []
     final400_cols = seg_cols[-2:]            # e.g., ['200m','Finish']
@@ -324,10 +310,8 @@ def segments_to_mid_final_400(seg_cols: list[str]) -> tuple[list[str], list[str]
 with st.sidebar:
     st.header("Data Source")
     source = st.radio("Choose input type", ["Upload CSV", "Manual input"], index=1)
-
     distance_m = st.number_input("Race distance (m)", min_value=800, max_value=4000, value=1200, step=200, help="Multiples of 200 only")
     num_horses = st.number_input("Number of horses (manual)", min_value=1, max_value=30, value=8, step=1, disabled=(source != "Manual input"))
-
     st.caption("Manual mode shows countdown 200 m segments. Upload mode expects your CSV schema (Race Time, 800-400, 400-Finish).")
 
 # ===================
@@ -343,9 +327,8 @@ if source == "Upload CSV":
         st.stop()
     df_raw = pd.read_csv(uploaded)
     st.success("File loaded.")
-
 else:
-    # ----- Manual mode: build dynamic grid from distance & number of horses -----
+    # ----- Manual mode: dynamic grid -----
     try:
         seg_headers = make_countdown_headers(int(distance_m))
     except ValueError as e:
@@ -355,7 +338,6 @@ else:
     # Persist / rebuild editor frame when controls change
     key_rows = ("manual_rows" not in st.session_state) or (st.session_state["manual_rows"] != int(num_horses))
     key_cols = ("manual_cols" not in st.session_state) or (st.session_state["manual_cols"] != tuple(seg_headers))
-
     if key_rows or key_cols or ("manual_df" not in st.session_state):
         keep = st.session_state.get("manual_df")
         st.session_state["manual_df"] = build_manual_frame(int(num_horses), seg_headers, keep=keep)
@@ -433,7 +415,7 @@ else:
         st.error("No segment columns found. Please enter 200 m times in the manual editor.")
         st.stop()
 
-    # Parse each segment to seconds
+    # Parse each segment to seconds (they are strings in the editor)
     for c in seg_cols:
         df[c] = pd.to_numeric(df[c].apply(parse_time_any), errors="coerce")
 
@@ -466,6 +448,7 @@ _dbg("Dtypes", df.dtypes)
 # ===================
 try:
     metrics = compute_metrics(df, distance_m=float(distance_m))
+
     # Winner time (best Finish_Pos if provided, else fastest RaceTime_s)
     winner_time = None
     if "Finish_Pos" in df.columns and df["Finish_Pos"].notna().any():
@@ -525,15 +508,16 @@ fig.legend(loc="lower center", ncol=4, bbox_to_anchor=(0.5, 0.0), frameon=False)
 st.pyplot(fig)
 
 st.subheader("Insights")
-ctx_spi = ctx.get("spi_median", np.nan)
+ctx_spi = compute_pressure_context(metrics).get("spi_median", np.nan)
+ctx_vals = compute_pressure_context(metrics)
 if pd.isna(ctx_spi):
-    st.write("SPI median: —  |  Early heat: —  |  Pressure ratio (EPI≤3.0): —  |  Field size: ", ctx.get("field_size", 0))
+    st.write("SPI median: —  |  Early heat: —  |  Pressure ratio (EPI≤3.0): —  |  Field size:", ctx_vals.get("field_size", 0))
 else:
     st.write(
         f"**SPI median:** {ctx_spi:.1f}%  |  "
-        f"**Early heat (0–1):** {ctx['early_heat']:.2f}  |  "
-        f"**Pressure ratio (EPI≤3.0):** {ctx['pressure_ratio']:.2f}  |  "
-        f"**Field size:** {ctx['field_size']}"
+        f"**Early heat (0–1):** {ctx_vals['early_heat']:.2f}  |  "
+        f"**Pressure ratio (EPI≤3.0):** {ctx_vals['pressure_ratio']:.2f}  |  "
+        f"**Field size:** {ctx_vals['field_size']}"
     )
 
 st.subheader("Sleepers")
@@ -561,7 +545,7 @@ csv_bytes = disp.to_csv(index=False).encode("utf-8")
 st.download_button("Download metrics as CSV", data=csv_bytes, file_name="race_sectional_metrics.csv", mime="text/csv")
 
 st.caption(
-    "Manual mode uses countdown 200 m segment times. We derive RaceTime (seconds), Mid400 and Final400, then compute SPI / Basic FSP / Refined FSP, flag Sleepers, and compute GCI v3.1. "
+    "Manual mode uses countdown 200 m segment times (typed as seconds or M:SS.ms / M:SS:ms). We derive RaceTime (seconds), Mid400 and Final400, then compute SPI / Basic FSP / Refined FSP, flag Sleepers, and compute GCI v3.1. "
     "Upload mode expects: Horse, Race Time, 800-400, 400-Finish (Finish_Pos optional). "
     "EPI/position fields are optional; when absent, GCI ignores on-pace/leader adjustments."
 )
