@@ -177,12 +177,7 @@ def compute_pressure_context(metrics_df):
         valid_epi = epi_series.dropna()
         field_size = int(metrics_df.shape[0])
         pressure_ratio = 0.0 if valid_epi.empty else float((valid_epi <= 3.0).mean())
-    return {
-        "early_heat": early_heat,
-        "pressure_ratio": pressure_ratio,
-        "field_size": field_size,
-        "spi_median": spi_med
-    }
+    return {"early_heat": early_heat, "pressure_ratio": pressure_ratio, "field_size": field_size, "spi_median": spi_med}
 
 def _distance_bucket(distance_m: float) -> str:
     if distance_m <= 1400:
@@ -196,16 +191,12 @@ def _distance_bucket(distance_m: float) -> str:
 def distance_profile(distance_m: float) -> dict:
     b = _distance_bucket(distance_m)
     if b == "SPRINT":
-        return dict(bucket=b, wT=0.22, wPACE=0.38, wSS=0.20, wEFF=0.20,
-                    lq_ref_w=0.70, lq_basic_w=0.30, ss_lo=99.0, ss_hi=105.0, lq_floor=0.35)
+        return dict(bucket=b, wT=0.22, wPACE=0.38, wSS=0.20, wEFF=0.20, lq_ref_w=0.70, lq_basic_w=0.30, ss_lo=99.0, ss_hi=105.0, lq_floor=0.35)
     if b == "STAY":
-        return dict(bucket=b, wT=0.30, wPACE=0.28, wSS=0.30, wEFF=0.12,
-                    lq_ref_w=0.50, lq_basic_w=0.50, ss_lo=97.5, ss_hi=104.5, lq_floor=0.25)
+        return dict(bucket=b, wT=0.30, wPACE=0.28, wSS=0.30, wEFF=0.12, lq_ref_w=0.50, lq_basic_w=0.50, ss_lo=97.5, ss_hi=104.5, lq_floor=0.25)
     if b == "MIDDLE":
-        return dict(bucket=b, wT=0.27, wPACE=0.32, wSS=0.28, wEFF=0.13,
-                    lq_ref_w=0.60, lq_basic_w=0.40, ss_lo=98.0, ss_hi=105.0, lq_floor=0.30)
-    return dict(bucket="MILE", wT=0.25, wPACE=0.35, wSS=0.25, wEFF=0.15,
-                lq_ref_w=0.60, lq_basic_w=0.40, ss_lo=98.0, ss_hi=105.0, lq_floor=0.30)
+        return dict(bucket=b, wT=0.27, wPACE=0.32, wSS=0.28, wEFF=0.13, lq_ref_w=0.60, lq_basic_w=0.40, ss_lo=98.0, ss_hi=105.0, lq_floor=0.30)
+    return dict(bucket="MILE", wT=0.25, wPACE=0.35, wSS=0.25, wEFF=0.15, lq_ref_w=0.60, lq_basic_w=0.40, ss_lo=98.0, ss_hi=105.0, lq_floor=0.30)
 
 def compute_gci_v31(row, ctx, distance_m: float, winner_time_s=None):
     prof = distance_profile(float(distance_m))
@@ -228,43 +219,47 @@ def compute_gci_v31(row, ctx, distance_m: float, winner_time_s=None):
     T = 0.0
     if (winner_time_s is not None) and (not pd.isna(rtime)):
         deficit = rtime - winner_time_s
-        if deficit <= 0.30: T = 1.0; reasons.append("≤0.30s off winner")
-        elif deficit <= 0.60: T = 0.7; reasons.append("0.31–0.60s off winner")
-        elif deficit <= 1.00: T = 0.4; reasons.append("0.61–1.00s off winner")
-        else: T = 0.2
+        if deficit <= 0.30:
+            T = 1.0; reasons.append("≤0.30s off winner")
+        elif deficit <= 0.60:
+            T = 0.7; reasons.append("0.31–0.60s off winner")
+        elif deficit <= 1.00:
+            T = 0.4; reasons.append("0.61–1.00s off winner")
+        else:
+            T = 0.2
 
     # LQ: Late quality (distance-aware blend)
     def map_pct(x): return max(0.0, min(1.0, (x - 98.0) / 6.0))  # 98→0, 104→1
     LQ = 0.0
     if not pd.isna(refined) and not pd.isna(basic):
         LQ = prof["lq_ref_w"] * map_pct(refined) + prof["lq_basic_w"] * map_pct(basic)
-        if refined >= 103: reasons.append("strong late profile")
-        elif refined >= 101.5: reasons.append("useful late profile")
+        if refined >= 103:
+            reasons.append("strong late profile")
+        elif refined >= 101.5:
+            reasons.append("useful late profile")
 
     # OP: On-pace merit (with pressure gates)
     OP = 0.0
     if not pd.isna(epi) and not pd.isna(basic):
         on_speed = (epi <= 2.5)
         handy    = (epi <= 3.5)
-        if handy and basic >= 99: OP = 0.5
-        if on-speed := (epi <= 2.5):
-            pass  # (kept for readability; already used)
-
+        if handy and basic >= 99:
+            OP = 0.5
         if on_speed and basic >= 100:
             OP = max(OP, 0.7)
-        if on_speed and (not pd.isna(spi_median)) and (spi_median >= 103) and (float(ctx.get("early_heat",0.0)) >= 0.7) and (float(ctx.get("pressure_ratio",0.0)) >= 0.35) and basic >= 100:
+        if on_speed and fast_early and (early_heat >= 0.7) and (pressure_rat >= 0.35) and basic >= 100:
             OP = max(OP, 1.0); reasons.append("on-speed under genuine heat & pressure")
 
     # Leader Tax
     LT = 0.0
     if not pd.isna(epi) and epi <= 2.0:
-        soft_early = (float(ctx.get("early_heat", 0.0)) < 0.5)
-        low_press  = (float(ctx.get("pressure_ratio", 0.0)) < 0.30)
+        soft_early = (early_heat < 0.5)
+        low_press  = (pressure_rat < 0.30)
         weak_late  = (pd.isna(refined) or refined < 100.0) or (pd.isna(basic) or basic < 100.0)
         if soft_early: LT += 0.25
         if low_press:  LT += 0.20
         if weak_late:  LT += 0.20
-        if (not pd.isna(spi_median)) and (spi_median <= 97): LT += 0.15
+        if sprint_home: LT += 0.15
         LT = min(0.60, LT)
         if LT > 0: reasons.append(f"leader tax applied ({LT:.2f})")
 
@@ -282,7 +277,8 @@ def compute_gci_v31(row, ctx, distance_m: float, winner_time_s=None):
         EFF = 0.0
     else:
         EFF = max(0.0, 1.0 - abs(refined - 100.0) / 8.0)
-        if 99 <= refined <= 103: reasons.append("efficient sectional profile")
+        if 99 <= refined <= 103:
+            reasons.append("efficient sectional profile")
 
     wT, wPACE, wSS, wEFF = prof["wT"], prof["wPACE"], prof["wSS"], prof["wEFF"]
     PACE = max(LQ, OP) * (1.0 - LT)
