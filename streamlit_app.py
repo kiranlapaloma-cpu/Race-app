@@ -32,10 +32,10 @@ else:
     st.warning("Logo not found. Tried:\n" + "\n".join(str(p) for p in CANDIDATE_LOGO_PATHS))
 
 # =========================================================
-# Helper functions: parsing, metrics, GCI v3.1, narratives
+# Helper functions: parsing, headers, metrics, GCI v3.1
 # =========================================================
 def parse_race_time(val):
-    """Parse Race Time as seconds or 'MM:SS:ms' (e.g., 1:12.49)."""
+    """Parse Race Time as seconds or 'MM:SS.ms' (e.g., 1:12.49)."""
     if pd.isna(val):
         return np.nan
     try:
@@ -54,6 +54,17 @@ def parse_race_time(val):
     except Exception:
         return np.nan
     return np.nan
+
+def _norm_header(s: str) -> str:
+    """Lowercase, strip spaces/commas to match variants like '1,000 m' → '1000m'."""
+    s = str(s).strip().lower()
+    s = s.replace(",", "").replace(" ", "")
+    return s
+
+def _has_200m_headers(df: pd.DataFrame) -> bool:
+    norm_cols = {_norm_header(c) for c in df.columns}
+    keys = {"1000m", "800m", "600m", "400m", "200m"}
+    return len(keys & norm_cols) > 0
 
 def compute_metrics(df, distance_m=1400.0):
     out = df.copy()
@@ -313,14 +324,21 @@ def _first_time_in_seconds(cell):
     return float(t)
 
 def convert_200m_table_to_app(df):
+    """
+    df is expected to have normalized headers (lowercase, no commas/spaces), e.g.:
+    'horse', 'result'/'finish', '1000m','800m','600m','400m','200m'
+    """
     cols = {str(c).lower(): c for c in df.columns}
     def pick(*names):
         for n in names:
-            if n.lower() in cols: return cols[n.lower()]
+            n = n.lower()
+            if n in cols:
+                return cols[n]
         return None
 
-    col_horse  = pick("Horse", "Runner", "Name")
-    col_result = pick("Result", "Finish")
+    col_horse  = pick("horse", "runner", "name")
+    col_result = pick("result", "finish", "time")
+
     col_800    = pick("800m")
     col_600    = pick("600m")
     col_400    = pick("400m")
@@ -345,8 +363,8 @@ def convert_200m_table_to_app(df):
     seg_400 = df[col_400].apply(_last_float) if col_400 else np.nan
     seg_200 = df[col_200].apply(_last_float) if col_200 else np.nan
 
-    out["800-400"]    = seg_800 + seg_600
-    out["400-Finish"] = seg_400 + seg_200
+    out["800-400"]    = seg_800 + seg_600        # 800→600 + 600→400
+    out["400-Finish"] = seg_400 + seg_200        # 400→200 + 200→Finish
 
     for c in ["Finish_Pos", "Race Time", "800-400", "400-Finish"]:
         out[c] = pd.to_numeric(out[c], errors="coerce")
@@ -356,61 +374,108 @@ def convert_200m_table_to_app(df):
 # UI: Inputs & Flow
 # ===================
 st.title("🏇 The Sharpest Edge")
-st.caption("Upload CSV/XLSX or paste a TPD-style sectional table; app converts 200m splits to 400m metrics and computes GCI v3.1.")
+st.caption("Upload CSV/XLSX, paste a TPD-style sectional table, or load from a URL with static HTML. 200m splits are auto-converted to 400m metrics and GCI v3.1 is computed.")
 
 with st.sidebar:
     st.header("Data Source")
-    source = st.radio("Choose input type", ["Upload file", "Paste table"], index=0)
+    source = st.radio("Choose input type", ["Upload file", "Web URL", "Paste table"], index=0)
     distance_m = st.number_input("Race Distance (m)", min_value=800, max_value=4000, value=1400, step=50)
+
+df_raw = None
 
 if source == "Upload file":
     uploaded = st.file_uploader("Upload CSV/XLSX (any jurisdiction)", type=["csv", "xlsx"])
     if uploaded is None:
-        st.info("Upload a file or switch to 'Paste table'.")
+        st.info("Upload a file or switch to 'Web URL' or 'Paste table'.")
         st.stop()
     try:
         df_raw = pd.read_csv(uploaded) if uploaded.name.lower().endswith(".csv") else pd.read_excel(uploaded)
+        st.success("File loaded.")
     except Exception as e:
         st.error(f"Could not read file: {e}")
         st.stop()
-    st.success("File loaded.")
-else:
-    st.markdown("From the TPD page, select the sectional table → **Copy** → paste below.")
-    pasted = st.text_area("Paste table here (raw, straight from the webpage)")
-    if not pasted.strip():
+
+elif source == "Web URL":
+    url = st.text_input("Enter a page URL (static HTML table) or a direct CSV/XLSX link")
+    if not url:
         st.stop()
     try:
-        df_raw = pd.read_csv(pd.io.common.StringIO(pasted))
+        if url.lower().endswith(".csv"):
+            df_raw = pd.read_csv(url)
+            st.success("Loaded CSV from URL.")
+        elif url.lower().endswith((".xlsx", ".xls")):
+            df_raw = pd.read_excel(url)
+            st.success("Loaded Excel from URL.")
+        else:
+            tables = pd.read_html(url)  # works only for static tables
+            if not tables:
+                raise ValueError("No tables in static HTML.")
+            df_raw = max(tables, key=lambda t: t.shape[0] * t.shape[1])
+            st.success("Loaded HTML table from URL.")
     except Exception:
-        df_raw = pd.read_fwf(pd.io.common.StringIO(pasted))
-    st.success("Parsed the pasted table.")
+        st.error("Could not extract a table from that URL. Many sites (incl. TPD) render tables with JavaScript.")
+        st.info("Use 'Paste table' (bookmarklet copies the table) or provide a direct CSV/XLSX link.")
+        st.stop()
+
+else:  # Paste table
+    st.markdown("From the site, run your **Copy TPD Table** bookmarklet → it shows a white box → Select All → Copy → paste below.")
+    pasted = st.text_area("Paste table here (raw)", height=240)
+    if not pasted.strip():
+        st.stop()
+    # Detect tabs → TSV; else try CSV; else fixed-width fallback
+    if "\t" in pasted:
+        df_raw = pd.read_csv(pd.io.common.StringIO(pasted), sep="\t")
+    else:
+        try:
+            df_raw = pd.read_csv(pd.io.common.StringIO(pasted))
+        except Exception:
+            df_raw = pd.read_fwf(pd.io.common.StringIO(pasted))
+    st.success("Parsed pasted table.")
 
 st.subheader("Raw table preview")
 st.dataframe(df_raw.head(12), use_container_width=True)
 
-lower_cols = [str(c).lower() for c in df_raw.columns]
-looks_200m = any(k in lower_cols for k in ["1000m", "800m", "600m", "400m", "200m"])
+# Normalize a copy of headers for detection/mapping
+df_norm = df_raw.copy()
+df_norm.columns = [_norm_header(c) for c in df_norm.columns]
+
+looks_200m = _has_200m_headers(df_raw) or _has_200m_headers(df_norm)
 
 if looks_200m:
-    work = convert_200m_table_to_app(df_raw)
+    # Align names to normalized ones before conversion
+    df_conv_input = df_raw.copy()
+    df_conv_input.columns = df_norm.columns
+    work = convert_200m_table_to_app(df_conv_input)
 else:
+    # Fall back to app schema if user already provides it
     work = df_raw.rename(columns={
         "Race time": "Race Time", "Race_Time": "Race Time", "RaceTime": "Race Time",
         "800_400": "800-400", "400_Finish": "400-Finish",
         "Horse Name": "Horse", "Finish": "Finish_Pos", "Placing": "Finish_Pos"
     })
 
-df = work.copy()
-if "Race Time" in df.columns:
-    df["RaceTime_s"] = df["Race Time"].apply(parse_race_time)
-else:
-    df["RaceTime_s"] = np.nan
+# Hard guard: ensure required columns exist after conversion
+_required = ["Horse", "Race Time", "800-400", "400-Finish"]
+_missing = [c for c in _required if c not in work.columns]
+if _missing:
+    st.error(
+        "I couldn't produce the columns the analysis needs.\n\n"
+        "Missing: " + ", ".join(_missing) +
+        "\n\nTips:\n"
+        "• Make sure you pasted the actual table text (not a screenshot).\n"
+        "• The parser now handles tabs and most header variations ('1,000m', '800 m').\n"
+        "• Check the Raw preview above to see how headers came through."
+    )
+    st.stop()
 
+# --- Final normalization so the rest of the app works the same ---
+df = work.copy()
+df["RaceTime_s"] = df["Race Time"].apply(parse_race_time)
 for col in ["800-400", "400-Finish", "200_Pos", "400_Pos", "800_Pos", "1000_Pos", "Finish_Pos"]:
     if col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-# If Finish_Pos missing, best-effort infer by time
+# If Finish_Pos missing, infer by time (best-effort)
 if ("Finish_Pos" not in df.columns) or df["Finish_Pos"].isna().all():
     if df["RaceTime_s"].notna().any():
         df["Finish_Pos"] = df["RaceTime_s"].rank(method="min").astype("Int64")
