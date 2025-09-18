@@ -5,15 +5,42 @@ import streamlit as st
 import matplotlib.pyplot as plt
 
 from pathlib import Path
+import os
 
-APP_DIR = Path(__file__).parent
-LOGO_PATH = APP_DIR / "assets" / "logos.png"   # <-- note the exact file name
+APP_DIR = Path(__file__).resolve().parent
+
+# Try a few likely locations/names (yours is assets/logos.png)
+CANDIDATE_LOGO_PATHS = [
+    APP_DIR / "assets" / "logos.png",  # your stated filename
+    APP_DIR / "assets" / "logo.png",   # common alternative
+    APP_DIR / "logos.png",
+    APP_DIR / "logo.png",
+]
+
+LOGO_PATH = next((p for p in CANDIDATE_LOGO_PATHS if p.exists()), None)
 
 st.set_page_config(
-    page_title="The Sharpest Edge",   # title in browser tab
-    page_icon=str(LOGO_PATH),         # favicon (tab icon)
-    layout="wide"
+    page_title="The Sharpest Edge",
+    page_icon=str(LOGO_PATH) if LOGO_PATH else None,  # favicon if found
+    layout="wide",
 )
+
+# --- Branding ---
+if LOGO_PATH:
+    st.image(str(LOGO_PATH), width=250)
+else:
+    st.warning("Logo not found. Debug info below to help fix the path.")
+    st.write("Tried paths (in order):")
+    st.code("\n".join(str(p) for p in CANDIDATE_LOGO_PATHS))
+    assets_dir = APP_DIR / "assets"
+    if assets_dir.exists():
+        st.write("assets/ folder contents:")
+        try:
+            st.code("\n".join(sorted(os.listdir(assets_dir))))
+        except Exception as e:
+            st.error(f"Couldn't list assets/: {e}")
+    else:
+        st.error("No assets/ folder next to this script.")
 
 # --- Branding ---
 st.image(str(LOGO_PATH), width=250)   # show logo (with slogan) at top
