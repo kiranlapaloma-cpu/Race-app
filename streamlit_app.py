@@ -37,19 +37,29 @@ def _dbg(label, obj=None):
             st.write(obj)
 
 # =========================================================
-# Helpers: parsing, metrics, GCI v3.1, narratives
+# Time parsing (regex-based; supports M:SS:ms like 01:37:620)
 # =========================================================
+_M_SS_MS_RE   = re.compile(r"^(?P<m>\d{1,2}):(?P<s>\d{2}):(?P<ms>\d{2,3})$")      # 01:37:620
+_M_SS_DMS_RE  = re.compile(r"^(?P<m>\d{1,2}):(?P<s>\d{2}\.\d+)$")                  # 1:12.45
+_H_MM_SS_RE   = re.compile(r"^(?P<h>\d+):(?P<m>\d{2}):(?P<s>\d{2}(?:\.\d+)?)$")    # 0:01:12.45
+
 def parse_race_time(val):
     """
-    Accepts:
-      - seconds as float/int:  "72.45"
-      - M:SS(.ms):            "1:12.45"
-      - H:MM:SS(.ms):         "0:01:12.45"
-      - M:SS:ms (TPD-style):  "01:24:510"  -> 84.510 seconds
+    Supports:
+      - seconds:           "72.45" (float/int)
+      - M:SS.ms:           "1:12.45"
+      - M:SS:ms (TPD):     "01:24:510"  -> 84.510
+      - H:MM:SS(.ms):      "0:01:12.45"
+    Returns float seconds or NaN.
     """
     if pd.isna(val):
         return np.nan
     s = str(val).strip()
+
+    # normalize unicode colon, strip stray chars/spaces
+    s = s.replace("：", ":")
+    s = re.sub(r"[^\d:\.\s]", "", s)
+    s = re.sub(r"\s+", "", s)
 
     # plain seconds?
     try:
@@ -57,29 +67,32 @@ def parse_race_time(val):
     except Exception:
         pass
 
-    parts = s.split(":")
-    try:
-        if len(parts) == 2:
-            m, sec = parts
-            return int(m) * 60 + float(sec)
+    m = _M_SS_MS_RE.match(s)
+    if m:
+        mm  = int(m.group("m"))
+        ss  = int(m.group("s"))
+        ms  = int(m.group("ms"))
+        if ss < 60 and ms < 1000:
+            return mm * 60 + ss + ms / 1000.0
 
-        if len(parts) == 3:
-            a, b, c = parts
+    m = _M_SS_DMS_RE.match(s)
+    if m:
+        mm  = int(m.group("m"))
+        sec = float(m.group("s"))
+        return mm * 60 + sec
 
-            # Heuristic for M:SS:ms (no dot in last piece, <=3 digits, a<60, b<60)
-            if (c.replace(" ", "").isdigit() and "." not in c and len(c) <= 3
-                and b.replace(" ", "").isdigit() and int(b) < 60
-                and a.replace(" ", "").isdigit() and int(a) < 60):
-                return int(a) * 60 + int(b) + (int(c) / 1000.0)
-
-            # Otherwise treat as H:MM:SS(.ms)
-            return int(a) * 3600 + int(b) * 60 + float(c)
-
-    except Exception:
-        return np.nan
+    m = _H_MM_SS_RE.match(s)
+    if m:
+        hh  = int(m.group("h"))
+        mm  = int(m.group("m"))
+        sec = float(m.group("s"))
+        return hh * 3600 + mm * 60 + sec
 
     return np.nan
 
+# =========================================================
+# Metrics, context, GCI v3.1, narratives
+# =========================================================
 def compute_metrics(df, distance_m=1400.0):
     out = df.copy()
 
@@ -234,20 +247,24 @@ def compute_gci_v31(row, ctx, distance_m: float, winner_time_s=None):
         on_speed = (epi <= 2.5)
         handy    = (epi <= 3.5)
         if handy and basic >= 99: OP = 0.5
-        if on_speed and basic >= 100: OP = max(OP, 0.7)
-        if on_speed and fast_early and (early_heat >= 0.7) and (pressure_rat >= 0.35) and basic >= 100:
+        if on-speed := (epi <= 2.5):
+            pass  # (kept for readability; already used)
+
+        if on_speed and basic >= 100:
+            OP = max(OP, 0.7)
+        if on_speed and (not pd.isna(spi_median)) and (spi_median >= 103) and (float(ctx.get("early_heat",0.0)) >= 0.7) and (float(ctx.get("pressure_ratio",0.0)) >= 0.35) and basic >= 100:
             OP = max(OP, 1.0); reasons.append("on-speed under genuine heat & pressure")
 
     # Leader Tax
     LT = 0.0
     if not pd.isna(epi) and epi <= 2.0:
-        soft_early = (early_heat < 0.5)
-        low_press  = (pressure_rat < 0.30)
+        soft_early = (float(ctx.get("early_heat", 0.0)) < 0.5)
+        low_press  = (float(ctx.get("pressure_ratio", 0.0)) < 0.30)
         weak_late  = (pd.isna(refined) or refined < 100.0) or (pd.isna(basic) or basic < 100.0)
         if soft_early: LT += 0.25
         if low_press:  LT += 0.20
         if weak_late:  LT += 0.20
-        if sprint_home: LT += 0.15
+        if (not pd.isna(spi_median)) and (spi_median <= 97): LT += 0.15
         LT = min(0.60, LT)
         if LT > 0: reasons.append(f"leader tax applied ({LT:.2f})")
 
@@ -451,6 +468,15 @@ if _missing:
     _dbg("Workframe columns", list(df.columns))
     st.stop()
 
+# Standardize any unicode colons / stray characters in-place BEFORE parsing
+df["Race Time"] = (
+    df["Race Time"]
+    .astype(str)
+    .str.replace("：", ":", regex=False)
+    .str.replace(r"[^\d:\.\s]", "", regex=True)
+    .str.replace(r"\s+", "", regex=True)
+)
+
 # Parse times safely
 df["RaceTime_s"] = df["Race Time"].apply(parse_race_time)
 
@@ -458,9 +484,14 @@ df["RaceTime_s"] = df["Race Time"].apply(parse_race_time)
 mask = df["RaceTime_s"] > 600
 if mask.any():
     def _m_ss_ms_fallback(x):
-        p = str(x).strip().split(":")
-        if len(p) == 3 and p[2].isdigit() and len(p[2]) <= 3:
-            return int(p[0]) * 60 + int(p[1]) + int(p[2]) / 1000.0
+        p = str(x).strip().replace("：", ":")
+        p = re.sub(r"[^\d:\.\s]", "", p)
+        p = re.sub(r"\s+", "", p)
+        m = _M_SS_MS_RE.match(p)
+        if m:
+            mm = int(m.group("m")); ss = int(m.group("s")); ms = int(m.group("ms"))
+            if ss < 60 and ms < 1000:
+                return mm * 60 + ss + ms / 1000.0
         return np.nan
     df.loc[mask, "RaceTime_s"] = df.loc[mask, "Race Time"].apply(_m_ss_ms_fallback).fillna(df.loc[mask, "RaceTime_s"])
 
