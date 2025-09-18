@@ -326,7 +326,7 @@ def _first_time_in_seconds(cell):
 def convert_200m_table_to_app(df):
     """
     df is expected to have normalized headers (lowercase, no commas/spaces), e.g.:
-    'horse', 'result'/'finish', '1000m','800m','600m','400m','200m'
+    'horse', 'result'/'finish'/'time', '1000m','800m','600m','400m','200m'
     """
     cols = {str(c).lower(): c for c in df.columns}
     def pick(*names):
@@ -417,20 +417,98 @@ elif source == "Web URL":
         st.info("Use 'Paste table' (bookmarklet copies the table) or provide a direct CSV/XLSX link.")
         st.stop()
 
-else:  # Paste table
-    st.markdown("From the site, run your **Copy TPD Table** bookmarklet → it shows a white box → Select All → Copy → paste below.")
-    pasted = st.text_area("Paste table here (raw)", height=240)
+else:
+    # ---------- Paste table (robust for squashed TPD text) ----------
+    st.markdown("Run your bookmarklet → a white box appears → Select All → Copy → paste **everything** below.")
+    pasted = st.text_area("Paste table here (raw)", height=280)
     if not pasted.strip():
         st.stop()
-    # Detect tabs → TSV; else try CSV; else fixed-width fallback
-    if "\t" in pasted:
-        df_raw = pd.read_csv(pd.io.common.StringIO(pasted), sep="\t")
+
+    def _looks_squashed_tpd(txt: str) -> bool:
+        # Heuristic: first non-empty line contains all 800m/600m/400m/200m in one line
+        first_nonempty = next((ln for ln in txt.splitlines() if ln.strip()), "")
+        return all(k in first_nonempty for k in ["800m", "600m", "400m", "200m"])
+
+    def _unsquash_tpd(txt: str) -> str:
+        """
+        Turn 'one huge line of headers + numbers' into a TSV with real columns.
+        Output headers: Result, No.(Draw), Horse, 800m, 600m, 400m, 200m, Finish
+        """
+        lines = [ln for ln in txt.splitlines() if ln.strip()]
+        if not lines:
+            return txt
+
+        # Find header line (contains 800m/600m/400m/200m)
+        hdr_idx = 0
+        for i, ln in enumerate(lines):
+            if all(k in ln for k in ["800m", "600m", "400m", "200m"]):
+                hdr_idx = i
+                break
+
+        rows = lines[hdr_idx + 1:]  # data lines
+        header = ["Result", "No.(Draw)", "Horse", "800m", "600m", "400m", "200m", "Finish"]
+        out = ["\t".join(header)]
+
+        time_pat = re.compile(r"^(?:\d+:\d{2}\.\d{1,3}|\d+\.\d{1,3}|NR)$")
+        pos_draw_pat = re.compile(r"^\d+\(\d+\)$")
+        float_pat = re.compile(r"\d+\.\d{1,3}")
+
+        for ln in rows:
+            toks = ln.strip().split()
+            if not toks:
+                continue
+
+            # 1) Result/time (or NR): first token that matches time/NR
+            t_res = ""
+            while toks and not time_pat.match(toks[0]):
+                toks.pop(0)
+            if toks:
+                t_res = toks.pop(0)
+            else:
+                continue
+
+            # 2) No.(Draw): like 3(8)
+            nd = ""
+            if toks and pos_draw_pat.match(toks[0]):
+                nd = toks.pop(0)
+
+            # 3) Horse name until we start seeing segment-looking tokens (floats / '--')
+            horse_parts, seg_tokens = [], []
+            hit_segments = False
+            for tok in toks:
+                if float_pat.search(tok) or tok in {"--", "—"} or tok.replace("-", "") == "":
+                    hit_segments = True
+                if hit_segments:
+                    seg_tokens.append(tok)
+                else:
+                    horse_parts.append(tok)
+            horse = " ".join(horse_parts).strip()
+
+            # 4) Pull floats from segment tokens. Expect at least 5 floats; if more, take the last 5.
+            floats = [ft for tok in seg_tokens for ft in float_pat.findall(tok)]
+            if len(floats) >= 5:
+                seg_vals = floats[-5:]  # assume order corresponds to 800m, 600m, 400m, 200m, Finish
+            else:
+                seg_vals = floats + [""] * (5 - len(floats))
+
+            out.append("\t".join([t_res, nd, horse] + seg_vals))
+
+        return "\n".join(out)
+
+    # Choose parser path: squashed or normal TSV/CSV/FWF
+    if _looks_squashed_tpd(pasted):
+        tsv = _unsquash_tpd(pasted)
+        df_raw = pd.read_csv(io.StringIO(tsv), sep="\t")
+        st.info("Detected compact TPD paste. Rebuilt into a proper table automatically.")
     else:
-        try:
-            df_raw = pd.read_csv(pd.io.common.StringIO(pasted))
-        except Exception:
-            df_raw = pd.read_fwf(pd.io.common.StringIO(pasted))
-    st.success("Parsed pasted table.")
+        if "\t" in pasted:
+            df_raw = pd.read_csv(io.StringIO(pasted), sep="\t")
+        else:
+            try:
+                df_raw = pd.read_csv(io.StringIO(pasted))
+            except Exception:
+                df_raw = pd.read_fwf(io.StringIO(pasted))
+        st.success("Parsed pasted table.")
 
 st.subheader("Raw table preview")
 st.dataframe(df_raw.head(12), use_container_width=True)
@@ -463,7 +541,7 @@ if _missing:
         "Missing: " + ", ".join(_missing) +
         "\n\nTips:\n"
         "• Make sure you pasted the actual table text (not a screenshot).\n"
-        "• The parser now handles tabs and most header variations ('1,000m', '800 m').\n"
+        "• The parser now handles compact TPD pastes and tab-separated text.\n"
         "• Check the Raw preview above to see how headers came through."
     )
     st.stop()
