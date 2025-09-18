@@ -39,7 +39,7 @@ def _dbg(label, obj=None):
             st.write(obj)
 
 # =========================================================
-# Time parsing (handles seconds, M:SS.ms, M:SS:ms like 01:37:620, H:MM:SS(.ms))
+# Time parsing (seconds, M:SS.ms, M:SS:ms like 01:37:620, H:MM:SS(.ms))
 # =========================================================
 _M_SS_MS_RE   = re.compile(r"^(?P<m>\d{1,2}):(?P<s>\d{2}):(?P<ms>\d{2,3})$")      # 01:37:620
 _M_SS_DMS_RE  = re.compile(r"^(?P<m>\d{1,2}):(?P<s>\d{2}\.\d+)$")                  # 1:12.45
@@ -243,17 +243,24 @@ if source == "Upload CSV":
 else:
     # Manual: derive RaceTime_s, 800-400, 400-Finish from segment columns
     df = df_raw.copy()
-    # Segment columns are everything except 'Horse' and 'Finish_Pos'
-    seg_cols = [c for c in df.columns if c not in ("Horse", "Finish_Pos")]
+
+    # Use the exact countdown order we generated for the grid
+    desired_order = list(st.session_state.get("manual_cols", []))
+    # Fallback safely if session key missing
+    if not desired_order:
+        desired_order = [c for c in df.columns if c not in ("Horse", "Finish_Pos")]
+
+    # Keep only existing columns, preserving countdown order
+    seg_cols = [c for c in desired_order if c in df.columns]
 
     # Parse each segment to seconds
     for c in seg_cols:
         df[c] = pd.to_numeric(df[c].apply(parse_time_any), errors="coerce")
 
-    # RaceTime_s = sum of segments
+    # RaceTime_s = sum of segments (requires all seg cells to exist for the row)
     df["RaceTime_s"] = df[seg_cols].sum(axis=1, min_count=len(seg_cols))
 
-    # Build mid- and final-400 sums from tail segments
+    # Build mid- and final-400 sums from tail segments (reliable: uses ordered seg_cols)
     mid_cols, fin_cols = segments_to_mid_final_400(seg_cols)
     if not mid_cols or not fin_cols:
         st.error("Distance must be at least 800 m to compute Mid400 and Final400.")
@@ -266,7 +273,7 @@ else:
     if "Finish_Pos" in df.columns:
         df["Finish_Pos"] = pd.to_numeric(df["Finish_Pos"], errors="coerce").astype("Int64")
 
-    # >>> KEY FIX: alias RaceTime_s to 'Race Time' to avoid KeyError downstream
+    # Alias for downstream compatibility
     if "Race Time" not in df.columns and "RaceTime_s" in df.columns:
         df["Race Time"] = df["RaceTime_s"]
 
@@ -284,7 +291,7 @@ except Exception as e:
     if DEBUG: st.exception(e)
     st.stop()
 
-# If Finish_Pos missing, rank by time for display order
+# If Finish_Pos missing, rank by time for display order (does not overwrite uploaded official placings)
 if "Finish_Pos" not in metrics.columns or metrics["Finish_Pos"].isna().all():
     metrics["Finish_Pos"] = metrics["RaceTime_s"].rank(method="min").astype("Int64")
 
