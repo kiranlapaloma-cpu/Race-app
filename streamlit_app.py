@@ -4,7 +4,21 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Race Analysis by Kiran", layout="wide")
+from pathlib import Path
+
+APP_DIR = Path(__file__).parent
+LOGO_PATH = APP_DIR / "assets" / "logos.png"   # <-- note the exact file name
+
+st.set_page_config(
+    page_title="The Sharpest Edge",   # title in browser tab
+    page_icon=str(LOGO_PATH),         # favicon (tab icon)
+    layout="wide"
+)
+
+# --- Branding ---
+st.image(str(LOGO_PATH), width=250)   # show logo (with slogan) at top
+# Optional: keep a big title as well if you want
+# st.title("🏇 The Sharpest Edge")
 
 # ---------- Helpers ----------
 
