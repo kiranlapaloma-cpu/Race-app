@@ -24,7 +24,7 @@ if LOGO_PATH and Path(LOGO_PATH).exists():
     st.image(str(LOGO_PATH), width=220)
 
 st.title("🏇 The Sharpest Edge")
-st.caption("Upload CSV or use Manual input with countdown 200 m segments. Calculates SPI / FSP / Refined FSP and pace curves.")
+st.caption("Upload CSV or use Manual input with countdown 200 m segments. Calculates SPI / Basic FSP / Refined FSP and pace curves.")
 
 # -------------------
 # Debug toggle
@@ -101,11 +101,12 @@ def compute_metrics(df, distance_m=1400.0):
     return out
 
 def round_display(df):
+    df = df.copy()
     for c in ["Basic_FSP_%", "Refined_FSP_%", "SPI_%", "Race_AvgSpeed", "Mid400_Speed", "Final400_Speed"]:
         if c in df.columns:
-            df[c] = df[c].round(2)
+            df.loc[:, c] = df[c].round(2)
     if "RaceTime_s" in df.columns:
-        df["RaceTime_s"] = df["RaceTime_s"].round(3)
+        df.loc[:, "RaceTime_s"] = df["RaceTime_s"].round(3)
     return df
 
 # =========================================================
@@ -127,7 +128,6 @@ def build_manual_frame(n_rows: int, seg_headers: list, keep: pd.DataFrame | None
     df = pd.DataFrame({c: [np.nan]*n_rows for c in cols})
     df["Horse"] = ""
     if keep is not None:
-        # try to preserve by column name and row index overlap
         for c in set(keep.columns) & set(cols):
             n = min(n_rows, len(keep))
             df.loc[:n-1, c] = keep.loc[:n-1, c].values
@@ -149,7 +149,6 @@ with st.sidebar:
     st.header("Data Source")
     source = st.radio("Choose input type", ["Upload CSV", "Manual input"], index=1)
 
-    # Distance control is ALWAYS visible, but only active for manual mode (helps with context)
     distance_m = st.number_input("Race distance (m)", min_value=800, max_value=4000, value=1200, step=200, help="Multiples of 200 only")
     num_horses = st.number_input("Number of horses (manual)", min_value=1, max_value=30, value=8, step=1, disabled=(source != "Manual input"))
 
@@ -191,7 +190,7 @@ else:
     st.write(f"Columns: {' | '.join(seg_headers)}  — enter **segment times** (seconds or M:SS.ms / M:SS:ms).")
     manual_df = st.data_editor(
         st.session_state["manual_df"],
-        use_container_width=True,
+        width="stretch",
         num_rows="dynamic",
         key="manual_editor",
         column_config={
@@ -215,12 +214,9 @@ else:
 # Normalize to analysis schema
 # ===================
 st.subheader("Raw table preview")
-st.dataframe(df_raw.head(12), use_container_width=True)
+st.dataframe(df_raw.head(12), width="stretch")
 _dbg("Raw columns", list(df_raw.columns))
 
-# Two branches:
-#  A) Upload CSV → expect ["Race Time","800-400","400-Finish"] present (or mappable)
-#  B) Manual → compute from 200 m segments in countdown order
 if source == "Upload CSV":
     # Map common variants
     df = df_raw.rename(columns={
@@ -247,11 +243,8 @@ if source == "Upload CSV":
 else:
     # Manual: derive RaceTime_s, 800-400, 400-Finish from segment columns
     df = df_raw.copy()
-    # Figure segment columns in the order they appear (Horse first, then segments..., then Finish_Pos)
+    # Segment columns are everything except 'Horse' and 'Finish_Pos'
     seg_cols = [c for c in df.columns if c not in ("Horse", "Finish_Pos")]
-    # Ensure they match countdown
-    if "Finish_Pos" in seg_cols:
-        seg_cols.remove("Finish_Pos")
 
     # Parse each segment to seconds
     for c in seg_cols:
@@ -260,7 +253,7 @@ else:
     # RaceTime_s = sum of segments
     df["RaceTime_s"] = df[seg_cols].sum(axis=1, min_count=len(seg_cols))
 
-    # Build mid- and final-400 sums from tail segments
+    # mid- and final-400 sums from tail segments
     mid_cols, fin_cols = segments_to_mid_final_400(seg_cols)
     if not mid_cols or not fin_cols:
         st.error("Distance must be at least 800 m to compute Mid400 and Final400.")
@@ -274,7 +267,7 @@ else:
         df["Finish_Pos"] = pd.to_numeric(df["Finish_Pos"], errors="coerce").astype("Int64")
 
 st.subheader("Converted table (ready for analysis)")
-st.dataframe(df.head(12), use_container_width=True)
+st.dataframe(df.head(12), width="stretch")
 _dbg("Dtypes", df.dtypes)
 
 # ===================
@@ -287,13 +280,13 @@ except Exception as e:
     if DEBUG: st.exception(e)
     st.stop()
 
-# If Finish_Pos missing, we can still rank by time for display-only order
+# If Finish_Pos missing, rank by time for display order
 if "Finish_Pos" not in metrics.columns or metrics["Finish_Pos"].isna().all():
     metrics["Finish_Pos"] = metrics["RaceTime_s"].rank(method="min").astype("Int64")
 
 st.subheader("Sectional Metrics")
 disp = round_display(metrics.copy()).sort_values("Finish_Pos", na_position="last")
-st.dataframe(disp, use_container_width=True)
+st.dataframe(disp, width="stretch")
 
 # ===================
 # Pace Curves
@@ -305,11 +298,15 @@ avg_fin = metrics["Final400_Speed"].mean()
 top8 = metrics.sort_values("Finish_Pos").head(8).copy()
 top8["HorseShort"] = top8["Horse"].astype(str).str.slice(0, 20)
 
+# Average line
 fig, ax = plt.subplots()
 x_vals = [1, 2]
 ax.plot(x_vals, [avg_mid, avg_fin], marker="o", linewidth=3, color="black", label="Average (Field)")
+
+# Runner lines
 for _, row in top8.iterrows():
     ax.plot(x_vals, [row["Mid400_Speed"], row["Final400_Speed"]], marker="o", linewidth=2, label=row["HorseShort"])
+
 ax.set_xticks([1, 2]); ax.set_xticklabels(["Mid 400", "Final 400"])
 ax.set_ylabel("Speed (m/s)"); ax.set_title("Average vs Top 8 Pace Curves")
 ax.grid(True, linestyle="--", alpha=0.3)
@@ -325,6 +322,6 @@ csv_bytes = disp.to_csv(index=False).encode("utf-8")
 st.download_button("Download metrics as CSV", data=csv_bytes, file_name="race_sectional_metrics.csv", mime="text/csv")
 
 st.caption(
-    "Manual mode uses countdown 200 m segment times. We derive RaceTime, Mid400 (two segments before the final 400), and Final400 (last two segments), then compute SPI / Basic FSP / Refined FSP. "
+    "Manual mode uses countdown 200 m segment times. We derive RaceTime (seconds), Mid400 and Final400, then compute SPI / Basic FSP / Refined FSP. "
     "Upload mode expects: Horse, Race Time, 800-400, 400-Finish (Finish_Pos optional)."
 )
