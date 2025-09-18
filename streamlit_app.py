@@ -39,7 +39,7 @@ def _dbg(label, obj=None):
             st.write(obj)
 
 # =========================================================
-# Time parsing (handles M:SS.ms, M:SS:ms like 01:37:620, or seconds)
+# Time parsing (handles seconds, M:SS.ms, M:SS:ms like 01:37:620, H:MM:SS(.ms))
 # =========================================================
 _M_SS_MS_RE   = re.compile(r"^(?P<m>\d{1,2}):(?P<s>\d{2}):(?P<ms>\d{2,3})$")      # 01:37:620
 _M_SS_DMS_RE  = re.compile(r"^(?P<m>\d{1,2}):(?P<s>\d{2}\.\d+)$")                  # 1:12.45
@@ -200,7 +200,7 @@ else:
         },
     )
 
-    # Clean blank rows (no Horse & no segment data)
+    # Clean blank rows (no Horse)
     df_raw = manual_df.copy()
     df_raw["Horse"] = df_raw["Horse"].astype(str).str.strip()
     nonempty = df_raw["Horse"].ne("")
@@ -253,7 +253,7 @@ else:
     # RaceTime_s = sum of segments
     df["RaceTime_s"] = df[seg_cols].sum(axis=1, min_count=len(seg_cols))
 
-    # mid- and final-400 sums from tail segments
+    # Build mid- and final-400 sums from tail segments
     mid_cols, fin_cols = segments_to_mid_final_400(seg_cols)
     if not mid_cols or not fin_cols:
         st.error("Distance must be at least 800 m to compute Mid400 and Final400.")
@@ -265,6 +265,10 @@ else:
     # Optional Finish_Pos
     if "Finish_Pos" in df.columns:
         df["Finish_Pos"] = pd.to_numeric(df["Finish_Pos"], errors="coerce").astype("Int64")
+
+    # >>> KEY FIX: alias RaceTime_s to 'Race Time' to avoid KeyError downstream
+    if "Race Time" not in df.columns and "RaceTime_s" in df.columns:
+        df["Race Time"] = df["RaceTime_s"]
 
 st.subheader("Converted table (ready for analysis)")
 st.dataframe(df.head(12), width="stretch")
@@ -298,12 +302,9 @@ avg_fin = metrics["Final400_Speed"].mean()
 top8 = metrics.sort_values("Finish_Pos").head(8).copy()
 top8["HorseShort"] = top8["Horse"].astype(str).str.slice(0, 20)
 
-# Average line
 fig, ax = plt.subplots()
 x_vals = [1, 2]
 ax.plot(x_vals, [avg_mid, avg_fin], marker="o", linewidth=3, color="black", label="Average (Field)")
-
-# Runner lines
 for _, row in top8.iterrows():
     ax.plot(x_vals, [row["Mid400_Speed"], row["Final400_Speed"]], marker="o", linewidth=2, label=row["HorseShort"])
 
