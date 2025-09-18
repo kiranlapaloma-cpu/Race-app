@@ -1,5 +1,4 @@
 import io
-import os
 import re
 from pathlib import Path
 
@@ -13,8 +12,8 @@ import matplotlib.pyplot as plt
 # ================================
 APP_DIR = Path(__file__).resolve().parent
 CANDIDATE_LOGO_PATHS = [
-    APP_DIR / "assets" / "logos.png",  # your file name
-    APP_DIR / "assets" / "logo.png",   # common fallback
+    APP_DIR / "assets" / "logos.png",
+    APP_DIR / "assets" / "logo.png",
     APP_DIR / "logos.png",
     APP_DIR / "logo.png",
 ]
@@ -28,16 +27,27 @@ st.set_page_config(
 
 if LOGO_PATH:
     st.image(str(LOGO_PATH), width=250)
-else:
-    st.warning("Logo not found. Tried:\n" + "\n".join(str(p) for p in CANDIDATE_LOGO_PATHS))
+
+# -------------------
+# Debug toggle
+# -------------------
+with st.sidebar:
+    DEBUG = st.checkbox("Debug mode", value=False)
+
+def _dbg(label, obj=None):
+    if DEBUG:
+        st.write(f"🔎 {label}")
+        if obj is not None:
+            st.write(obj)
 
 # =========================================================
-# Helper functions: parsing, headers, metrics, GCI v3.1
+# Helpers: parsing, headers, metrics, GCI v3.1
 # =========================================================
 def parse_race_time(val):
     """Parse Race Time as seconds or 'MM:SS.ms' (e.g., 1:12.49)."""
     if pd.isna(val):
         return np.nan
+    # already seconds?
     try:
         return float(val)
     except Exception:
@@ -299,7 +309,7 @@ def runner_summary(row, spi_med):
     return "  \n".join(bits)
 
 # ===================================================
-# TPD-style (200m) table converter & paste handling
+# TPD 200m converter & paste handling (with spill/fused)
 # ===================================================
 TIME_RE = re.compile(r"(\d+:\d{2}\.\d{1,3}|\d+\.\d{1,3})")
 
@@ -312,16 +322,31 @@ def _first_text(cell):
     if pd.isna(cell): return ""
     return str(cell).splitlines()[0].strip()
 
-def _first_time_in_seconds(cell):
-    if pd.isna(cell): return np.nan
-    s = str(cell)
-    m = TIME_RE.findall(s)
-    if not m: return np.nan
-    t = m[0]
-    if ":" in t:
-        mm, rest = t.split(":")
-        return int(mm) * 60 + float(rest)
-    return float(t)
+def _first_int_and_time(cell):
+    """
+    Handles fused “pos+time” like '158.37' -> (1, 58.37)
+    Also handles '9 1:00.09' -> (9, 60.09), 'NR' -> (nan, nan)
+    """
+    if pd.isna(cell):
+        return np.nan, np.nan
+    s = str(cell).strip()
+    if s.upper() == "NR":
+        return np.nan, np.nan
+    # fused 1–2 digits + float
+    m = re.match(r"^(\d{1,2})(\d+\.\d{1,3})$", s)
+    if m:
+        return int(m.group(1)), float(m.group(2))
+    # general case: find first integer and first time token
+    m_time = TIME_RE.findall(s)
+    m_pos  = re.findall(r"\b\d+\b", s)
+    pos = int(m_pos[0]) if m_pos else np.nan
+    if m_time:
+        t = m_time[0]
+        if ":" in t:
+            mm, rest = t.split(":")
+            return pos, int(mm) * 60 + float(rest)
+        return pos, float(t)
+    return pos, np.nan
 
 def convert_200m_table_to_app(df):
     """
@@ -348,12 +373,9 @@ def convert_200m_table_to_app(df):
     out["Horse"] = (df[col_horse].apply(_first_text) if col_horse else df.iloc[:, 0].apply(_first_text))
 
     if col_result:
-        def _first_int(cell):
-            if pd.isna(cell): return np.nan
-            m = re.findall(r"\b\d+\b", str(cell))
-            return float(m[0]) if m else np.nan
-        out["Finish_Pos"] = df[col_result].apply(_first_int)
-        out["Race Time"]  = df[col_result].apply(_first_time_in_seconds)
+        ft = df[col_result].apply(_first_int_and_time)
+        out["Finish_Pos"] = ft.apply(lambda x: x[0])
+        out["Race Time"]  = ft.apply(lambda x: x[1])
     else:
         out["Finish_Pos"] = np.nan
         out["Race Time"]  = np.nan
@@ -370,6 +392,82 @@ def convert_200m_table_to_app(df):
         out[c] = pd.to_numeric(out[c], errors="coerce")
     return out
 
+# ---------- Unsquasher for TPD pastes (handles “spill” and fused tokens) ----------
+def _looks_squashed_tpd(txt: str) -> bool:
+    first_nonempty = next((ln for ln in txt.splitlines() if ln.strip()), "")
+    return all(k in first_nonempty for k in ["800m", "600m", "400m", "200m"])
+
+def _unsquash_tpd(txt: str) -> str:
+    """
+    Convert the 'squashed' TPD paste into TSV:
+    Result | No.(Draw) | Horse | 800m | 600m | 400m | 200m | Finish
+
+    Handles:
+      • Fused tokens like '158.37' -> '58.37' (pos handled later)
+      • 'Number spill' of floats sitting after the header; distributes 5 per runner.
+    """
+    lines = [ln for ln in txt.splitlines() if ln.strip()]
+    if not lines:
+        return txt
+
+    float_pat = re.compile(r"\d+\.\d{1,3}")
+
+    def _defuse(tok: str) -> str:
+        m = re.match(r"^(\d{1,2})(\d+\.\d{1,3})$", tok)
+        return m.group(2) if m else tok
+
+    # 1) locate header line (contains all labels)
+    hdr_idx = 0
+    for i, ln in enumerate(lines):
+        if all(k in ln for k in ["800m", "600m", "400m", "200m", "Finish"]):
+            hdr_idx = i
+            break
+
+    header_line = lines[hdr_idx]
+    rows = lines[hdr_idx + 1:]
+
+    # 2) try to harvest a "spill" of floats from the tail of the header line
+    #    i.e., after the last label 'Finish'
+    spill = float_pat.findall(header_line.split("Finish")[-1])
+
+    # or, if the first row after header is just a block of floats, use that instead
+    if not spill and rows:
+        tokens = rows[0].split()
+        if tokens and all(float_pat.search(t) or t in {"--", "—"} for t in tokens):
+            spill = float_pat.findall(rows[0])
+            rows = rows[1:]
+
+    header = ["Result", "No.(Draw)", "Horse", "800m", "600m", "400m", "200m", "Finish"]
+    out = ["\t".join(header)]
+
+    # 3) helper to distribute 5 floats per runner
+    def get_segments(i):
+        if not spill:
+            return [""] * 5
+        start = i * 5
+        end = start + 5
+        if end <= len(spill):
+            return spill[start:end]
+        return [""] * 5
+
+    # 4) parse runner rows
+    for i, ln in enumerate(rows):
+        toks = [_defuse(t) for t in ln.strip().split()]
+        if not toks:
+            continue
+
+        # Result token: may be 'NR', '1:12.49', '58.37', '158.37' etc
+        result = toks.pop(0) if toks else ""
+        # No.(Draw): like 3(8)
+        nd = toks.pop(0) if toks and "(" in toks[0] else ""
+        # Horse = the rest (trainer/jockey usually included; fine)
+        horse = " ".join(toks).strip()
+
+        segs = get_segments(i)
+        out.append("\t".join([result, nd, horse] + segs))
+
+    return "\n".join(out)
+
 # ===================
 # UI: Inputs & Flow
 # ===================
@@ -383,169 +481,94 @@ with st.sidebar:
 
 df_raw = None
 
-if source == "Upload file":
-    uploaded = st.file_uploader("Upload CSV/XLSX (any jurisdiction)", type=["csv", "xlsx"])
-    if uploaded is None:
-        st.info("Upload a file or switch to 'Web URL' or 'Paste table'.")
-        st.stop()
-    try:
+try:
+    if source == "Upload file":
+        uploaded = st.file_uploader("Upload CSV/XLSX (any jurisdiction)", type=["csv", "xlsx"])
+        if uploaded is None:
+            st.info("Upload a file or switch to 'Web URL' or 'Paste table'.")
+            st.stop()
         df_raw = pd.read_csv(uploaded) if uploaded.name.lower().endswith(".csv") else pd.read_excel(uploaded)
         st.success("File loaded.")
-    except Exception as e:
-        st.error(f"Could not read file: {e}")
-        st.stop()
 
-elif source == "Web URL":
-    url = st.text_input("Enter a page URL (static HTML table) or a direct CSV/XLSX link")
-    if not url:
-        st.stop()
-    try:
-        if url.lower().endswith(".csv"):
-            df_raw = pd.read_csv(url)
-            st.success("Loaded CSV from URL.")
-        elif url.lower().endswith((".xlsx", ".xls")):
-            df_raw = pd.read_excel(url)
-            st.success("Loaded Excel from URL.")
-        else:
-            tables = pd.read_html(url)  # works only for static tables
-            if not tables:
-                raise ValueError("No tables in static HTML.")
-            df_raw = max(tables, key=lambda t: t.shape[0] * t.shape[1])
-            st.success("Loaded HTML table from URL.")
-    except Exception:
-        st.error("Could not extract a table from that URL. Many sites (incl. TPD) render tables with JavaScript.")
-        st.info("Use 'Paste table' (bookmarklet copies the table) or provide a direct CSV/XLSX link.")
-        st.stop()
-
-else:
-    # ---------- Paste table (robust for compact/fused TPD text) ----------
-    st.markdown("Run your bookmarklet → a white box appears → Select All → Copy → paste **everything** below.")
-    pasted = st.text_area("Paste table here (raw)", height=280)
-    if not pasted.strip():
-        st.stop()
-
-    def _looks_squashed_tpd(txt: str) -> bool:
-        # Heuristic: first non-empty line contains all 800m/600m/400m/200m in one line
-        first_nonempty = next((ln for ln in txt.splitlines() if ln.strip()), "")
-        return all(k in first_nonempty for k in ["800m", "600m", "400m", "200m"])
-
-    def _unsquash_tpd(txt: str) -> str:
-        """
-        Turn 'one huge line of headers + numbers' into a TSV with real columns.
-        Output headers: Result, No.(Draw), Horse, 800m, 600m, 400m, 200m, Finish
-        Handles fused tokens like:
-          '158.37','613.78','910.81','1113.55','1212.64' → keep only the time part.
-        """
-        lines = [ln for ln in txt.splitlines() if ln.strip()]
-        if not lines:
-            return txt
-
-        # helper: defuse leading position stuck to a float (1–2 digits allowed)
-        def _defuse_fused_number(tok: str) -> str:
-            m = re.match(r'^(\d{1,2})(\d+\.\d{1,3})$', tok)
-            return m.group(2) if m else tok
-
-        # Find header line (contains 800m/600m/400m/200m)
-        hdr_idx = 0
-        for i, ln in enumerate(lines):
-            if all(k in ln for k in ["800m", "600m", "400m", "200m"]):
-                hdr_idx = i
-                break
-
-        rows = lines[hdr_idx + 1:]  # data lines
-        header = ["Result", "No.(Draw)", "Horse", "800m", "600m", "400m", "200m", "Finish"]
-        out = ["\t".join(header)]
-
-        time_pat     = re.compile(r"^(?:\d+:\d{2}\.\d{1,3}|\d+\.\d{1,3}|NR)$")
-        pos_draw_pat = re.compile(r"^\d+\(\d+\)$")
-        float_pat    = re.compile(r"\d+\.\d{1,3}")
-
-        for ln in rows:
-            toks = ln.strip().split()
-            if not toks:
-                continue
-
-            # defuse fused tokens first (e.g. '1113.55' -> '13.55')
-            toks = [_defuse_fused_number(t) for t in toks]
-
-            # 1) Result/time (or NR): first token that matches time/NR
-            t_res = ""
-            while toks and not time_pat.match(toks[0]):
-                toks.pop(0)
-            if toks:
-                t_res = toks.pop(0)
+    elif source == "Web URL":
+        url = st.text_input("Enter a page URL (static HTML table) or a direct CSV/XLSX link")
+        if not url:
+            st.stop()
+        try:
+            if url.lower().endswith(".csv"):
+                df_raw = pd.read_csv(url)
+                st.success("Loaded CSV from URL.")
+            elif url.lower().endswith((".xlsx", ".xls")):
+                df_raw = pd.read_excel(url)
+                st.success("Loaded Excel from URL.")
             else:
-                continue
+                tables = pd.read_html(url)  # only static tables
+                if not tables:
+                    raise ValueError("No tables in static HTML.")
+                df_raw = max(tables, key=lambda t: t.shape[0] * t.shape[1])
+                st.success("Loaded HTML table from URL.")
+        except Exception as e:
+            st.error("Could not extract a table from that URL (likely rendered by JavaScript).")
+            if DEBUG: st.exception(e)
+            st.info("Use 'Paste table' (bookmarklet) or provide a direct CSV/XLSX link.")
+            st.stop()
 
-            # 2) No.(Draw): like 3(8)
-            nd = ""
-            if toks and pos_draw_pat.match(toks[0]):
-                nd = toks.pop(0)
-
-            # 3) Horse name until we start seeing segment-looking tokens (floats / '--')
-            horse_parts, seg_tokens = [], []
-            hit_segments = False
-            for tok in toks:
-                if float_pat.search(tok) or tok in {"--", "—"} or tok.replace("-", "") == "":
-                    hit_segments = True
-                if hit_segments:
-                    seg_tokens.append(tok)
-                else:
-                    horse_parts.append(tok)
-            horse = " ".join(horse_parts).strip()
-
-            # defuse again inside the segment tokens (safety)
-            seg_tokens = [_defuse_fused_number(t) for t in seg_tokens]
-
-            # 4) Pull floats from segment tokens. Expect at least 5 floats; if more, take the last 5.
-            floats = [ft for tok in seg_tokens for ft in float_pat.findall(tok)]
-            if len(floats) >= 5:
-                seg_vals = floats[-5:]  # assume order: 800m, 600m, 400m, 200m, Finish
-            else:
-                seg_vals = floats + [""] * (5 - len(floats))
-
-            out.append("\t".join([t_res, nd, horse] + seg_vals))
-
-        return "\n".join(out)
-
-    # Choose parser path: squashed or normal TSV/CSV/FWF
-    if _looks_squashed_tpd(pasted):
-        tsv = _unsquash_tpd(pasted)
-        df_raw = pd.read_csv(io.StringIO(tsv), sep="\t")
-        st.info("Detected compact TPD paste. Rebuilt into a proper table automatically.")
     else:
-        if "\t" in pasted:
-            df_raw = pd.read_csv(io.StringIO(pasted), sep="\t")
+        # ---------- Paste table (robust for compact/fused TPD text) ----------
+        st.markdown("Run your bookmarklet → a white box appears → Select All → Copy → paste **everything** below.")
+        pasted = st.text_area("Paste table here (raw)", height=280)
+        if not pasted.strip():
+            st.stop()
+
+        if _looks_squashed_tpd(pasted):
+            tsv = _unsquash_tpd(pasted)
+            df_raw = pd.read_csv(io.StringIO(tsv), sep="\t")
+            st.info("Detected compact TPD paste. Rebuilt into a proper table automatically.")
         else:
-            try:
-                df_raw = pd.read_csv(io.StringIO(pasted))
-            except Exception:
-                df_raw = pd.read_fwf(io.StringIO(pasted))
-        st.success("Parsed pasted table.")
+            # regular TSV/CSV/FWF paste
+            if "\t" in pasted:
+                df_raw = pd.read_csv(io.StringIO(pasted), sep="\t")
+            else:
+                try:
+                    df_raw = pd.read_csv(io.StringIO(pasted))
+                except Exception:
+                    df_raw = pd.read_fwf(io.StringIO(pasted))
+            st.success("Parsed pasted table.")
+
+except Exception as e:
+    st.error("Input parsing failed.")
+    if DEBUG: st.exception(e)
+    st.stop()
 
 st.subheader("Raw table preview")
 st.dataframe(df_raw.head(12), use_container_width=True)
+_dbg("Raw columns", list(df_raw.columns))
 
-# Normalize a copy of headers for detection/mapping
+# Normalize headers for detection/mapping
 df_norm = df_raw.copy()
 df_norm.columns = [_norm_header(c) for c in df_norm.columns]
-
 looks_200m = _has_200m_headers(df_raw) or _has_200m_headers(df_norm)
+_dbg("Looks like 200m table?", looks_200m)
 
-if looks_200m:
-    # Align names to normalized ones before conversion
-    df_conv_input = df_raw.copy()
-    df_conv_input.columns = df_norm.columns
-    work = convert_200m_table_to_app(df_conv_input)
-else:
-    # Fall back to app schema if user already provides it
-    work = df_raw.rename(columns={
-        "Race time": "Race Time", "Race_Time": "Race Time", "RaceTime": "Race Time",
-        "800_400": "800-400", "400_Finish": "400-Finish",
-        "Horse Name": "Horse", "Finish": "Finish_Pos", "Placing": "Finish_Pos"
-    })
+try:
+    if looks_200m:
+        # Align names to normalized ones before conversion
+        df_conv_input = df_raw.copy()
+        df_conv_input.columns = df_norm.columns
+        work = convert_200m_table_to_app(df_conv_input)
+    else:
+        # Fall back to app schema if user already provides it
+        work = df_raw.rename(columns={
+            "Race time": "Race Time", "Race_Time": "Race Time", "RaceTime": "Race Time",
+            "800_400": "800-400", "400_Finish": "400-Finish",
+            "Horse Name": "Horse", "Finish": "Finish_Pos", "Placing": "Finish_Pos"
+        })
+except Exception as e:
+    st.error("Conversion to app schema failed.")
+    if DEBUG: st.exception(e)
+    st.stop()
 
-# Hard guard: ensure required columns exist after conversion
+# Hard guard
 _required = ["Horse", "Race Time", "800-400", "400-Finish"]
 _missing = [c for c in _required if c not in work.columns]
 if _missing:
@@ -553,10 +576,11 @@ if _missing:
         "I couldn't produce the columns the analysis needs.\n\n"
         "Missing: " + ", ".join(_missing) +
         "\n\nTips:\n"
-        "• Make sure you pasted the actual table text (not a screenshot).\n"
-        "• The parser now handles compact TPD pastes, fused position+time tokens, and tabs.\n"
+        "• Paste the actual table text (not a screenshot).\n"
+        "• Parser handles compact TPD pastes, fused position+time tokens, and header spills.\n"
         "• Check the Raw preview above to see how headers came through."
     )
+    _dbg("Workframe columns", list(work.columns))
     st.stop()
 
 # --- Final normalization so the rest of the app works the same ---
@@ -577,8 +601,13 @@ st.dataframe(df.head(12), use_container_width=True)
 # ===================
 # Analysis Pipeline
 # ===================
-metrics = compute_metrics(df, distance_m=distance_m)
-metrics = flag_sleepers(metrics)
+try:
+    metrics = compute_metrics(df, distance_m=distance_m)
+    metrics = flag_sleepers(metrics)
+except Exception as e:
+    st.error("Metric computation failed.")
+    if DEBUG: st.exception(e)
+    st.stop()
 
 # Drop optional columns that clutter
 for drop_col in ["Jockey", "Trainer"]:
