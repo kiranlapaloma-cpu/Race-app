@@ -53,7 +53,6 @@ def parse_time_any(val):
     s = s.replace("：", ":")
     s = re.sub(r"[^\d:\.\s]", "", s)
     s = re.sub(r"\s+", "", s)
-    # seconds?
     try:
         return float(s)
     except Exception:
@@ -83,7 +82,7 @@ def compute_metrics(df, distance_m=1400.0):
     for c in ["RaceTime_s", "800-400", "400-Finish"]:
         out[c] = pd.to_numeric(out.get(c, np.nan), errors="coerce")
 
-    # Optional positions if present (used for EPI/Pos_Change; OK if absent)
+    # Optional positions (used for EPI/Pos_Change)
     for c in ["200_Pos", "400_Pos", "800_Pos", "1000_Pos", "Finish_Pos"]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
@@ -265,6 +264,62 @@ def compute_gci_v31(row, ctx, distance_m: float, winner_time_s=None):
     return score10, reasons
 
 # =========================================================
+# Narrative helpers (runner-by-runner)
+# =========================================================
+def style_from_epi(epi):
+    if pd.isna(epi): return "position unknown"
+    if epi <= 2.0:   return "on-speed/leader"
+    if epi <= 5.0:   return "handy/midfield"
+    return "backmarker"
+
+def kick_from_refined(refined):
+    if pd.isna(refined):     return "—"
+    if refined >= 103.0:     return "accelerated strongly late"
+    if refined >= 100.0:     return "kept building late"
+    if refined >= 97.0:      return "flattened late"
+    return "faded late"
+
+def pace_note(spi_med):
+    if pd.isna(spi_med): return "pace uncertain"
+    if spi_med >= 103:   return "fast early / tough late"
+    if spi_med <= 97:    return "slow early / sprint-home"
+    return "even tempo"
+
+def distance_hint(refined, pos_change, epi):
+    if pd.isna(refined) or pd.isna(pos_change) or pd.isna(epi): return ""
+    if refined >= 102 and pos_change >= 2: return "likely to appreciate a little further."
+    if refined < 98 and epi <= 2.5:        return "may prefer slightly shorter or a softer mid-race."
+    if refined >= 100 and epi >= 5:        return "effective if they can be ridden a touch closer."
+    return ""
+
+def runner_summary(row, spi_med):
+    name = str(row.get("Horse", ""))
+    fin  = row.get("Finish_Pos", np.nan)
+    rt   = row.get("RaceTime_s", np.nan)
+    epi  = row.get("EPI", np.nan)
+    ref  = row.get("Refined_FSP_%", np.nan)
+    spi  = row.get("SPI_%", np.nan)
+    pc   = row.get("Pos_Change", np.nan)
+    slp  = bool(row.get("Sleeper", False))
+    gci  = row.get("GCI", np.nan)
+    gcand= bool(row.get("Group_Candidate", False))
+
+    bits = [
+        f"**{name}** — Finish: **{int(fin) if not pd.isna(fin) else '—'}**, Time: **{rt:.2f}s**",
+        f"Style: {style_from_epi(epi)} (EPI {epi:.1f} if known); Race shape: {pace_note(spi_med)}.",
+        f"Late profile: {kick_from_refined(ref)} (Refined FSP {ref:.1f}% if known); "
+        f"Pos change 400–Finish: {int(pc) if not pd.isna(pc) else '—'}; "
+        f"GCI: {gci:.1f} if known."
+    ]
+    dh = distance_hint(ref, pc, epi)
+    if dh: bits.append(f"Note: {dh}")
+    tags = []
+    if slp: tags.append("Sleeper")
+    if gcand: tags.append("Group candidate")
+    if tags: bits[0] += f" **[{', '.join(tags)}]**"
+    return "  \n".join(bits)
+
+# =========================================================
 # Manual-mode grid utilities (countdown 200 m segments)
 # =========================================================
 def make_countdown_headers_any(distance_m: float) -> tuple[list[str], int]:
@@ -434,10 +489,7 @@ else:
     if not desired_order:
         desired_order = [c for c in df.columns if c not in ("Horse", "Finish_Pos")]
 
-    # Keep only existing columns, preserving countdown order
     seg_cols = [c for c in desired_order if c in df.columns]
-
-    # Strong safeguard
     if not seg_cols:
         st.error("No segment columns found. Please enter 200 m times in the manual editor.")
         st.stop()
@@ -446,7 +498,7 @@ else:
     for c in seg_cols:
         df[c] = pd.to_numeric(df[c].apply(parse_time_any), errors="coerce")
 
-    # RaceTime_s = sum of all segment times (allow partial rows but require at least 1 value)
+    # RaceTime_s = sum of all segment times
     df["RaceTime_s"] = df[seg_cols].sum(axis=1, min_count=1)
 
     # mid- and final-400 sums from tail segments
@@ -565,6 +617,13 @@ else:
         round_display(cands[["Horse","Finish_Pos","RaceTime_s","Refined_FSP_%","Basic_FSP_%","SPI_%","Pos_Change","EPI","GCI","GCI_Reasons"]]),
         width="stretch"
     )
+
+# ---- Runner-by-runner narrative ----
+st.subheader("Runner-by-runner summaries")
+ordered = metrics.sort_values("Finish_Pos", na_position="last")
+for _, row in ordered.iterrows():
+    st.markdown(runner_summary(row, ctx.get("spi_median")))
+    st.markdown("---")
 
 # ===================
 # Download
