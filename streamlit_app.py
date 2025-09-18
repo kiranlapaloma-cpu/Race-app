@@ -19,13 +19,10 @@ CANDIDATE_LOGO_PATHS = [
 ]
 LOGO_PATH = next((p for p in CANDIDATE_LOGO_PATHS if p.exists()), None)
 
-st.set_page_config(
-    page_title="The Sharpest Edge",
-    page_icon=str(LOGO_PATH) if LOGO_PATH else None,
-    layout="wide",
-)
+icon = str(LOGO_PATH) if LOGO_PATH and Path(LOGO_PATH).exists() else "🏇"
+st.set_page_config(page_title="The Sharpest Edge", page_icon=icon, layout="wide")
 
-if LOGO_PATH:
+if LOGO_PATH and Path(LOGO_PATH).exists():
     st.image(str(LOGO_PATH), width=250)
 
 # -------------------
@@ -44,37 +41,33 @@ def _dbg(label, obj=None):
 # Helpers: parsing, headers, metrics, GCI v3.1
 # =========================================================
 def parse_race_time(val):
-    """Parse Race Time as seconds or 'MM:SS.ms' (e.g., 1:12.49)."""
+    """Parse time in seconds, 'M:SS(.ms)', or 'H:MM:SS(.ms)'. Returns float seconds or NaN."""
     if pd.isna(val):
         return np.nan
-    # already seconds?
+    s = str(val).strip()
+    # direct float seconds?
     try:
-        return float(val)
+        return float(s)
     except Exception:
         pass
-    s = str(val).strip()
     parts = s.split(":")
     try:
-        if len(parts) == 3:
-            m, sec, ms = parts
-            return int(m) * 60 + int(sec) + int(ms) / 1000.0
-        if len(parts) == 2:
+        if len(parts) == 2:  # M:SS(.ms)
             m, sec = parts
             return int(m) * 60 + float(sec)
+        if len(parts) == 3:  # H:MM:SS(.ms)
+            h, m, sec = parts
+            return int(h) * 3600 + int(m) * 60 + float(sec)
     except Exception:
         return np.nan
     return np.nan
 
 def _norm_header(s: str) -> str:
-    """Lowercase, strip spaces/commas to match variants like '1,000 m' → '1000m'."""
-    s = str(s).strip().lower()
-    s = s.replace(",", "").replace(" ", "")
+    """Lowercase & strip punctuation/spaces to match variants."""
+    s = str(s).lower().strip()
+    for ch in [",", " ", "(", ")", "–", "-", "/", "\\"]:
+        s = s.replace(ch, "")
     return s
-
-def _has_200m_headers(df: pd.DataFrame) -> bool:
-    norm_cols = {_norm_header(c) for c in df.columns}
-    keys = {"1000m", "800m", "600m", "400m", "200m"}
-    return len(keys & norm_cols) > 0
 
 def compute_metrics(df, distance_m=1400.0):
     out = df.copy()
@@ -86,13 +79,24 @@ def compute_metrics(df, distance_m=1400.0):
     out["Refined_FSP_%"] = (out["Final400_Speed"] / out["Mid400_Speed"]) * 100.0
     out["SPI_%"]         = (out["Mid400_Speed"]   / out["Race_AvgSpeed"]) * 100.0
 
-    # Early Position Index (fallbacks)
-    if ("200_Pos" in out.columns) and ("400_Pos" in out.columns):
-        out["EPI"] = out["200_Pos"] * 0.6 + out["400_Pos"] * 0.4
-    elif ("1000_Pos" in out.columns) and ("800_Pos" in out.columns):
-        out["EPI"] = out["1000_Pos"] * 0.6 + out["800_Pos"] * 0.4
-    elif "400_Pos" in out.columns:
-        out["EPI"] = out["400_Pos"]
+    # Early Position Index (fallbacks, include common alternates)
+    def _get(col, alts):
+        for c in [col] + alts:
+            if c in out.columns:
+                return out[c]
+        return None
+
+    p200 = _get("200_Pos", ["Pos200", "200Pos", "P200"])
+    p400 = _get("400_Pos", ["Pos400", "400Pos", "P400"])
+    p800 = _get("800_Pos", ["Pos800", "800Pos", "P800"])
+    p1000= _get("1000_Pos",["Pos1000","1000Pos","P1000"])
+
+    if (p200 is not None) and (p400 is not None):
+        out["EPI"] = p200 * 0.6 + p400 * 0.4
+    elif (p1000 is not None) and (p800 is not None):
+        out["EPI"] = p1000 * 0.6 + p800 * 0.4
+    elif p400 is not None:
+        out["EPI"] = p400
     else:
         out["EPI"] = np.nan
 
@@ -250,7 +254,7 @@ def compute_gci_v31(row, ctx, distance_m: float, winner_time_s=None):
     if LQ < prof["lq_floor"]:
         PACE = min(PACE, 0.60)
 
-    score01 = (wT * T) + (wPACE * PACE) + (wSS * SS) + (wEFF * EFF)
+    score01 = min(1.0, (wT * T) + (wPACE * PACE) + (wSS * SS) + (wEFF * EFF))
     score10 = round(10.0 * score01, 2)
     return score10, reasons
 
@@ -293,12 +297,17 @@ def runner_summary(row, spi_med):
     gci  = row.get("GCI", np.nan)
     gcand= bool(row.get("Group_Candidate", False))
 
+    fin_txt = f"{int(fin)}" if not pd.isna(fin) else "—"
+    rt_txt  = f"{rt:.2f}s" if not pd.isna(rt) else "—"
+    ref_txt = f"{ref:.1f}%" if not pd.isna(ref) else "—"
+    pc_txt  = f"{int(pc)}" if not pd.isna(pc) else "—"
+    gci_txt = f"{gci:.1f}" if not pd.isna(gci) else "—"
+
     bits = [
-        f"**{name}** — Finish: **{int(fin) if not pd.isna(fin) else '—'}**, Time: **{rt:.2f}s**",
+        f"**{name}** — Finish: **{fin_txt}**, Time: **{rt_txt}**",
         f"Style: {style_from_epi(epi)} (EPI {epi:.1f} if known); Race shape: {pace_note(spi_med)}.",
-        f"Late profile: {kick_from_refined(ref)} (Refined FSP {ref:.1f}% if known); "
-        f"Pos change 400–Finish: {int(pc) if not pd.isna(pc) else '—'}; "
-        f"GCI: {gci:.1f} if known."
+        f"Late profile: {kick_from_refined(ref)} (Refined FSP {ref_txt}); "
+        f"Pos change 400–Finish: {pc_txt}; GCI: {gci_txt}."
     ]
     dh = distance_hint(ref, pc, epi)
     if dh: bits.append(f"Note: {dh}")
@@ -308,232 +317,93 @@ def runner_summary(row, spi_med):
     if tag: bits[0] += f" **[{', '.join(tag)}]**"
     return "  \n".join(bits)
 
-# ===================================================
-# TPD 200m converter & paste handling (with spill/fused)
-# ===================================================
-TIME_RE = re.compile(r"(\d+:\d{2}\.\d{1,3}|\d+\.\d{1,3})")
-
-def _last_float(cell):
-    if pd.isna(cell): return np.nan
-    m = re.findall(r"\d+\.\d{1,3}", str(cell))
-    return float(m[-1]) if m else np.nan
-
-def _first_text(cell):
-    if pd.isna(cell): return ""
-    return str(cell).splitlines()[0].strip()
-
-def _first_int_and_time(cell):
-    """
-    Handles fused “pos+time” like '158.37' -> (1, 58.37)
-    Also handles '9 1:00.09' -> (9, 60.09), 'NR' -> (nan, nan)
-    """
-    if pd.isna(cell):
-        return np.nan, np.nan
-    s = str(cell).strip()
-    if s.upper() == "NR":
-        return np.nan, np.nan
-    # fused 1–2 digits + float
-    m = re.match(r"^(\d{1,2})(\d+\.\d{1,3})$", s)
-    if m:
-        return int(m.group(1)), float(m.group(2))
-    # general case: find first integer and first time token
-    m_time = TIME_RE.findall(s)
-    m_pos  = re.findall(r"\b\d+\b", s)
-    pos = int(m_pos[0]) if m_pos else np.nan
-    if m_time:
-        t = m_time[0]
-        if ":" in t:
-            mm, rest = t.split(":")
-            return pos, int(mm) * 60 + float(rest)
-        return pos, float(t)
-    return pos, np.nan
-
-def convert_200m_table_to_app(df):
-    """
-    df is expected to have normalized headers (lowercase, no commas/spaces), e.g.:
-    'horse', 'result'/'finish'/'time', '1000m','800m','600m','400m','200m'
-    """
-    cols = {str(c).lower(): c for c in df.columns}
-    def pick(*names):
-        for n in names:
-            n = n.lower()
-            if n in cols:
-                return cols[n]
-        return None
-
-    col_horse  = pick("horse", "runner", "name")
-    col_result = pick("result", "finish", "time")
-
-    col_800    = pick("800m")
-    col_600    = pick("600m")
-    col_400    = pick("400m")
-    col_200    = pick("200m")
-
-    out = pd.DataFrame()
-    out["Horse"] = (df[col_horse].apply(_first_text) if col_horse else df.iloc[:, 0].apply(_first_text))
-
-    if col_result:
-        ft = df[col_result].apply(_first_int_and_time)
-        out["Finish_Pos"] = ft.apply(lambda x: x[0])
-        out["Race Time"]  = ft.apply(lambda x: x[1])
-    else:
-        out["Finish_Pos"] = np.nan
-        out["Race Time"]  = np.nan
-
-    seg_800 = df[col_800].apply(_last_float) if col_800 else np.nan
-    seg_600 = df[col_600].apply(_last_float) if col_600 else np.nan
-    seg_400 = df[col_400].apply(_last_float) if col_400 else np.nan
-    seg_200 = df[col_200].apply(_last_float) if col_200 else np.nan
-
-    out["800-400"]    = seg_800 + seg_600        # 800→600 + 600→400
-    out["400-Finish"] = seg_400 + seg_200        # 400→200 + 200→Finish
-
-    for c in ["Finish_Pos", "Race Time", "800-400", "400-Finish"]:
-        out[c] = pd.to_numeric(out[c], errors="coerce")
-    return out
-
-# ---------- Unsquasher for TPD pastes (handles “spill” and fused tokens) ----------
-def _looks_squashed_tpd(txt: str) -> bool:
-    first_nonempty = next((ln for ln in txt.splitlines() if ln.strip()), "")
-    return all(k in first_nonempty for k in ["800m", "600m", "400m", "200m"])
-
-def _unsquash_tpd(txt: str) -> str:
-    """
-    Convert the 'squashed' TPD paste into TSV:
-    Result | No.(Draw) | Horse | 800m | 600m | 400m | 200m | Finish
-
-    Handles:
-      • Fused tokens like '158.37' -> '58.37' (pos handled later)
-      • 'Number spill' of floats sitting after the header; distributes 5 per runner.
-    """
-    lines = [ln for ln in txt.splitlines() if ln.strip()]
-    if not lines:
-        return txt
-
-    float_pat = re.compile(r"\d+\.\d{1,3}")
-
-    def _defuse(tok: str) -> str:
-        m = re.match(r"^(\d{1,2})(\d+\.\d{1,3})$", tok)
-        return m.group(2) if m else tok
-
-    # 1) locate header line (contains all labels)
-    hdr_idx = 0
-    for i, ln in enumerate(lines):
-        if all(k in ln for k in ["800m", "600m", "400m", "200m", "Finish"]):
-            hdr_idx = i
-            break
-
-    header_line = lines[hdr_idx]
-    rows = lines[hdr_idx + 1:]
-
-    # 2) try to harvest a "spill" of floats from the tail of the header line
-    #    i.e., after the last label 'Finish'
-    spill = float_pat.findall(header_line.split("Finish")[-1])
-
-    # or, if the first row after header is just a block of floats, use that instead
-    if not spill and rows:
-        tokens = rows[0].split()
-        if tokens and all(float_pat.search(t) or t in {"--", "—"} for t in tokens):
-            spill = float_pat.findall(rows[0])
-            rows = rows[1:]
-
-    header = ["Result", "No.(Draw)", "Horse", "800m", "600m", "400m", "200m", "Finish"]
-    out = ["\t".join(header)]
-
-    # 3) helper to distribute 5 floats per runner
-    def get_segments(i):
-        if not spill:
-            return [""] * 5
-        start = i * 5
-        end = start + 5
-        if end <= len(spill):
-            return spill[start:end]
-        return [""] * 5
-
-    # 4) parse runner rows
-    for i, ln in enumerate(rows):
-        toks = [_defuse(t) for t in ln.strip().split()]
-        if not toks:
-            continue
-
-        # Result token: may be 'NR', '1:12.49', '58.37', '158.37' etc
-        result = toks.pop(0) if toks else ""
-        # No.(Draw): like 3(8)
-        nd = toks.pop(0) if toks and "(" in toks[0] else ""
-        # Horse = the rest (trainer/jockey usually included; fine)
-        horse = " ".join(toks).strip()
-
-        segs = get_segments(i)
-        out.append("\t".join([result, nd, horse] + segs))
-
-    return "\n".join(out)
-
 # ===================
-# UI: Inputs & Flow
+# UI: Inputs & Flow (CSV or Manual only)
 # ===================
 st.title("🏇 The Sharpest Edge")
-st.caption("Upload CSV/XLSX, paste a TPD-style sectional table, or load from a URL with static HTML. 200m splits are auto-converted to 400m metrics and GCI v3.1 is computed.")
+st.caption("Choose CSV upload or enter values manually. URL and paste ingestion removed for a cleaner workflow.")
 
 with st.sidebar:
     st.header("Data Source")
-    source = st.radio("Choose input type", ["Upload file", "Web URL", "Paste table"], index=0)
+    source = st.radio("Choose input type", ["Upload CSV", "Manual input"], index=0)
     distance_m = st.number_input("Race Distance (m)", min_value=800, max_value=4000, value=1400, step=50)
+    show_example = st.checkbox("Prefill manual input with 6 example rows", value=False)
+
+def _empty_manual_frame(n_rows: int = 8) -> pd.DataFrame:
+    """Blank manual-entry frame with the exact columns the analysis expects."""
+    cols = [
+        "Horse", "Finish_Pos", "Race Time", "800-400", "400-Finish",
+        "200_Pos", "400_Pos", "800_Pos", "1000_Pos"
+    ]
+    df = pd.DataFrame({c: [np.nan]*n_rows for c in cols})
+    df["Horse"] = ""
+    return df
 
 df_raw = None
 
 try:
-    if source == "Upload file":
-        uploaded = st.file_uploader("Upload CSV/XLSX (any jurisdiction)", type=["csv", "xlsx"])
+    if source == "Upload CSV":
+        uploaded = st.file_uploader(
+            "Upload CSV (columns: Horse, Finish_Pos (opt), Race Time, 800-400, 400-Finish, 200_Pos/400_Pos/800_Pos/1000_Pos (opt))",
+            type=["csv"]
+        )
         if uploaded is None:
-            st.info("Upload a file or switch to 'Web URL' or 'Paste table'.")
+            st.info("Upload a CSV or switch to Manual input.")
             st.stop()
-        df_raw = pd.read_csv(uploaded) if uploaded.name.lower().endswith(".csv") else pd.read_excel(uploaded)
+        df_raw = pd.read_csv(uploaded)
         st.success("File loaded.")
-
-    elif source == "Web URL":
-        url = st.text_input("Enter a page URL (static HTML table) or a direct CSV/XLSX link")
-        if not url:
-            st.stop()
-        try:
-            if url.lower().endswith(".csv"):
-                df_raw = pd.read_csv(url)
-                st.success("Loaded CSV from URL.")
-            elif url.lower().endswith((".xlsx", ".xls")):
-                df_raw = pd.read_excel(url)
-                st.success("Loaded Excel from URL.")
-            else:
-                tables = pd.read_html(url)  # only static tables
-                if not tables:
-                    raise ValueError("No tables in static HTML.")
-                df_raw = max(tables, key=lambda t: t.shape[0] * t.shape[1])
-                st.success("Loaded HTML table from URL.")
-        except Exception as e:
-            st.error("Could not extract a table from that URL (likely rendered by JavaScript).")
-            if DEBUG: st.exception(e)
-            st.info("Use 'Paste table' (bookmarklet) or provide a direct CSV/XLSX link.")
-            st.stop()
-
     else:
-        # ---------- Paste table (robust for compact/fused TPD text) ----------
-        st.markdown("Run your bookmarklet → a white box appears → Select All → Copy → paste **everything** below.")
-        pasted = st.text_area("Paste table here (raw)", height=280)
-        if not pasted.strip():
-            st.stop()
+        # ---------- Manual input ----------
+        st.subheader("Manual input")
+        st.write("Fill the grid. Time may be seconds (e.g., `72.45`) or `M:SS.ms` (e.g., `1:12.45`).")
+        n_rows = st.number_input("Rows", min_value=1, max_value=30, value=6, step=1)
+        if "manual_df" not in st.session_state or st.session_state.get("manual_df_rows", 0) != n_rows:
+            st.session_state["manual_df"] = _empty_manual_frame(n_rows)
+            st.session_state["manual_df_rows"] = n_rows
 
-        if _looks_squashed_tpd(pasted):
-            tsv = _unsquash_tpd(pasted)
-            df_raw = pd.read_csv(io.StringIO(tsv), sep="\t")
-            st.info("Detected compact TPD paste. Rebuilt into a proper table automatically.")
-        else:
-            # regular TSV/CSV/FWF paste
-            if "\t" in pasted:
-                df_raw = pd.read_csv(io.StringIO(pasted), sep="\t")
-            else:
-                try:
-                    df_raw = pd.read_csv(io.StringIO(pasted))
-                except Exception:
-                    df_raw = pd.read_fwf(io.StringIO(pasted))
-            st.success("Parsed pasted table.")
+        if show_example and st.session_state["manual_df"]["Horse"].eq("").all():
+            ex = _empty_manual_frame(6)
+            ex.loc[0, ["Horse","Race Time","800-400","400-Finish","200_Pos","400_Pos"]] = ["Runner A","72.40","25.2","23.8",2,3]
+            ex.loc[1, ["Horse","Race Time","800-400","400-Finish","200_Pos","400_Pos"]] = ["Runner B","72.55","25.3","23.9",3,4]
+            ex.loc[2, ["Horse","Race Time","800-400","400-Finish","200_Pos","400_Pos"]] = ["Runner C","73.10","25.7","24.0",6,6]
+            ex.loc[3, ["Horse","Race Time","800-400","400-Finish","200_Pos","400_Pos"]] = ["Runner D","72.90","25.4","24.2",1,2]
+            ex.loc[4, ["Horse","Race Time","800-400","400-Finish","200_Pos","400_Pos"]] = ["Runner E","73.60","26.0","24.3",8,7]
+            ex.loc[5, ["Horse","Race Time","800-400","400-Finish","200_Pos","400_Pos"]] = ["Runner F","73.30","25.9","24.2",5,5]
+            st.session_state["manual_df"] = ex
+
+        manual_df = st.data_editor(
+            st.session_state["manual_df"],
+            use_container_width=True,
+            num_rows="dynamic",
+            column_config={
+                "Horse": st.column_config.TextColumn(required=True, help="Runner name"),
+                "Finish_Pos": st.column_config.NumberColumn(format="%d", help="Optional (we infer from time if missing)"),
+                "Race Time": st.column_config.TextColumn(help="Seconds or M:SS.ms"),
+                "800-400": st.column_config.TextColumn(help="Seconds for 800→400 segment"),
+                "400-Finish": st.column_config.TextColumn(help="Seconds for 400→Finish segment"),
+                "200_Pos": st.column_config.NumberColumn(format="%.1f", help="Optional"),
+                "400_Pos": st.column_config.NumberColumn(format="%.1f", help="Optional"),
+                "800_Pos": st.column_config.NumberColumn(format="%.1f", help="Optional"),
+                "1000_Pos": st.column_config.NumberColumn(format="%.1f", help="Optional"),
+            },
+            key="manual_editor",
+        )
+
+        # Clean blank rows (no Horse & no times)
+        df_raw = manual_df.copy()
+        df_raw["Horse"] = df_raw["Horse"].astype(str).str.strip()
+        nonempty = (
+            df_raw["Horse"].ne("") |
+            df_raw["Race Time"].astype(str).str.strip().ne("") |
+            df_raw["800-400"].astype(str).str.strip().ne("") |
+            df_raw["400-Finish"].astype(str).str.strip().ne("")
+        )
+        df_raw = df_raw.loc[nonempty].reset_index(drop=True)
+
+        if df_raw.empty:
+            st.info("Enter at least one row (Horse + times) above.")
+            st.stop()
+        st.success("Manual data captured.")
 
 except Exception as e:
     st.error("Input parsing failed.")
@@ -544,56 +414,40 @@ st.subheader("Raw table preview")
 st.dataframe(df_raw.head(12), use_container_width=True)
 _dbg("Raw columns", list(df_raw.columns))
 
-# Normalize headers for detection/mapping
-df_norm = df_raw.copy()
-df_norm.columns = [_norm_header(c) for c in df_norm.columns]
-looks_200m = _has_200m_headers(df_raw) or _has_200m_headers(df_norm)
-_dbg("Looks like 200m table?", looks_200m)
+# --- Final normalization so the rest of the app works the same ---
+# Map common alt headers just in case a user’s CSV uses variants
+df = df_raw.rename(columns={
+    "Race time": "Race Time", "Race_Time": "Race Time", "RaceTime": "Race Time",
+    "800_400": "800-400", "400_Finish": "400-Finish",
+    "Horse Name": "Horse", "Finish": "Finish_Pos", "Placing": "Finish_Pos"
+}).copy()
 
-try:
-    if looks_200m:
-        # Align names to normalized ones before conversion
-        df_conv_input = df_raw.copy()
-        df_conv_input.columns = df_norm.columns
-        work = convert_200m_table_to_app(df_conv_input)
-    else:
-        # Fall back to app schema if user already provides it
-        work = df_raw.rename(columns={
-            "Race time": "Race Time", "Race_Time": "Race Time", "RaceTime": "Race Time",
-            "800_400": "800-400", "400_Finish": "400-Finish",
-            "Horse Name": "Horse", "Finish": "Finish_Pos", "Placing": "Finish_Pos"
-        })
-except Exception as e:
-    st.error("Conversion to app schema failed.")
-    if DEBUG: st.exception(e)
-    st.stop()
-
-# Hard guard
 _required = ["Horse", "Race Time", "800-400", "400-Finish"]
-_missing = [c for c in _required if c not in work.columns]
+_missing = [c for c in _required if c not in df.columns]
 if _missing:
     st.error(
-        "I couldn't produce the columns the analysis needs.\n\n"
-        "Missing: " + ", ".join(_missing) +
-        "\n\nTips:\n"
-        "• Paste the actual table text (not a screenshot).\n"
-        "• Parser handles compact TPD pastes, fused position+time tokens, and header spills.\n"
-        "• Check the Raw preview above to see how headers came through."
+        "Missing required columns: " + ", ".join(_missing) +
+        "\n\nRequired: Horse, Race Time, 800-400, 400-Finish\n"
+        "Optional: Finish_Pos, 200_Pos, 400_Pos, 800_Pos, 1000_Pos"
     )
-    _dbg("Workframe columns", list(work.columns))
+    _dbg("Workframe columns", list(df.columns))
     st.stop()
 
-# --- Final normalization so the rest of the app works the same ---
-df = work.copy()
+# Parse times safely
 df["RaceTime_s"] = df["Race Time"].apply(parse_race_time)
-for col in ["800-400", "400-Finish", "200_Pos", "400_Pos", "800_Pos", "1000_Pos", "Finish_Pos"]:
+for col in ["800-400", "400-Finish"]:
+    df[col] = pd.to_numeric(df[col].apply(parse_race_time), errors="coerce")
+
+# Optional numeric fields
+for col in ["200_Pos", "400_Pos", "800_Pos", "1000_Pos", "Finish_Pos", "Pos200", "Pos400", "Pos800", "Pos1000", "P200", "P400", "P800", "P1000"]:
     if col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
 # If Finish_Pos missing, infer by time (best-effort)
 if ("Finish_Pos" not in df.columns) or df["Finish_Pos"].isna().all():
     if df["RaceTime_s"].notna().any():
-        df["Finish_Pos"] = df["RaceTime_s"].rank(method="min").astype("Int64")
+        df["Finish_Pos"] = df["RaceTime_s"].rank(method="min")
+    df["Finish_Pos"] = df["Finish_Pos"].astype("Int64")
 
 st.subheader("Converted table (ready for analysis)")
 st.dataframe(df.head(12), use_container_width=True)
@@ -643,17 +497,19 @@ st.dataframe(disp, use_container_width=True)
 st.subheader("Pace Curves — Field Average (black) + Top 8 by Finish")
 avg_mid = metrics["Mid400_Speed"].mean()
 avg_fin = metrics["Final400_Speed"].mean()
-top8 = metrics.sort_values("Finish_Pos").head(8)
+top8 = metrics.sort_values("Finish_Pos").head(8).copy()
+top8["HorseShort"] = top8["Horse"].astype(str).str.slice(0, 20)
 
 fig, ax = plt.subplots()
 x_vals = [1, 2]
 ax.plot(x_vals, [avg_mid, avg_fin], marker="o", linewidth=3, color="black", label="Average (Field)")
 for _, row in top8.iterrows():
-    ax.plot(x_vals, [row["Mid400_Speed"], row["Final400_Speed"]], marker="o", linewidth=2, label=str(row.get("Horse", "Runner")))
+    ax.plot(x_vals, [row["Mid400_Speed"], row["Final400_Speed"]], marker="o", linewidth=2, label=row["HorseShort"])
 ax.set_xticks([1, 2]); ax.set_xticklabels(["Mid 400 (800→400)", "Final 400 (400→Finish)"])
 ax.set_ylabel("Speed (m/s)"); ax.set_title("Average vs Top 8 Pace Curves")
 ax.grid(True, linestyle="--", alpha=0.3)
-fig.legend(loc="lower center", ncol=4, bbox_to_anchor=(0.5, -0.12))
+fig.subplots_adjust(bottom=0.22)
+fig.legend(loc="lower center", ncol=4, bbox_to_anchor=(0.5, 0.0), frameon=False)
 st.pyplot(fig)
 
 st.subheader("Insights")
