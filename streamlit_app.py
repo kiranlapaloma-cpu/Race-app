@@ -569,15 +569,3 @@ ordered = gci_df.sort_values("Finish_Pos", na_position="last")
 for _, row in ordered.iterrows():
     st.markdown(runner_summary(row, ctx["spi_median"]))
     st.markdown("---")
-
-# Download
-st.subheader("Download")
-out = sleep_df.merge(gci_df[["Horse","GCI"]], on="Horse", how="left", suffixes=("",""))
-csv_bytes = out.to_csv(index=False).encode("utf-8")
-st.download_button("Download full metrics as CSV", data=csv_bytes, file_name="race_edge_v33_metrics.csv", mime="text/csv")
-
-st.caption(
-    "Legend: Basic FSP = Final400 / Race Avg; Refined FSP = Final400 / Mid400; "
-    "SPI = Mid400 / Race Avg; Kick01 (anchored) for GCI; KickQ (quantile-aware) for Sleepers/Display; "
-    "GCI v3.3 applies distance-normalised, sectional pressure context."
-)
