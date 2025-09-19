@@ -1,5 +1,4 @@
 # streamlit_app.py
-import io
 import re
 from pathlib import Path
 
@@ -11,7 +10,6 @@ import matplotlib.pyplot as plt
 # ================================
 # Branding / Page
 # ================================
-from pathlib import Path
 APP_DIR = Path(__file__).resolve().parent
 LOGO_PATH = APP_DIR / "assets" / "logos.png"
 
@@ -20,6 +18,7 @@ st.set_page_config(
     page_icon=str(LOGO_PATH) if LOGO_PATH.exists() else None,
     layout="wide",
 )
+
 if LOGO_PATH.exists():
     st.image(str(LOGO_PATH), width=220)
 
@@ -339,7 +338,7 @@ def flag_sleepers_v33_balanced(df_in, distance_m, ctx):
     df["Kick_abs"] = 100.0 * (0.70*df["Refined_FSP_%"].apply(lambda x: map01(x, 98.0, 104.0)) +
                               0.30*df["Basic_FSP_%"].apply(lambda x: map01(x, 98.0, 104.0)))
 
-    # mid_pct exists from GCI; compute if missing
+    # mid_pct from GCI; compute if missing
     if "mid_pct" not in df.columns:
         df["mid_pct"] = df["Mid400_Speed"].rank(pct=True, method="average").fillna(0.5)
 
@@ -424,7 +423,7 @@ st.subheader("Raw table preview")
 st.dataframe(df_raw.head(12), width="stretch")
 _dbg("Raw columns", list(df_raw.columns))
 
-# Detect & convert 200m TPD tables (for uploads)
+# Detect & convert 200m TPD tables (uploads only)
 df_norm = df_raw.copy()
 df_norm.columns = [_norm_header(c) for c in df_norm.columns]
 looks_200m = _has_200m_headers(df_raw) or _has_200m_headers(df_norm)
@@ -504,7 +503,6 @@ disp_cols = ["Horse","Finish_Pos","RaceTime_s","Basic_FSP_%","Refined_FSP_%","SP
              "Kick01","GCI","T","LQ","OPp","CMp","LTp","SS","EFF"]
 disp = gci_df[disp_cols].copy()
 disp = disp.sort_values(["Finish_Pos"], na_position="last")
-# round numerics
 for c in ["Basic_FSP_%","Refined_FSP_%","SPI_%","Kick01","GCI","T","LQ","OPp","CMp","LTp","SS","EFF","RaceTime_s"]:
     if c in disp.columns:
         disp[c] = pd.to_numeric(disp[c], errors="coerce").round(3 if c in ["Kick01","T","LQ","OPp","CMp","LTp","SS","EFF"] else 2)
@@ -548,7 +546,6 @@ sleep_disp_cols = ["Horse","Finish_Pos","RaceTime_s","Kick_abs","KickQ","mid_pct
 sleep_disp = sleep_df[sleep_disp_cols].copy().sort_values(
     ["Sleeper","sleeper01","Finish_Pos"], ascending=[False, False, True]
 )
-# rounding
 for c in ["Kick_abs","KickQ","mid_pct","deficit_s","kick_comp","chase_comp","time_comp","sleeper01","RaceTime_s"]:
     if c in sleep_disp.columns:
         sleep_disp[c] = pd.to_numeric(sleep_disp[c], errors="coerce").round(3 if c in ["kick_comp","chase_comp","time_comp","sleeper01","mid_pct"] else 2)
