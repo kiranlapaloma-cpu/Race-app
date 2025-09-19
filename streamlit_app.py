@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 # ================================
 # Branding / Page
 # ================================
+from pathlib import Path
 APP_DIR = Path(__file__).resolve().parent
 LOGO_PATH = APP_DIR / "assets" / "logos.png"
 
@@ -19,7 +20,6 @@ st.set_page_config(
     page_icon=str(LOGO_PATH) if LOGO_PATH.exists() else None,
     layout="wide",
 )
-
 if LOGO_PATH.exists():
     st.image(str(LOGO_PATH), width=220)
 
