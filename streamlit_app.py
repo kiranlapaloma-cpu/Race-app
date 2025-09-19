@@ -1,3 +1,5 @@
+# streamlit_app.py
+import io
 import re
 from pathlib import Path
 
@@ -7,7 +9,7 @@ import streamlit as st
 import matplotlib.pyplot as plt
 
 # ================================
-# App / Branding
+# Branding / Page
 # ================================
 APP_DIR = Path(__file__).resolve().parent
 CANDIDATE_LOGO_PATHS = [
@@ -18,13 +20,20 @@ CANDIDATE_LOGO_PATHS = [
 ]
 LOGO_PATH = next((p for p in CANDIDATE_LOGO_PATHS if p.exists()), None)
 
-icon = str(LOGO_PATH) if LOGO_PATH and Path(LOGO_PATH).exists() else "🏇"
-st.set_page_config(page_title="The Sharpest Edge", page_icon=icon, layout="wide")
-if LOGO_PATH and Path(LOGO_PATH).exists():
+st.set_page_config(
+    page_title="Race Edge — v3.3 (KickQ Sleepers)",
+    page_icon=str(LOGO_PATH) if LOGO_PATH else None,
+    layout="wide",
+)
+
+if LOGO_PATH:
     st.image(str(LOGO_PATH), width=220)
 
-st.title("🏇 The Sharpest Edge")
-st.caption("Upload CSV or use Manual input with countdown 200 m segments. Calculates SPI / Basic FSP / Refined FSP, flags Sleepers, computes GCI v3.1, and plots pace curves.")
+st.title("🏇 Race Edge — v3.3")
+st.caption(
+    "GCI v3.3 (EPI-free, sectional). Sleepers use KickQ (quantile-aware) with balanced gates/tiers, "
+    "heat bonus, field-size guards, and a safety-net."
+)
 
 # -------------------
 # Debug toggle
@@ -38,603 +47,569 @@ def _dbg(label, obj=None):
         if obj is not None:
             st.write(obj)
 
-# =========================================================
-# Time parsing (seconds, M:SS.ms, M:SS:ms like 01:37:620, H:MM:SS(.ms))
-# =========================================================
-_M_SS_MS_RE   = re.compile(r"^(?P<m>\d{1,2}):(?P<s>\d{2}):(?P<ms>\d{2,3})$")
-_M_SS_DMS_RE  = re.compile(r"^(?P<m>\d{1,2}):(?P<s>\d{2}\.\d+)$")
-_H_MM_SS_RE   = re.compile(r"^(?P<h>\d+):(?P<m>\d{2}):(?P<s>\d{2}(?:\.\d+)?)$")
-
-def parse_time_any(val):
-    """Return seconds (float) from seconds, M:SS.ms, M:SS:ms, or H:MM:SS(.ms)."""
+# ================================
+# Helpers
+# ================================
+def parse_race_time(val):
+    """Parse Race Time seconds or 'MM:SS.ms'."""
     if pd.isna(val):
         return np.nan
     s = str(val).strip()
-    s = s.replace("：", ":")
-    s = re.sub(r"[^\d:\.\s]", "", s)
-    s = re.sub(r"\s+", "", s)
+    # already seconds?
     try:
         return float(s)
     except Exception:
         pass
-    m = _M_SS_MS_RE.match(s)
-    if m:
-        mm, ss, ms = int(m.group("m")), int(m.group("s")), int(m.group("ms"))
-        if ss < 60 and ms < 1000:
-            return mm * 60 + ss + ms / 1000.0
-    m = _M_SS_DMS_RE.match(s)
-    if m:
-        mm, sec = int(m.group("m")), float(m.group("s"))
-        return mm * 60 + sec
-    m = _H_MM_SS_RE.match(s)
-    if m:
-        hh, mm, sec = int(m.group("h")), int(m.group("m")), float(m.group("s"))
-        return hh * 3600 + mm * 60 + sec
+    parts = s.split(":")
+    try:
+        if len(parts) == 3:
+            m, sec, ms = parts
+            return int(m) * 60 + int(sec) + int(ms) / 1000.0
+        if len(parts) == 2:
+            m, sec = parts
+            return int(m) * 60 + float(sec)
+    except Exception:
+        return np.nan
     return np.nan
 
-# =========================================================
-# Core metric helpers
-# =========================================================
-def compute_metrics(df, distance_m=1400.0):
-    """Assumes df has numeric RaceTime_s, 800-400, 400-Finish; optional positions."""
-    out = df.copy()
+def _norm_header(s: str) -> str:
+    s = str(s).strip().lower()
+    s = s.replace(",", "").replace(" ", "")
+    return s
 
-    for c in ["RaceTime_s", "800-400", "400-Finish"]:
-        out[c] = pd.to_numeric(out.get(c, np.nan), errors="coerce")
+def _has_200m_headers(df: pd.DataFrame) -> bool:
+    norm_cols = {_norm_header(c) for c in df.columns}
+    keys = {"1000m", "800m", "600m", "400m", "200m"}
+    return len(keys & norm_cols) > 0
 
-    # Optional positions (used for EPI/Pos_Change)
-    for c in ["200_Pos", "400_Pos", "800_Pos", "1000_Pos", "Finish_Pos"]:
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
+# ====== 200m→app converter (handles fused text) ======
+TIME_RE = re.compile(r"(\d+:\d{2}\.\d{1,3}|\d+\.\d{1,3})")
 
-    with np.errstate(divide='ignore', invalid='ignore'):
-        out["Race_AvgSpeed"]  = distance_m / out["RaceTime_s"]
-        out["Mid400_Speed"]   = 400.0 / out["800-400"]
-        out["Final400_Speed"] = 400.0 / out["400-Finish"]
+def _last_float(cell):
+    if pd.isna(cell): return np.nan
+    m = re.findall(r"\d+\.\d{1,3}", str(cell))
+    return float(m[-1]) if m else np.nan
 
-        out["SPI_%"]         = (out["Mid400_Speed"]   / out["Race_AvgSpeed"]) * 100.0
-        out["Basic_FSP_%"]   = (out["Final400_Speed"] / out["Race_AvgSpeed"]) * 100.0
-        out["Refined_FSP_%"] = (out["Final400_Speed"] / out["Mid400_Speed"]) * 100.0
+def _first_text(cell):
+    if pd.isna(cell): return ""
+    return str(cell).splitlines()[0].strip()
 
-    out.replace([np.inf, -np.inf], np.nan, inplace=True)
+def _first_int_and_time(cell):
+    if pd.isna(cell):
+        return np.nan, np.nan
+    s = str(cell).strip()
+    if s.upper() == "NR":
+        return np.nan, np.nan
+    m = re.match(r"^(\d{1,2})(\d+\.\d{1,3})$", s)
+    if m:
+        return int(m.group(1)), float(m.group(2))
+    m_time = TIME_RE.findall(s)
+    m_pos  = re.findall(r"\b\d+\b", s)
+    pos = int(m_pos[0]) if m_pos else np.nan
+    if m_time:
+        t = m_time[0]
+        if ":" in t:
+            mm, rest = t.split(":")
+            return pos, int(mm) * 60 + float(rest)
+        return pos, float(t)
+    return pos, np.nan
 
-    # EPI (optional)
-    if ("200_Pos" in out.columns) and ("400_Pos" in out.columns):
-        out["EPI"] = out["200_Pos"] * 0.6 + out["400_Pos"] * 0.4
-    elif ("1000_Pos" in out.columns) and ("800_Pos" in out.columns):
-        out["EPI"] = out["1000_Pos"] * 0.6 + out["800_Pos"] * 0.4
-    elif "400_Pos" in out.columns:
-        out["EPI"] = out["400_Pos"]
+def convert_200m_table_to_app(df):
+    cols = {str(c).lower(): c for c in df.columns}
+    def pick(*names):
+        for n in names:
+            n = n.lower()
+            if n in cols:
+                return cols[n]
+        return None
+    col_horse  = pick("horse", "runner", "name")
+    col_result = pick("result", "finish", "time")
+    col_800    = pick("800m")
+    col_600    = pick("600m")
+    col_400    = pick("400m")
+    col_200    = pick("200m")
+
+    out = pd.DataFrame()
+    out["Horse"] = (df[col_horse].apply(_first_text) if col_horse else df.iloc[:, 0].apply(_first_text))
+
+    if col_result:
+        ft = df[col_result].apply(_first_int_and_time)
+        out["Finish_Pos"] = ft.apply(lambda x: x[0])
+        out["Race Time"]  = ft.apply(lambda x: x[1])
     else:
-        out["EPI"] = np.nan
+        out["Finish_Pos"] = np.nan
+        out["Race Time"]  = np.nan
 
-    # Pos change (optional)
-    if ("400_Pos" in out.columns) and ("Finish_Pos" in out.columns):
-        out["Pos_Change"] = out["400_Pos"] - out["Finish_Pos"]
-    else:
-        out["Pos_Change"] = np.nan
+    seg_800 = df[col_800].apply(_last_float) if col_800 else np.nan
+    seg_600 = df[col_600].apply(_last_float) if col_600 else np.nan
+    seg_400 = df[col_400].apply(_last_float) if col_400 else np.nan
+    seg_200 = df[col_200].apply(_last_float) if col_200 else np.nan
 
+    out["800-400"]    = seg_800 + seg_600
+    out["400-Finish"] = seg_400 + seg_200
+
+    for c in ["Finish_Pos", "Race Time", "800-400", "400-Finish"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
     return out
 
-def round_display(df):
-    df = df.copy()
-    for c in ["Basic_FSP_%", "Refined_FSP_%", "SPI_%", "Race_AvgSpeed", "Mid400_Speed", "Final400_Speed"]:
-        if c in df.columns:
-            df.loc[:, c] = df[c].round(2)
-    if "RaceTime_s" in df.columns:
-        df.loc[:, "RaceTime_s"] = df["RaceTime_s"].round(3)
-    if "EPI" in df.columns:
-        df.loc[:, "EPI"] = df["EPI"].round(1)
-    if "Pos_Change" in df.columns:
-        df.loc[:, "Pos_Change"] = df["Pos_Change"].round(0).astype("Int64")
-    return df
-
-# =========================================================
-# Sleeper flag
-# =========================================================
-def flag_sleepers(df):
-    """
-    Sleeper = Refined_FSP_% >= 102 OR Pos_Change >= 3 (if available),
-    and (if Finish_Pos present) finished outside top 3.
-    """
-    out = df.copy()
-    out["Sleeper"] = False
-    cond = (out["Refined_FSP_%"] >= 102.0) | (out["Pos_Change"].fillna(0) >= 3)
-    if "Finish_Pos" in out.columns:
-        cond = cond & (out["Finish_Pos"] > 3)
-    out.loc[cond, "Sleeper"] = True
-    return out
-
-# =========================================================
-# Pressure context + GCI v3.1
-# =========================================================
-def _to01(val, lo, hi):
-    if pd.isna(val) or hi == lo:
-        return 0.0
-    return float(min(1.0, max(0.0, (val - lo) / (hi - lo))))
-
-def compute_pressure_context(metrics_df):
-    spi_med = metrics_df["SPI_%"].median()
-    early_heat = 0.0 if pd.isna(spi_med) else max(0.0, min(1.0, (spi_med - 100.0) / 3.0))  # ~103 → 1.0
-    epi_series = metrics_df["EPI"] if "EPI" in metrics_df.columns else pd.Series(dtype=float)
-    if epi_series.empty:
-        pressure_ratio = 0.0
-        field_size = int(metrics_df.shape[0])
-    else:
-        valid_epi = epi_series.dropna()
-        field_size = int(metrics_df.shape[0])
-        pressure_ratio = 0.0 if valid_epi.empty else float((valid_epi <= 3.0).mean())
-    return {"early_heat": early_heat, "pressure_ratio": pressure_ratio, "field_size": field_size, "spi_median": spi_med}
-
+# ====== Distance buckets / profiles ======
 def _distance_bucket(distance_m: float) -> str:
-    if distance_m <= 1400: return "SPRINT"
-    if distance_m < 1800:  return "MILE"
-    if distance_m < 2200:  return "MIDDLE"
+    d = float(distance_m)
+    if d <= 1400: return "SPRINT"
+    if d < 1800:  return "MILE"
+    if d < 2200:  return "MIDDLE"
     return "STAY"
 
 def distance_profile(distance_m: float) -> dict:
     b = _distance_bucket(distance_m)
     if b == "SPRINT":
-        return dict(bucket=b, wT=0.22, wPACE=0.38, wSS=0.20, wEFF=0.20, lq_ref_w=0.70, lq_basic_w=0.30, ss_lo=99.0,  ss_hi=105.0, lq_floor=0.35)
+        return dict(bucket=b, wT=0.22, wPACE=0.38, wSS=0.20, wEFF=0.20,
+                    ss_lo=99.0, ss_hi=105.0, lq_floor=0.35)
     if b == "STAY":
-        return dict(bucket=b, wT=0.30, wPACE=0.28, wSS=0.30, wEFF=0.12, lq_ref_w=0.50, lq_basic_w=0.50, ss_lo=97.5, ss_hi=104.5, lq_floor=0.25)
+        return dict(bucket=b, wT=0.30, wPACE=0.28, wSS=0.30, wEFF=0.12,
+                    ss_lo=97.5, ss_hi=104.5, lq_floor=0.25)
     if b == "MIDDLE":
-        return dict(bucket=b, wT=0.27, wPACE=0.32, wSS=0.28, wEFF=0.13, lq_ref_w=0.60, lq_basic_w=0.40, ss_lo=98.0,  ss_hi=105.0, lq_floor=0.30)
-    return dict(bucket="MILE", wT=0.25, wPACE=0.35, wSS=0.25, wEFF=0.15, lq_ref_w=0.60, lq_basic_w=0.40, ss_lo=98.0,  ss_hi=105.0, lq_floor=0.30)
+        return dict(bucket=b, wT=0.27, wPACE=0.32, wSS=0.28, wEFF=0.13,
+                    ss_lo=98.0, ss_hi=105.0, lq_floor=0.30)
+    return dict(bucket="MILE", wT=0.25, wPACE=0.35, wSS=0.25, wEFF=0.15,
+                ss_lo=98.0, ss_hi=105.0, lq_floor=0.30)
 
-def compute_gci_v31(row, ctx, distance_m: float, winner_time_s=None):
-    prof = distance_profile(float(distance_m))
-    reasons = [f"{prof['bucket'].title()} weighting"]
+def clip01(x):
+    try:
+        return float(max(0.0, min(1.0, x)))
+    except Exception:
+        return 0.0
 
-    refined = row.get("Refined_FSP_%", np.nan)
-    basic   = row.get("Basic_FSP_%",   np.nan)
-    spi     = row.get("SPI_%",         np.nan)
-    epi     = row.get("EPI",           np.nan)
-    rtime   = row.get("RaceTime_s",    np.nan)
+def map01(x, lo, hi):
+    if pd.isna(x) or hi == lo:
+        return 0.0
+    return clip01((float(x) - lo) / (hi - lo))
 
-    early_heat   = float(ctx.get("early_heat", 0.0))
-    pressure_rat = float(ctx.get("pressure_ratio", 0.0))
-    spi_median   = ctx.get("spi_median", np.nan)
+# ====== Core metrics ======
+def compute_metrics(df, distance_m=1400.0):
+    out = df.copy()
+    out["Race_AvgSpeed"]  = distance_m / out["RaceTime_s"]
+    out["Mid400_Speed"]   = 400.0 / out["800-400"]
+    out["Final400_Speed"] = 400.0 / out["400-Finish"]
 
-    fast_early  = (not pd.isna(spi_median)) and (spi_median >= 103)
-    sprint_home = (not pd.isna(spi_median)) and (spi_median <= 97)
+    out["Basic_FSP_%"]   = (out["Final400_Speed"] / out["Race_AvgSpeed"]) * 100.0
+    out["Refined_FSP_%"] = (out["Final400_Speed"] / out["Mid400_Speed"]) * 100.0
+    out["SPI_%"]         = (out["Mid400_Speed"]   / out["Race_AvgSpeed"]) * 100.0
+    return out
 
-    # T: Time vs winner
-    T = 0.0
-    if (winner_time_s is not None) and (not pd.isna(rtime)):
-        deficit = rtime - winner_time_s
-        if deficit <= 0.30: T = 1.0; reasons.append("≤0.30s off winner")
-        elif deficit <= 0.60: T = 0.7; reasons.append("0.31–0.60s off winner")
-        elif deficit <= 1.00: T = 0.4; reasons.append("0.61–1.00s off winner")
-        else: T = 0.2
+def compute_pressure_context(metrics_df):
+    spi_med = metrics_df["SPI_%"].median()
+    early_heat = 0.0 if pd.isna(spi_med) else max(0.0, min(1.0, (spi_med - 100.0) / 3.0))  # ~103 → 1.0
+    mid_pct = metrics_df["Mid400_Speed"].rank(pct=True, method="average")
+    pressure_ratio_prime = float((mid_pct >= 0.65).mean()) if len(mid_pct) else 0.0
+    return dict(spi_median=spi_med, early_heat=early_heat, pressure_ratio_prime=pressure_ratio_prime,
+                field_size=int(metrics_df.shape[0]))
 
-    # LQ: Late quality (distance-aware blend)
-    def map_pct(x): return max(0.0, min(1.0, (x - 98.0) / 6.0))  # 98→0, 104→1
-    LQ = 0.0
-    if not pd.isna(refined) and not pd.isna(basic):
-        LQ = prof["lq_ref_w"] * map_pct(refined) + prof["lq_basic_w"] * map_pct(basic)
-        if refined >= 103: reasons.append("strong late profile")
-        elif refined >= 101.5: reasons.append("useful late profile")
+# ====== Anchored Kick01 (for GCI only) & KickQ (for Sleepers/Display) ======
+def kick01_anchored(refined_fsp, basic_fsp):
+    # 98→0, 104→1
+    return 0.70 * map01(refined_fsp, 98.0, 104.0) + 0.30 * map01(basic_fsp, 98.0, 104.0)
 
-    # OP: On-pace merit (with pressure gates)
-    OP = 0.0
-    if not pd.isna(epi) and not pd.isna(basic):
-        on_speed = (epi <= 2.5)
-        handy    = (epi <= 3.5)
-        if handy and basic >= 99: OP = 0.5
-        if on_speed and basic >= 100: OP = max(OP, 0.7)
-        if on_speed and fast_early and (early_heat >= 0.7) and (pressure_rat >= 0.35) and basic >= 100:
-            OP = max(OP, 1.0); reasons.append("on-speed under genuine heat & pressure")
+def kickQ_quantile(df_fsp):
+    """Return KickQ 0..100 using quantile-aware highs per race (Refined/Basic)."""
+    ref = df_fsp["Refined_FSP_%"].astype(float)
+    bas = df_fsp["Basic_FSP_%"].astype(float)
+    base_hi_ref, base_hi_bas = 106.0, 105.5
+    q75_ref = float(np.nanpercentile(ref.dropna(), 75)) if ref.notna().any() else base_hi_ref
+    q75_bas = float(np.nanpercentile(bas.dropna(), 75)) if bas.notna().any() else base_hi_bas
+    hi_ref = max(base_hi_ref, q75_ref + 1.0)
+    hi_bas = max(base_hi_bas, q75_bas + 0.8)
+    lo_ref, lo_bas = 98.0, 98.0
+    k01 = 0.70 * ref.apply(lambda x: map01(x, lo_ref, hi_ref)) + 0.30 * bas.apply(lambda x: map01(x, lo_bas, hi_bas))
+    return (k01 * 100.0).astype(float), dict(hi_ref=hi_ref, hi_bas=hi_bas, q75_ref=q75_ref, q75_bas=q75_bas)
 
-    # Leader Tax
-    LT = 0.0
-    if not pd.isna(epi) and epi <= 2.0:
-        soft_early = (early_heat < 0.5)
-        low_press  = (pressure_rat < 0.30)
-        weak_late  = (pd.isna(refined) or refined < 100.0) or (pd.isna(basic) or basic < 100.0)
-        if soft_early: LT += 0.25
-        if low_press:  LT += 0.20
-        if weak_late:  LT += 0.20
-        if sprint_home: LT += 0.15
-        LT = min(0.60, LT)
-        if LT > 0: reasons.append(f"leader tax applied ({LT:.2f})")
+# ====== GCI v3.3 (EPI-free, sectional-driven) ======
+def distance_profile_for(distance_m):  # alias
+    return distance_profile(distance_m)
 
-    # SS: Sustained speed
-    if pd.isna(spi) or pd.isna(basic):
-        SS = 0.0
-    else:
-        mean_sb = (spi + basic) / 2.0
-        SS = _to01(mean_sb, prof["ss_lo"], prof["ss_hi"])
-        if mean_sb >= (prof["ss_hi"] - 2.0): reasons.append("strong sustained speed")
+def compute_gci_v33(metrics_df, distance_m):
+    prof = distance_profile_for(distance_m)
+    spi_median = metrics_df["SPI_%"].median()
+    early_heat = 0.0 if pd.isna(spi_median) else clip01((spi_median - 100.0)/3.0)
 
-    # EFF: Efficiency
-    if pd.isna(refined):
-        EFF = 0.0
-    else:
-        EFF = max(0.0, 1.0 - abs(refined - 100.0) / 8.0)
-        if 99 <= refined <= 103: reasons.append("efficient sectional profile")
+    mid_vals = metrics_df["Mid400_Speed"]
+    mid_pct = mid_vals.rank(pct=True, method="average")  # 0..1
+    pressure_ratio_prime = float((mid_pct >= 0.65).mean())
+    field_size = int(len(metrics_df))
 
-    wT, wPACE, wSS, wEFF = prof["wT"], prof["wPACE"], prof["wSS"], prof["wEFF"]
-    PACE = max(LQ, OP) * (1.0 - LT)
-    if LQ < prof["lq_floor"]:
-        PACE = min(PACE, 0.60)
+    # T vs winner
+    wtime = None
+    if "Finish_Pos" in metrics_df.columns and "RaceTime_s" in metrics_df.columns and metrics_df["RaceTime_s"].notna().any():
+        try:
+            wtime = float(metrics_df.loc[metrics_df["RaceTime_s"].idxmin(), "RaceTime_s"])
+        except Exception:
+            wtime = None
 
-    score01 = min(1.0, (wT * T) + (wPACE * PACE) + (wSS * SS) + (wEFF * EFF))
-    score10 = round(10.0 * score01, 2)
-    return score10, reasons
+    def to01(val, lo, hi):
+        if pd.isna(val) or hi == lo:
+            return 0.0
+        return clip01((val - lo) / (hi - lo))
 
-# =========================================================
-# Narrative helpers (runner-by-runner)
-# =========================================================
-def style_from_epi(epi):
-    if pd.isna(epi): return "position unknown"
-    if epi <= 2.0:   return "on-speed/leader"
-    if epi <= 5.0:   return "handy/midfield"
-    return "backmarker"
+    def gci_row(row):
+        refined = row["Refined_FSP_%"]; basic = row["Basic_FSP_%"]; spi = row["SPI_%"]
+        rtime   = row["RaceTime_s"]; mid_rk = mid_pct.loc[row.name]
+        k01     = kick01_anchored(refined, basic)  # anchored for comparability
+        sprint_home = (spi_median <= 97)
 
-def kick_from_refined(refined):
-    if pd.isna(refined):     return "—"
-    if refined >= 103.0:     return "accelerated strongly late"
-    if refined >= 100.0:     return "kept building late"
-    if refined >= 97.0:      return "flattened late"
-    return "faded late"
+        # 1) T
+        T = 0.0
+        if (wtime is not None) and (not pd.isna(rtime)):
+            deficit = rtime - wtime
+            if deficit <= 0.30: T = 1.0
+            elif deficit <= 0.60: T = 0.7
+            elif deficit <= 1.00: T = 0.4
+            else: T = 0.2
+            if sprint_home:
+                T *= 0.85  # crawl deflate
 
-def pace_note(spi_med):
-    if pd.isna(spi_med): return "pace uncertain"
-    if spi_med >= 103:   return "fast early / tough late"
-    if spi_med <= 97:    return "slow early / sprint-home"
-    return "even tempo"
+        # 2) LQ via Kick
+        LQ = k01
 
-def distance_hint(refined, pos_change, epi):
-    if pd.isna(refined) or pd.isna(pos_change) or pd.isna(epi): return ""
-    if refined >= 102 and pos_change >= 2: return "likely to appreciate a little further."
-    if refined < 98 and epi <= 2.5:        return "may prefer slightly shorter or a softer mid-race."
-    if refined >= 100 and epi >= 5:        return "effective if they can be ridden a touch closer."
-    return ""
+        # 3) OP' by mid-race speed + basic
+        OPp = 0.0
+        if (mid_rk >= 0.55) and (basic >= 99.0): OPp = 0.5
+        if (mid_rk >= 0.70) and (basic >= 100.0): OPp = max(OPp, 0.7)
+        if (early_heat >= 0.6) and (pressure_ratio_prime >= 0.35) and (mid_rk >= 0.70) and (basic >= 100.0):
+            OPp = max(OPp, 1.0)
+        if field_size <= 7 and OPp >= 0.7 and basic < 100.5:
+            OPp = 0.5
+
+        # 4) CM'
+        CMp = 0.0
+        if (early_heat >= 0.6) and (k01 >= 0.65):
+            CMp = 0.60
+            if k01 >= 0.80: CMp += 0.10
+            if mid_rk <= 0.40: CMp += 0.05
+            CMp = min(1.0, CMp)
+
+        # 5) LT'
+        LT_raw = 0.6*(1.0 - early_heat) + 0.5*(1.0 - pressure_ratio_prime)
+        LT_raw = max(0.0, min(0.65, LT_raw))
+        if (mid_rk >= 0.75) and (k01 < 0.60):
+            LT_raw = min(0.65, LT_raw + 0.10)
+        if sprint_home:
+            LT_raw = min(0.65, LT_raw + 0.05)
+        if early_heat >= 0.7:
+            LT_raw = max(0.0, LT_raw - 0.15)
+        LTp = min(LT_raw, 0.30 if early_heat >= 0.7 else 0.60)
+
+        # 6) SS & EFF
+        SS = 0.0 if (pd.isna(spi) or pd.isna(basic)) else to01((spi + basic)/2.0, prof["ss_lo"], prof["ss_hi"])
+        EFF = 0.0 if pd.isna(refined) else max(0.0, 1.0 - abs(refined - 100.0)/8.0)
+
+        PACE = max(LQ, OPp, CMp) * (1.0 - LTp)
+        if LQ < prof["lq_floor"]:
+            PACE = min(PACE, 0.60)
+
+        score01 = (prof["wT"]*T) + (prof["wPACE"]*PACE) + (prof["wSS"]*SS) + (prof["wEFF"]*EFF)
+        return round(10.0 * min(1.0, score01), 2), T, LQ, OPp, CMp, LTp, SS, EFF, k01, mid_rk
+
+    parts = metrics_df.apply(gci_row, axis=1, result_type="expand")
+    parts.columns = ["GCI","T","LQ","OPp","CMp","LTp","SS","EFF","Kick01","mid_pct"]
+    return pd.concat([metrics_df.reset_index(drop=True), parts.reset_index(drop=True)], axis=1), dict(
+        spi_median=spi_median, early_heat=early_heat, pressure_ratio_prime=pressure_ratio_prime, field_size=field_size
+    )
+
+# ====== Sleepers v3.3 (KickQ + Balanced + dual gate + tiers + heat bonus + guards + safety-net) ======
+KICK_THR = {"SPRINT":68.0, "MILE":67.0, "MIDDLE":65.0, "STAY":63.0}
+DEFICIT  = {"SPRINT":(0.25,1.05), "MILE":(0.33,1.05), "MIDDLE":(0.42,1.15), "STAY":(0.52,1.35)}
+S_GATE   = {"SPRINT":0.58, "MILE":0.59, "MIDDLE":0.60, "STAY":0.60}
+TIER_EDGES = [0.58, 0.68, 0.78]  # Bronze/Silver/Gold
+
+def _tier_label(x):
+    if x < TIER_EDGES[0]: return "—"
+    if x < TIER_EDGES[1]: return "Bronze"
+    if x < TIER_EDGES[2]: return "Silver"
+    return "Gold"
+
+def flag_sleepers_v33_balanced(df_in, distance_m, ctx):
+    df = df_in.copy()
+    bucket = _distance_bucket(distance_m)
+    kick_thr = KICK_THR[bucket]
+    lo_def, hi_def = DEFICIT[bucket]
+    gate = S_GATE[bucket]
+
+    # field-size guards
+    fs = ctx.get("field_size", int(df.shape[0]))
+    if fs <= 8:
+        kick_thr += 1.0
+    elif fs >= 13:
+        gate = max(0.0, gate - 0.02)
+
+    # KickQ for sleepers/display
+    kickQ, qinfo = kickQ_quantile(df[["Refined_FSP_%","Basic_FSP_%"]])
+    df["KickQ"] = kickQ
+    # Absolute anchored Kick (for dual gate)
+    df["Kick_abs"] = 100.0 * (0.70*df["Refined_FSP_%"].apply(lambda x: map01(x, 98.0, 104.0)) +
+                              0.30*df["Basic_FSP_%"].apply(lambda x: map01(x, 98.0, 104.0)))
+
+    # mid_pct already exists in GCI block; recompute here if missing
+    if "mid_pct" not in df.columns:
+        df["mid_pct"] = df["Mid400_Speed"].rank(pct=True, method="average").fillna(0.5)
+
+    # winner time
+    wtime = float(df.loc[df["RaceTime_s"].idxmin(), "RaceTime_s"])
+
+    # Components (using KickQ for 'kick_comp')
+    df["kick_comp"]  = df["KickQ"].apply(lambda k: clip01((k - (kick_thr - 10.0)) / 20.0))
+    df["chase_comp"] = ctx["early_heat"] * (1.0 - df["mid_pct"]) * (0.5 + 0.5*df["Refined_FSP_%"].apply(lambda r: map01(r, 100.0, 104.0)))
+    df.loc[df["Basic_FSP_%"] >= 100.0, "chase_comp"] += 0.10
+    df["chase_comp"] = df["chase_comp"].apply(clip01)
+    df["deficit_s"]  = df["RaceTime_s"] - wtime
+    df["time_comp"]  = 1.0 - ((df["deficit_s"] - lo_def) / (hi_def - lo_def)).apply(lambda x: clip01(x))
+
+    df["sleeper01"]  = 0.60*df["kick_comp"] + 0.25*df["chase_comp"] + 0.15*df["time_comp"]
+    # Heat bonus
+    if ctx["early_heat"] >= 0.60:
+        df["sleeper01"] = (df["sleeper01"] + 0.03).clip(upper=1.0)
+
+    # Dual gate: outside top-3 AND
+    #    (score ≥ gate) OR (abs Kick ≥ threshold AND chase/time reasonable) OR (KickQ pct ≥ 75th)
+    kickq_pct = df["KickQ"].rank(pct=True, method="average")
+    df["Sleeper"] = (df["Finish_Pos"] > 3) & (
+        (df["sleeper01"] >= gate) |
+        ((df["Kick_abs"] >= kick_thr) & ((df["chase_comp"] >= 0.35) | (df["time_comp"] >= 0.50))) |
+        (kickq_pct >= 0.75)
+    )
+
+    # Safety net: if none flagged, widen time hi +0.05 then lower Kick line −1
+    flagged = df["Sleeper"].sum()
+    if flagged == 0:
+        df["time_comp"]  = 1.0 - ((df["deficit_s"] - lo_def) / (hi_def + 0.05 - lo_def)).apply(lambda x: clip01(x))
+        df["sleeper01"]  = 0.60*df["kick_comp"] + 0.25*df["chase_comp"] + 0.15*df["time_comp"]
+        if ctx["early_heat"] >= 0.60:
+            df["sleeper01"] = (df["sleeper01"] + 0.03).clip(upper=1.0)
+        df["Sleeper"] = (df["Finish_Pos"] > 3) & (
+            (df["sleeper01"] >= gate) |
+            ((df["Kick_abs"] >= (kick_thr - 1.0)) & ((df["chase_comp"] >= 0.35) | (df["time_comp"] >= 0.50))) |
+            (kickq_pct >= 0.75)
+        )
+
+    df["Sleeper_Tier"] = df["sleeper01"].apply(_tier_label)
+    return df, qinfo
+
+# ====== Display helpers ======
+def round_display(df):
+    for c in ["Basic_FSP_%", "Refined_FSP_%", "SPI_%", "Race_AvgSpeed", "Mid400_Speed", "Final400_Speed", "KickQ", "Kick_abs"]:
+        if c in df.columns:
+            df[c] = df[c].astype(float).round(2)
+    for c in ["T","LQ","OPp","CMp","LTp","SS","EFF","Kick01","mid_pct","sleeper01","kick_comp","chase_comp","time_comp"]:
+        if c in df.columns:
+            df[c] = df[c].astype(float).round(3)
+    if "RaceTime_s" in df.columns:
+        df["RaceTime_s"] = df["RaceTime_s"].round(3)
+    return df
 
 def runner_summary(row, spi_med):
     name = str(row.get("Horse", ""))
     fin  = row.get("Finish_Pos", np.nan)
     rt   = row.get("RaceTime_s", np.nan)
-    epi  = row.get("EPI", np.nan)
     ref  = row.get("Refined_FSP_%", np.nan)
-    spi  = row.get("SPI_%", np.nan)
-    pc   = row.get("Pos_Change", np.nan)
-    slp  = bool(row.get("Sleeper", False))
+    bas  = row.get("Basic_FSP_%", np.nan)
     gci  = row.get("GCI", np.nan)
-    gcand= bool(row.get("Group_Candidate", False))
-
     bits = [
         f"**{name}** — Finish: **{int(fin) if not pd.isna(fin) else '—'}**, Time: **{rt:.2f}s**",
-        f"Style: {style_from_epi(epi)} (EPI {epi:.1f} if known); Race shape: {pace_note(spi_med)}.",
-        f"Late profile: {kick_from_refined(ref)} (Refined FSP {ref:.1f}% if known); "
-        f"Pos change 400–Finish: {int(pc) if not pd.isna(pc) else '—'}; "
-        f"GCI: {gci:.1f} if known."
+        f"Late profile: Refined FSP {ref:.1f}% | Basic FSP {bas:.1f}%; GCI {gci:.2f}",
+        f"Race shape (SPI median): {spi_med:.1f}%."
     ]
-    dh = distance_hint(ref, pc, epi)
-    if dh: bits.append(f"Note: {dh}")
-    tags = []
-    if slp: tags.append("Sleeper")
-    if gcand: tags.append("Group candidate")
-    if tags: bits[0] += f" **[{', '.join(tags)}]**"
     return "  \n".join(bits)
 
-# =========================================================
-# Manual-mode grid utilities (countdown 200 m segments)
-# =========================================================
-def make_countdown_headers_any(distance_m: float) -> tuple[list[str], int]:
-    """
-    Accept ANY distance (>=800). Rounds UP to the nearest 200 m for the grid.
-    Returns (segment_headers, rounded_distance).
-    Example: 1160 -> headers for 1200 m, and 1200 returned as the rounded distance.
-    """
-    rounded = int(np.ceil(float(distance_m) / 200.0) * 200)
-    if rounded < 800:
-        rounded = 800
-    headers = [f"{d}m" for d in range(rounded - 200, 0, -200)]
-    headers.append("Finish")
-    return headers, rounded
-
-def build_manual_frame(n_rows: int, seg_headers: list, keep: pd.DataFrame | None = None) -> pd.DataFrame:
-    """
-    Create an empty manual-entry frame with Horse + seg columns (+ optional Finish_Pos).
-    Seed segment columns as empty strings (object dtype) so TextColumn is allowed.
-    """
-    cols = ["Horse"] + seg_headers + ["Finish_Pos"]
-    data = {"Horse": ["" for _ in range(n_rows)], "Finish_Pos": [np.nan for _ in range(n_rows)]}
-    for h in seg_headers:
-        data[h] = ["" for _ in range(n_rows)]  # text/object dtype
-    df = pd.DataFrame(data)
-    if keep is not None:
-        for c in set(keep.columns) & set(cols):
-            n = min(n_rows, len(keep))
-            df.loc[:n-1, c] = keep.loc[:n-1, c].values
-    df["Horse"] = df["Horse"].astype("object")
-    for h in seg_headers:
-        df[h] = df[h].astype("object")
-    return df
-
-def segments_to_mid_final_400(seg_cols: list[str]) -> tuple[list[str], list[str]]:
-    """Given countdown segment column names, return mid400 (3rd & 4th from end) and final400 (last two)."""
-    if len(seg_cols) < 4:
-        return [], []
-    final400_cols = seg_cols[-2:]   # e.g., ['200m','Finish']
-    mid400_cols   = seg_cols[-4:-2] # e.g., ['600m','400m']
-    return mid400_cols, final400_cols
-
 # ===================
-# Sidebar & data source
+# UI: Inputs & Flow
 # ===================
 with st.sidebar:
     st.header("Data Source")
-    source = st.radio("Choose input type", ["Upload CSV", "Manual input"], index=1)
+    source = st.radio("Choose input type", ["Upload file (CSV/XLSX)", "Manual"], index=0)
+    # distance entry: allow any distance (e.g., 1160) — grid logic uses nearest 200 for labels only
+    distance_m = st.number_input("Race Distance (m)", min_value=800, max_value=4000, value=1400, step=10)
+    n_horses = None
+    if source == "Manual":
+        n_horses = st.number_input("Number of runners", min_value=2, max_value=20, value=10, step=1)
 
-    # Accept ANY distance; manual grid will round UP internally
-    distance_m = st.number_input(
-        "Race distance (m)",
-        min_value=800, max_value=4000, value=1200, step=10,
-        help="Enter any distance. Manual grid rounds UP to the nearest 200 m."
-    )
-
-    num_horses = st.number_input(
-        "Number of horses (manual)",
-        min_value=1, max_value=30, value=8, step=1,
-        disabled=(source != "Manual input")
-    )
-
-    st.caption("Manual grid uses rounded distance for 200 m splits; metrics use the exact distance you entered.")
-
-# ===================
-# Collect data (Upload vs Manual)
-# ===================
 df_raw = None
-mode_banner = "🖐️ Manual mode: enter 200 m **segment times** in countdown order." if source == "Manual input" else "📄 Upload CSV mode: provide Race Time, 800-400, 400-Finish."
-st.info(mode_banner)
 
-if source == "Upload CSV":
-    uploaded = st.file_uploader("Upload CSV", type=["csv"])
-    if uploaded is None:
-        st.stop()
-    df_raw = pd.read_csv(uploaded)
-    st.success("File loaded.")
-
-else:
-    # ----- Manual mode: dynamic grid (headers always round up) -----
-    seg_headers, grid_distance_m = make_countdown_headers_any(distance_m)
-
-    # Persist / rebuild editor frame when controls change
-    key_rows = ("manual_rows" not in st.session_state) or (st.session_state["manual_rows"] != int(num_horses))
-    key_cols = ("manual_cols" not in st.session_state) or (st.session_state["manual_cols"] != tuple(seg_headers))
-    if key_rows or key_cols or ("manual_df" not in st.session_state):
-        keep = st.session_state.get("manual_df")
-        st.session_state["manual_df"] = build_manual_frame(int(num_horses), seg_headers, keep=keep)
-        st.session_state["manual_rows"] = int(num_horses)
-        st.session_state["manual_cols"] = tuple(seg_headers)
-
-    st.subheader("Manual input (countdown 200 m segments)")
-    if float(distance_m) != float(grid_distance_m):
-        st.info(f"Manual grid rounded up: **{int(distance_m)} m → {grid_distance_m} m** for 200 m segments.")
-    st.write(f"Columns: {' | '.join(seg_headers)} — enter **segment times** (seconds or M:SS.ms / M:SS:ms).")
-
-    # 🔧 Force text-compatible dtypes for editor
-    manual_source = st.session_state["manual_df"].copy()
-    manual_source["Horse"] = manual_source["Horse"].astype("object")
-    for h in seg_headers:
-        if h in manual_source.columns:
-            manual_source[h] = manual_source[h].astype("object")
-    if "Finish_Pos" in manual_source.columns:
-        manual_source["Finish_Pos"] = manual_source["Finish_Pos"].astype("object")
-
-    manual_df = st.data_editor(
-        manual_source,
-        width="stretch",
-        num_rows="dynamic",
-        key="manual_editor",
-        column_config={
-            "Horse": st.column_config.TextColumn(required=True),
-            **{h: st.column_config.TextColumn(help=f"200 m segment time for {h}") for h in seg_headers},
-            "Finish_Pos": st.column_config.NumberColumn(format="%d", help="Optional"),
-        },
-    )
-
-    # Persist edits back to session so they stick on reruns
-    st.session_state["manual_df"] = manual_df
-
-    # Clean blank rows (no Horse)
-    df_raw = manual_df.copy()
-    df_raw["Horse"] = df_raw["Horse"].astype(str).str.strip()
-    nonempty = df_raw["Horse"].ne("")
-    if not nonempty.any():
-        st.warning("Enter at least one horse row.")
-        st.stop()
-    df_raw = df_raw.loc[nonempty].reset_index(drop=True)
-    st.success("Manual data captured.")
-
-# ===================
-# Normalize to analysis schema
-# ===================
-st.subheader("Raw table preview")
-st.dataframe(df_raw.head(12), width="stretch")
-_dbg("Raw columns", list(df_raw.columns))
-
-if source == "Upload CSV":
-    # Map common variants
-    df = df_raw.rename(columns={
-        "Race time": "Race Time", "Race_Time": "Race Time", "RaceTime": "Race Time",
-        "800_400": "800-400", "400_Finish": "400-Finish",
-        "Horse Name": "Horse", "Finish": "Finish_Pos", "Placing": "Finish_Pos"
-    }).copy()
-
-    required = ["Horse", "Race Time", "800-400", "400-Finish"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        st.error("Missing required columns in CSV: " + ", ".join(missing))
-        st.stop()
-
-    # Parse times safely
-    df["RaceTime_s"] = df["Race Time"].apply(parse_time_any)
-    for col in ["800-400", "400-Finish"]:
-        df[col] = pd.to_numeric(df[col].apply(parse_time_any), errors="coerce")
-
-    # Optional numeric fields
-    if "Finish_Pos" in df.columns:
-        df["Finish_Pos"] = pd.to_numeric(df["Finish_Pos"], errors="coerce").astype("Int64")
-
-else:
-    # Manual: derive RaceTime_s, 800-400, 400-Finish from segment columns
-    df = df_raw.copy()
-
-    # Use the exact countdown order we generated for the grid
-    desired_order = list(st.session_state.get("manual_cols", []))
-    if not desired_order:
-        desired_order = [c for c in df.columns if c not in ("Horse", "Finish_Pos")]
-
-    seg_cols = [c for c in desired_order if c in df.columns]
-    if not seg_cols:
-        st.error("No segment columns found. Please enter 200 m times in the manual editor.")
-        st.stop()
-
-    # Parse each segment to seconds (editor gave us strings)
-    for c in seg_cols:
-        df[c] = pd.to_numeric(df[c].apply(parse_time_any), errors="coerce")
-
-    # RaceTime_s = sum of all segment times
-    df["RaceTime_s"] = df[seg_cols].sum(axis=1, min_count=1)
-
-    # mid- and final-400 sums from tail segments
-    mid_cols, fin_cols = segments_to_mid_final_400(seg_cols)
-    if not mid_cols or not fin_cols:
-        st.error("Distance must be at least 800 m to compute Mid400 and Final400.")
-        st.stop()
-
-    df["800-400"]    = df[mid_cols].sum(axis=1, min_count=len(mid_cols))
-    df["400-Finish"] = df[fin_cols].sum(axis=1, min_count=len(fin_cols))
-
-    # Optional Finish_Pos
-    if "Finish_Pos" in df.columns:
-        df["Finish_Pos"] = pd.to_numeric(df["Finish_Pos"], errors="coerce").astype("Int64")
-
-    # Alias for downstream compatibility
-    if "Race Time" not in df.columns and "RaceTime_s" in df.columns:
-        df["Race Time"] = df["RaceTime_s"]
-
-st.subheader("Converted table (ready for analysis)")
-st.dataframe(df.head(12), width="stretch")
-_dbg("Dtypes", df.dtypes)
-
-# ===================
-# Analysis: metrics + Sleepers + GCI
-# ===================
 try:
-    # ⚠️ Metrics use the exact user-entered distance (not the rounded grid distance)
-    metrics = compute_metrics(df, distance_m=float(distance_m))
-
-    # Winner time (best Finish_Pos if provided, else fastest RaceTime_s)
-    winner_time = None
-    if "Finish_Pos" in df.columns and df["Finish_Pos"].notna().any():
-        try:
-            winner_time = metrics.loc[metrics["Finish_Pos"].idxmin(), "RaceTime_s"]
-        except Exception:
-            winner_time = None
-    if winner_time is None and metrics["RaceTime_s"].notna().any():
-        winner_time = metrics["RaceTime_s"].min()
-
-    # Pressure context & GCI
-    ctx = compute_pressure_context(metrics)
-    gci_scores, gci_reasons = [], []
-    for _, r in metrics.iterrows():
-        gci, why = compute_gci_v31(r, ctx, distance_m=float(distance_m), winner_time_s=winner_time)
-        gci_scores.append(gci)
-        gci_reasons.append("; ".join(why))
-    metrics["GCI"] = gci_scores
-    metrics["GCI_Reasons"] = gci_reasons
-    metrics["Group_Candidate"] = metrics["GCI"] >= 7.0
-
-    # Sleepers
-    metrics = flag_sleepers(metrics)
-
+    if source == "Upload file (CSV/XLSX)":
+        uploaded = st.file_uploader("Upload CSV/XLSX (columns: Horse, Race Time, 800-400, 400-Finish[, Finish_Pos])", type=["csv","xlsx"])
+        if uploaded is None:
+            st.info("Upload a file or switch to Manual input.")
+            st.stop()
+        df_raw = pd.read_csv(uploaded) if uploaded.name.lower().endswith(".csv") else pd.read_excel(uploaded)
+        st.success("File loaded.")
+    else:
+        # Manual grid
+        st.markdown("### Manual entry")
+        st.caption("Enter per-runner: Horse, Finish_Pos, Race Time (s or MM:SS.ms), 800-400 (s), 400-Finish (s).")
+        # Build a blank frame
+        df_raw = pd.DataFrame({
+            "Horse": ["" for _ in range(n_horses)],
+            "Finish_Pos": [np.nan for _ in range(n_horses)],
+            "Race Time": [np.nan for _ in range(n_horses)],
+            "800-400": [np.nan for _ in range(n_horses)],
+            "400-Finish": [np.nan for _ in range(n_horses)],
+        })
+        # Editable grid
+        df_raw = st.data_editor(df_raw, use_container_width=True, num_rows="dynamic")
+        st.info("Tip: Distance labels (for pace view) count down from the race trip; calculations use exact distance.")
 except Exception as e:
-    st.error("Metric/GCI computation failed.")
+    st.error("Input parsing failed.")
     if DEBUG: st.exception(e)
     st.stop()
 
-# If Finish_Pos missing, rank by time for display order
-if "Finish_Pos" not in metrics.columns or metrics["Finish_Pos"].isna().all():
-    metrics["Finish_Pos"] = metrics["RaceTime_s"].rank(method="min").astype("Int64")
+st.subheader("Raw table preview")
+st.dataframe(df_raw.head(12), use_container_width=True)
+_dbg("Raw columns", list(df_raw.columns))
+
+# Detect & convert 200m TPD tables if user uploaded those
+df_norm = df_raw.copy()
+df_norm.columns = [_norm_header(c) for c in df_norm.columns]
+looks_200m = _has_200m_headers(df_raw) or _has_200m_headers(df_norm)
+
+try:
+    if looks_200m and source == "Upload file (CSV/XLSX)":
+        df_conv_input = df_raw.copy()
+        df_conv_input.columns = df_norm.columns
+        work = convert_200m_table_to_app(df_conv_input)
+        st.info("Detected 200m TPD-style paste — converted to app schema.")
+    else:
+        work = df_raw.rename(columns={
+            "Race time": "Race Time", "Race_Time": "Race Time", "RaceTime": "Race Time",
+            "800_400": "800-400", "400_Finish": "400-Finish",
+            "Horse Name": "Horse", "Finish": "Finish_Pos", "Placing": "Finish_Pos"
+        })
+except Exception as e:
+    st.error("Conversion to app schema failed.")
+    if DEBUG: st.exception(e)
+    st.stop()
+
+# Required columns
+_required = ["Horse", "Race Time", "800-400", "400-Finish"]
+_missing = [c for c in _required if c not in work.columns]
+if _missing:
+    st.error("Missing required columns: " + ", ".join(_missing))
+    st.stop()
+
+# Normalize & parse
+df = work.copy()
+df["RaceTime_s"] = df["Race Time"].apply(parse_race_time)
+for col in ["800-400", "400-Finish", "Finish_Pos"]:
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+# If Finish_Pos missing, infer by time
+if ("Finish_Pos" not in df.columns) or df["Finish_Pos"].isna().all():
+    if df["RaceTime_s"].notna().any():
+        df["Finish_Pos"] = df["RaceTime_s"].rank(method="min").astype("Int64")
+
+st.subheader("Converted table (ready for analysis)")
+st.dataframe(df.head(12), use_container_width=True)
+
+# 200m vs 400m split sanity (scale times if needed)
+try:
+    med_mid = float(np.nanmedian(df["800-400"]))
+    med_fin = float(np.nanmedian(df["400-Finish"]))
+except Exception:
+    med_mid = med_fin = np.nan
+
+scale = 1.0
+# If both medians look like single 200m times (<~18s), scale by 2 to get 400m
+if (not pd.isna(med_mid)) and (not pd.isna(med_fin)) and (med_mid < 18.0) and (med_fin < 18.0):
+    scale = 2.0
+df["800-400"]    = df["800-400"] * scale
+df["400-Finish"] = df["400-Finish"] * scale
+
+# ===================
+# Analysis Pipeline
+# ===================
+try:
+    metrics = compute_metrics(df, distance_m=distance_m)
+except Exception as e:
+    st.error("Metric computation failed.")
+    if DEBUG: st.exception(e)
+    st.stop()
+
+# GCI v3.3
+gci_df, ctx = compute_gci_v33(metrics, distance_m=distance_m)
+
+# Sleepers (KickQ + Balanced)
+sleep_df, qinfo = flag_sleepers_v33_balanced(gci_df, distance_m=distance_m, ctx=ctx)
 
 # ===================
 # Outputs
 # ===================
-st.subheader("Sectional Metrics")
-disp = round_display(metrics.copy()).sort_values("Finish_Pos", na_position="last")
-st.dataframe(disp, width="stretch")
+st.subheader("Sectional Metrics + GCI v3.3")
+disp_cols = ["Horse","Finish_Pos","RaceTime_s","Basic_FSP_%","Refined_FSP_%","SPI_%",
+             "Kick01","GCI","T","LQ","OPp","CMp","LTp","SS","EFF"]
+disp = round_display(gci_df[disp_cols].copy()).sort_values(["Finish_Pos"], na_position="last")
+st.dataframe(disp, use_container_width=True)
 
+st.caption(
+    "Kick01 is anchored (98→104 mapping) for cross-race comparability. "
+    "GCI v3.3 uses sectionals only (mid-race speed percentile, Kick01), "
+    "with sectional leader-tax and chase merit."
+)
+
+# Pace Curves
 st.subheader("Pace Curves — Field Average (black) + Top 8 by Finish")
-avg_mid = metrics["Mid400_Speed"].mean()
-avg_fin = metrics["Final400_Speed"].mean()
-top8 = metrics.sort_values("Finish_Pos").head(8).copy()
-top8["HorseShort"] = top8["Horse"].astype(str).str.slice(0, 20)
+avg_mid = gci_df["Mid400_Speed"].mean()
+avg_fin = gci_df["Final400_Speed"].mean()
+top8 = gci_df.sort_values("Finish_Pos").head(8)
 
 fig, ax = plt.subplots()
 x_vals = [1, 2]
 ax.plot(x_vals, [avg_mid, avg_fin], marker="o", linewidth=3, color="black", label="Average (Field)")
 for _, row in top8.iterrows():
-    ax.plot(x_vals, [row["Mid400_Speed"], row["Final400_Speed"]], marker="o", linewidth=2, label=row["HorseShort"])
-ax.set_xticks([1, 2]); ax.set_xticklabels(["Mid 400", "Final 400"])
+    ax.plot(x_vals, [row["Mid400_Speed"], row["Final400_Speed"]], marker="o", linewidth=2, label=str(row.get("Horse","Runner")))
+ax.set_xticks([1, 2]); ax.set_xticklabels(["Mid 400 (800→400)", "Final 400 (400→Finish)"])
 ax.set_ylabel("Speed (m/s)"); ax.set_title("Average vs Top 8 Pace Curves")
 ax.grid(True, linestyle="--", alpha=0.3)
-fig.subplots_adjust(bottom=0.22)
-fig.legend(loc="lower center", ncol=4, bbox_to_anchor=(0.5, 0.0), frameon=False)
+fig.legend(loc="lower center", ncol=4, bbox_to_anchor=(0.5, -0.12))
 st.pyplot(fig)
 
-st.subheader("Insights")
-ctx_vals = compute_pressure_context(metrics)
-ctx_spi = ctx_vals.get("spi_median", np.nan)
-grid_note = "" if float(distance_m) == float(make_countdown_headers_any(distance_m)[1]) else f"  •  Grid rounded to {make_countdown_headers_any(distance_m)[1]} m"
-if pd.isna(ctx_spi):
-    st.write(f"SPI median: —  |  Early heat: —  |  Pressure ratio (EPI≤3.0): —  |  Field size: {ctx_vals.get('field_size', 0)}{grid_note}")
-else:
-    st.write(
-        f"**SPI median:** {ctx_spi:.1f}%  |  "
-        f"**Early heat (0–1):** {ctx_vals['early_heat']:.2f}  |  "
-        f"**Pressure ratio (EPI≤3.0):** {ctx_vals['pressure_ratio']:.2f}  |  "
-        f"**Field size:** {ctx_vals['field_size']}{grid_note}"
-    )
+# Race context
+st.subheader("Race Shape / Context")
+st.write(
+    f"**SPI median:** {ctx['spi_median']:.2f}%  |  "
+    f"**Early heat (0–1):** {ctx['early_heat']:.2f}  |  "
+    f"**Pressure ratio′ (mid_pct≥0.65):** {ctx['pressure_ratio_prime']:.2f}  |  "
+    f"**Field size:** {ctx['field_size']}"
+)
 
-st.subheader("Sleepers")
-sleepers = disp[disp["Sleeper"] == True][["Horse","Finish_Pos","Refined_FSP_%","Pos_Change"]]
-if sleepers.empty:
-    st.write("No clear sleepers flagged under current thresholds.")
-else:
-    st.dataframe(sleepers, width="stretch")
+# Sleepers
+st.subheader("Sleepers (KickQ + Balanced)")
+sleep_disp_cols = ["Horse","Finish_Pos","RaceTime_s","Kick_abs","KickQ","mid_pct",
+                   "deficit_s","kick_comp","chase_comp","time_comp","sleeper01","Sleeper","Sleeper_Tier"]
+sleep_disp = round_display(sleep_df[sleep_disp_cols].copy()).sort_values(
+    ["Sleeper","sleeper01","Finish_Pos"], ascending=[False, False, True]
+)
+st.dataframe(sleep_disp, use_container_width=True)
+st.caption(
+    "Sleepers use quantile-aware **KickQ** for display/scoring with dual gates (abs Kick line or top-quartile KickQ), "
+    "trip-aware deficit windows, tiers, heat bonus, and field-size guards. "
+    f"KickQ highs this race: Refined hi≈{qinfo['hi_ref']:.2f}, Basic hi≈{qinfo['hi_bas']:.2f}."
+)
 
-st.subheader("Potential Group-class candidates (GCI v3.1)")
-cands = metrics.loc[metrics["Group_Candidate"]].copy().sort_values(["GCI","Finish_Pos"], ascending=[False, True])
-if cands.empty:
-    st.write("No horses met the Group-class threshold today.")
-else:
-    st.dataframe(
-        round_display(cands[["Horse","Finish_Pos","RaceTime_s","Refined_FSP_%","Basic_FSP_%","SPI_%","Pos_Change","EPI","GCI","GCI_Reasons"]]),
-        width="stretch"
-    )
-
-# ---- Runner-by-runner narrative ----
+# Runner-by-runner summaries
 st.subheader("Runner-by-runner summaries")
-ordered = metrics.sort_values("Finish_Pos", na_position="last")
+ordered = gci_df.sort_values("Finish_Pos", na_position="last")
 for _, row in ordered.iterrows():
-    st.markdown(runner_summary(row, ctx.get("spi_median")))
+    st.markdown(runner_summary(row, ctx["spi_median"]))
     st.markdown("---")
 
-# ===================
 # Download
-# ===================
 st.subheader("Download")
-csv_bytes = disp.to_csv(index=False).encode("utf-8")
-st.download_button("Download metrics as CSV", data=csv_bytes, file_name="race_sectional_metrics.csv", mime="text/csv")
+out = sleep_df.merge(gci_df[["Horse","GCI"]], on="Horse", how="left", suffixes=("",""))
+out = round_display(out)
+csv_bytes = out.to_csv(index=False).encode("utf-8")
+st.download_button("Download full metrics as CSV", data=csv_bytes, file_name="race_edge_v33_metrics.csv", mime="text/csv")
 
 st.caption(
-    "Manual grid rounds UP to the nearest 200 m for clean 200 m segments; metrics use the exact distance you entered. "
-    "Manual mode: type segment times as seconds or M:SS.ms / M:SS:ms. "
-    "Upload mode expects: Horse, Race Time, 800-400, 400-Finish (Finish_Pos optional). "
-    "EPI/position fields are optional; when absent, GCI ignores on-pace/leader adjustments."
+    "Legend: Basic FSP = Final400 / Race Avg; Refined FSP = Final400 / Mid400; "
+    "SPI = Mid400 / Race Avg; Kick01 (anchored) for GCI; KickQ (quantile-aware) for Sleepers/Display; "
+    "GCI v3.3 applies distance-normalised, sectional pressure context."
 )
