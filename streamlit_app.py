@@ -10,17 +10,10 @@ import matplotlib.pyplot as plt
 # ================================
 # Branding / Page
 # ================================
-APP_DIR = Path(__file__).resolve().parent
-LOGO_PATH = APP_DIR / "assets" / "logos.png"
-
 st.set_page_config(
     page_title="Race Edge — v3.3",
-    page_icon=str(LOGO_PATH) if LOGO_PATH.exists() else None,
     layout="wide",
 )
-
-if LOGO_PATH.exists():
-    st.image(str(LOGO_PATH), width=220)
 
 st.title("🏇 Race Edge — v3.3")
 st.caption(
