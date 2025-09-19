@@ -1,4 +1,5 @@
-# streamlit_app.py
+import os
+os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "none"# streamlit_app.py
 import re
 from pathlib import Path
 
