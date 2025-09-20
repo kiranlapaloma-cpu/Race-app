@@ -505,6 +505,128 @@ else:
     st.pyplot(fig)
 
     st.caption("Reading guide: → right = stronger Kick; ↑ up = stronger Grind; bigger bubble = stronger tsSPI (sustain); brighter color = higher PI.")
+# ======================
+# Chart breakdown — distance-aware thresholds (SA sprint-aware)
+# ======================
+st.subheader("Chart breakdown — distance-aware reads")
+
+if plot_df.empty:
+    st.info("No chart data available for breakdown.")
+else:
+    # Determine race distance available in this session
+    try:
+        race_distance = int(distance_m)  # set in CSV mode block
+    except NameError:
+        race_distance = int(distance_m_rounded)  # manual mode fallback
+
+    is_sprint = (race_distance <= 1200)
+
+    # Precompute medians for sprint-relative logic
+    k_med   = float(np.nanmedian(plot_df["Kick%"]))   if is_sprint else None
+    ts_med  = float(np.nanmedian(plot_df["tsSPI%"]))  if is_sprint else None
+
+    # Trip-bucket absolute thresholds (non-sprint)
+    if not is_sprint:
+        if race_distance <= 1400:      # sprint-ish but not in sprint rule
+            K_HI, G_HI, TS_HI = 104.0, 102.0, 101.0
+        elif race_distance < 1800:     # mile
+            K_HI, G_HI, TS_HI = 103.0, 102.0, 101.0
+        elif race_distance < 2200:     # middle
+            K_HI, G_HI, TS_HI = 102.0, 101.0, 100.5
+        else:                           # staying
+            K_HI, G_HI, TS_HI = 101.5, 101.0, 100.0
+        # Low bands (soft) for context on flattening
+        K_LO, G_LO, TS_LO = 98.0, 98.0, 99.0
+
+    def tag_and_distance_note(row):
+        k   = float(row["Kick%"])
+        g   = float(row["Grind%"])
+        ts  = float(row["tsSPI%"])
+        f2  = float(row.get("F200%", np.nan))
+        pi  = float(row["PI_v3.3"])
+
+        # ----- Race-shape tags -----
+        if is_sprint:
+            # Kick relative to sprint median (±3 pts band)
+            if k >= k_med + 3:
+                k_tag = "showed late kick"
+            elif k <= k_med - 3:
+                k_tag = "flattened late"
+            else:
+                k_tag = "average late burst"
+
+            # Grind tighter bands in sprints
+            if g >= 102:
+                g_tag = "applied strong mid-race pressure"
+            elif g <= 98:
+                g_tag = "couldn’t hold mid-late pace"
+            else:
+                g_tag = "kept pace evenly"
+
+            # Combine
+            if "late kick" in k_tag and g >= 100:
+                tag = "closer with late power"
+            elif g >= 103 and k < (k_med + 1):
+                tag = "true grinder"
+            elif 98 <= k <= 102 and 98 <= g <= 102:
+                tag = "balanced profile"
+            else:
+                tag = "mixed sectional profile"
+
+            # ----- Distance suitability (sprint-relative) -----
+            if (k >= k_med + 3 and ts >= ts_med) or (ts >= ts_med + 1 and k >= k_med):
+                dist = "scope to improve over further"
+            elif (k <= k_med - 3 and (not np.isnan(f2) and f2 >= 110)) or (ts <= ts_med - 1 and k < k_med):
+                dist = "profile sharper at shorter"
+            elif abs(ts - ts_med) <= 1:
+                dist = "trip looks about right"
+            else:
+                dist = "distance flexible"
+
+        else:
+            # Absolute trip-bucket cutoffs
+            if k >= K_HI and g >= 100:
+                tag = "closer with late power"
+            elif g >= G_HI and k < (K_HI - 1):
+                tag = "true grinder"
+            elif 98 <= k <= 102 and 98 <= g <= 102:
+                tag = "balanced profile"
+            else:
+                tag = "mixed sectional profile"
+
+            if (k >= K_HI and ts >= TS_HI) or (ts >= TS_HI + 0.5 and k >= 100):
+                dist = "scope to improve over further"
+            elif (k <= K_LO and (not np.isnan(f2) and f2 >= 110)) or (ts <= TS_LO and k < 100):
+                dist = "profile sharper at shorter"
+            elif 98 <= ts <= 102:
+                dist = "trip looks about right"
+            else:
+                dist = "distance flexible"
+
+        # Optional: PI quartile gloss
+        try:
+            pi_q = np.nanpercentile(plot_df["PI_v3.3"], [25, 75])
+            if pi >= pi_q[1]:
+                merit = "sectional standout"
+            elif pi <= pi_q[0]:
+                merit = "sectional underperformer"
+            else:
+                merit = "solid merit"
+        except Exception:
+            merit = None
+
+        hint = f" — {merit}" if merit else ""
+        return tag, dist + hint, k, g, ts, pi
+
+    # Build and render breakdown (sorted by PI desc)
+    rows = []
+    for _, r in plot_df.sort_values("PI_v3.3", ascending=False).iterrows():
+        tag, dist_note, k, g, ts, p = tag_and_distance_note(r)
+        rows.append(f"- **{r['Horse']}** — {tag}; {dist_note}. "
+                    f"(Kick {k:.1f}, Grind {g:.1f}, tsSPI {ts:.1f}, PI {p:.3f})")
+
+    for line in rows:
+        st.markdown(line)
 
 # Footer
 st.caption(
