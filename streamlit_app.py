@@ -447,16 +447,64 @@ for _, row in merged.iterrows():
 # ======================
 # Quick visual: Kick vs PI
 # ======================
-st.subheader("Kick vs PI (quick view)")
-fig, ax = plt.subplots()
-plot_df = table.dropna(subset=["Kick%", "PI_v3.3"]).copy()
-ax.scatter(plot_df["Kick%"], plot_df["PI_v3.3"])
-for _, r in plot_df.iterrows():
-    ax.annotate(str(r["Horse"])[:12], (r["Kick%"], r["PI_v3.3"]), fontsize=8, xytext=(4, 4), textcoords="offset points")
-ax.set_xlabel("Kick% (200→Finish vs race avg)")
-ax.set_ylabel("PI v3.3")
-ax.grid(True, linestyle="--", alpha=0.3)
-st.pyplot(fig)
+# ======================
+# Kick vs Grind (bubble = tsSPI, color = PI)
+# ======================
+st.subheader("Kick vs Grind (size = tsSPI, color = PI)")
+
+plot_df = table.dropna(subset=["Kick%", "Grind%", "tsSPI%", "PI_v3.3"]).copy()
+if plot_df.empty:
+    st.info("Not enough data to plot.")
+else:
+    # Bubble sizes: scale tsSPI% to a readable area range
+    ts_min, ts_max = float(plot_df["tsSPI%"].min()), float(plot_df["tsSPI%"].max())
+    if ts_max > ts_min:
+        # map to 50..800 pts^2
+        plot_df["size_pts2"] = 50.0 + (plot_df["tsSPI%"] - ts_min) * (800.0 - 50.0) / (ts_max - ts_min)
+    else:
+        plot_df["size_pts2"] = 300.0
+
+    fig, ax = plt.subplots()
+    sc = ax.scatter(
+        plot_df["Kick%"],
+        plot_df["Grind%"],
+        s=plot_df["size_pts2"],
+        c=plot_df["PI_v3.3"],
+        alpha=0.7,
+        edgecolors="none"
+    )
+
+    # Labels
+    ax.set_xlabel("Kick%  (200 → Finish vs race avg)")
+    ax.set_ylabel("Grind% (600 → 200 vs race avg)")
+    ax.set_title("Sectional profile: finish vs late-drive (bubble = sustain)")
+
+    # Median reference lines (~100 is neutral)
+    try:
+        x_med = float(np.nanmedian(plot_df["Kick%"]))
+        y_med = float(np.nanmedian(plot_df["Grind%"]))
+        ax.axvline(x=100.0, linestyle="--", alpha=0.25)
+        ax.axhline(y=100.0, linestyle="--", alpha=0.25)
+        # also race medians (fainter)
+        ax.axvline(x=x_med, linestyle=":", alpha=0.25)
+        ax.axhline(y=y_med, linestyle=":", alpha=0.25)
+    except Exception:
+        pass
+
+    # Annotate a few top-PI points for readability
+    top_n = plot_df.sort_values("PI_v3.3", ascending=False).head(8)
+    for _, r in top_n.iterrows():
+        ax.annotate(str(r["Horse"])[:12], (r["Kick%"], r["Grind%"]), fontsize=8,
+                    xytext=(4, 4), textcoords="offset points")
+
+    # Colorbar for PI
+    cbar = plt.colorbar(sc, ax=ax)
+    cbar.set_label("PI v3.3")
+
+    ax.grid(True, linestyle="--", alpha=0.3)
+    st.pyplot(fig)
+
+    st.caption("Reading guide: → right = stronger Kick; ↑ up = stronger Grind; bigger bubble = stronger tsSPI (sustain); brighter color = higher PI.")
 
 # Footer
 st.caption(
