@@ -1,10 +1,15 @@
-import io
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import streamlit as st
+import matplotlib as mpl
 import matplotlib.pyplot as plt
+
+# =========================
+# Matplotlib safety defaults
+# =========================
+mpl.rcParams["figure.dpi"] = 110
+mpl.rcParams["savefig.dpi"] = 110
+mpl.rcParams["figure.max_open_warning"] = 0
 
 # =========================
 # Page config (no logo)
@@ -58,6 +63,12 @@ def norm_to_band(x, lo, hi):
 
 def clamp(x, lo=0.0, hi=1.0):
     return float(min(hi, max(lo, x)))
+
+def _safe_median(s, default=np.nan):
+    s = pd.to_numeric(s, errors="coerce")
+    if s.notna().any():
+        return float(np.nanmedian(s))
+    return default
 
 # =========================
 # PI v2.3G trip profile
@@ -168,11 +179,11 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int, manual_mode: bool) -> pd
             if name in work.columns:
                 mid_cols.append(name)
         work["Mid_time"] = work[mid_cols].sum(axis=1, skipna=True)
-        work["Mid_dist"] = 100.0 * work[mid_cols].notna().count(axis=1)
+        work["Mid_dist"] = (work[mid_cols].notna().sum(axis=1).astype(float)) * 100.0
 
     else:
         # Manual (200m grid + Finish 100m)
-        # round up distance for grid shape already done earlier
+        # round up distance for grid shape already handled in template
         first200_col = f"{distance_m - 200}_Time"
         work["F200_time"] = work[first200_col] if first200_col in work.columns else np.nan
 
@@ -191,18 +202,18 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int, manual_mode: bool) -> pd
             if name in work.columns:
                 mid_cols.append(name)
         work["Mid_time"] = work[mid_cols].sum(axis=1, skipna=True)
-        work["Mid_dist"] = 200.0 * work[mid_cols].notna().count(axis=1)
+        work["Mid_dist"] = (work[mid_cols].notna().sum(axis=1).astype(float)) * 200.0
 
-    # speeds & ratios
+    # speeds & ratios (guard NaNs/zeros)
     work["F200_speed"]  = 200.0 / work["F200_time"]
     work["Mid_speed"]   = np.where(work["Mid_time"] > 0, work["Mid_dist"] / work["Mid_time"], np.nan)
     work["Accel_speed"] = 200.0 / work["Accel_time"]
     work["Grind_speed"] = 100.0 / work["Grind_time"]
 
-    work["F200%"]  = (work["F200_speed"]  / work["Race_AvgSpeed"]) * 100.0
-    work["tsSPI%"] = (work["Mid_speed"]   / work["Race_AvgSpeed"]) * 100.0
-    work["Accel%"] = (work["Accel_speed"] / work["Mid_speed"])     * 100.0
-    work["Grind%"] = (work["Grind_speed"] / work["Race_AvgSpeed"]) * 100.0
+    work["F200%"]  = np.where(work["Race_AvgSpeed"] > 0, (work["F200_speed"]  / work["Race_AvgSpeed"]) * 100.0, np.nan)
+    work["tsSPI%"] = np.where(work["Race_AvgSpeed"] > 0, (work["Mid_speed"]   / work["Race_AvgSpeed"]) * 100.0, np.nan)
+    work["Accel%"] = np.where(work["Mid_speed"]     > 0, (work["Accel_speed"] / work["Mid_speed"])     * 100.0, np.nan)
+    work["Grind%"] = np.where(work["Race_AvgSpeed"] > 0, (work["Grind_speed"] / work["Race_AvgSpeed"]) * 100.0, np.nan)
 
     # Finish_Pos fallback
     if ("Finish_Pos" not in work.columns) or work["Finish_Pos"].isna().all():
@@ -220,9 +231,9 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int, manual_mode: bool) -> pd
 def compute_pi(df: pd.DataFrame, distance_m: int) -> pd.DataFrame:
     prof = trip_profile(distance_m)
 
-    spi_med = float(np.nanmedian(df["tsSPI%"]))
-    acc_med = float(np.nanmedian(df["Accel%"]))
-    gr_med  = float(np.nanmedian(df["Grind%"]))
+    spi_med = _safe_median(df["tsSPI%"], default=100.0)
+    acc_med = _safe_median(df["Accel%"], default=100.0)
+    gr_med  = _safe_median(df["Grind%"], default=100.0)
 
     bands = {"F200%": (86, 96),
              "tsSPI%": (100, 109),
@@ -352,31 +363,39 @@ def ema(series, alpha=0.3):
     return y
 
 # =========================
-# Charts
+# Charts (with DPI & height caps)
 # =========================
 def chart_pi_bar(df):
     ranked = df.sort_values("PI_v2_3G", ascending=True)
     names = ranked["Horse"].astype(str).tolist()
     pis = ranked["PI_v2_3G"].astype(float).tolist()
 
-    fig, ax = plt.subplots(figsize=(9, max(4, 0.35 * len(names))))
+    max_h_inches = 10.0
+    fig_h = min(max(4, 0.35 * len(names)), max_h_inches)
+    fig, ax = plt.subplots(figsize=(9, fig_h))
     ax.barh(names, pis)
     ax.set_xlabel("PI v2.3G (0–1)")
     ax.set_title("PI Ranking")
     for i, v in enumerate(pis):
         ax.text(v + 0.01, i, f"{v:.3f}", va="center", fontsize=8)
 
+    # ASCII badges (no emoji font issues)
     glyphs = []
     for _, r in ranked.iterrows():
         g = ""
-        if r["EndBonus"] > 0: g += "⛽"
-        if r["DomBonus"] > 0: g += "★"
-        if r["WinBonus"] > 0: g += "🛡"
-        if r["IntPenalty"] < 0: g += "⚠️"
+        if r["EndBonus"] > 0: g += "[END]"
+        if r["DomBonus"] > 0: g += "[DOM]"
+        if r["WinBonus"] > 0: g += "[WIN]"
+        if r["IntPenalty"] < 0: g += "[INT]"
         glyphs.append(g or " ")
     for i, g in enumerate(glyphs):
-        ax.text(0.01, i, g, va="center", fontsize=10)
-    st.pyplot(fig)
+        ax.text(0.01, i, g, va="center", fontsize=9)
+
+    ax.tick_params(labelsize=9)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+
+    st.pyplot(fig, dpi=110)
 
 def chart_shape_map(df, label_mode="Top 8"):
     fig, ax = plt.subplots(figsize=(9, 7))
@@ -385,7 +404,7 @@ def chart_shape_map(df, label_mode="Top 8"):
     pi = df["PI_v2_3G"].astype(float)
     size = (df["tsSPI%"].astype(float) - df["tsSPI%"].min() + 1.0) * 18.0
 
-    x_med, y_med = np.nanmedian(x), np.nanmedian(y)
+    x_med, y_med = _safe_median(x), _safe_median(y)
     # quadrant shading
     ax.axvspan(x_med, max(np.nanmax(x), x_med), ymin=0, ymax=0.5, alpha=0.08)
     ax.axvspan(min(np.nanmin(x), x_med), x_med, ymin=0.5, ymax=1, alpha=0.08)
@@ -395,7 +414,6 @@ def chart_shape_map(df, label_mode="Top 8"):
     sc = ax.scatter(x, y, s=size, c=pi, cmap="viridis", alpha=0.85, edgecolors="white", linewidths=0.8)
 
     # Decide which to label
-    label_idx = []
     if label_mode == "None":
         label_idx = []
     elif label_mode == "All":
@@ -405,9 +423,9 @@ def chart_shape_map(df, label_mode="Top 8"):
     else:  # Top 8
         label_idx = df["PI_v2_3G"].nlargest(min(8, len(df))).index.tolist()
 
-    # Arrowed labels (offset + arrowprops)
+    # Arrowed labels
     for i, r in df.iterrows():
-        if i in label_idx:
+        if i in label_idx and pd.notna(r["Accel%"]) and pd.notna(r["Grind%"]):
             ax.annotate(
                 str(r["Horse"]),
                 (r["Accel%"], r["Grind%"]),
@@ -423,7 +441,7 @@ def chart_shape_map(df, label_mode="Top 8"):
     ax.set_xlabel("Accel% (200→100 vs Mid)")
     ax.set_ylabel("Grind% (Final 100 vs Avg)")
     ax.set_title("Sectional Shape Map — Accel vs Grind (bubble = tsSPI, color = PI)")
-    st.pyplot(fig)
+    st.pyplot(fig, dpi=110)
 
 def chart_pace_curve_200m(df: pd.DataFrame, distance_m: int, manual_mode: bool,
                           overlays="Top 5 finishers", smooth=False, normalize=False):
@@ -432,27 +450,18 @@ def chart_pace_curve_200m(df: pd.DataFrame, distance_m: int, manual_mode: bool,
     x = list(range(len(labels)))[::-1]
     y = list(reversed(speeds))
     xlabels = list(reversed(labels))
-
     y_plot = ema(y) if smooth else y
 
     fig, ax = plt.subplots(figsize=(10, 4.8))
     # Field average in black
     ax.plot(x, y_plot, marker="o", linewidth=2.5, label="Field avg (200m)", zorder=5, color="black")
 
-    # Prepare per-horse overlays (top N finishers)
-    # We'll reconstruct each horse's 200m speeds with same bins
-    # Normalize flag: if True, plot (runner - field_avg) per bin
-    # Determine N
+    # Overlays: top N finishers
     overlay_n = {"None": 0, "Top 3 finishers": 3, "Top 5 finishers": 5, "Top 8 finishers": 8}.get(overlays, 5)
     if overlay_n > 0:
-        # Get top N by Finish_Pos ascending
         top_finish = df.sort_values("Finish_Pos").head(overlay_n)
-        palette = [
-            # colorblind-friendly-ish distinct set
-            "#4477AA","#EE6677","#228833","#CCBB44","#66CCEE","#AA3377","#BBBBBB","#000000"
-        ]
-        # Build each horse's 200m vector
-        # Helper to get per-horse bin times
+        palette = ["#4477AA","#EE6677","#228833","#CCBB44","#66CCEE","#AA3377","#BBBBBB","#000000"]
+
         def horse_bin_times(row):
             if not manual_mode:
                 hcols = _list_100m_cols(df, distance_m)
@@ -461,7 +470,9 @@ def chart_pace_curve_200m(df: pd.DataFrame, distance_m: int, manual_mode: bool,
                     pairs.append((hcols[i], hcols[i+1]))
                 times = []
                 for (a, b) in pairs:
-                    t = pd.to_numeric(pd.Series([row.get(a), row.get(b)])).sum()
+                    a_val = pd.to_numeric(pd.Series([row.get(a)]), errors="coerce").iloc[0]
+                    b_val = pd.to_numeric(pd.Series([row.get(b)]), errors="coerce").iloc[0]
+                    t = (a_val if pd.notna(a_val) else np.nan) + (b_val if pd.notna(b_val) else np.nan)
                     times.append(t if pd.notna(t) and t > 0 else np.nan)
                 return times
             else:
@@ -473,15 +484,12 @@ def chart_pace_curve_200m(df: pd.DataFrame, distance_m: int, manual_mode: bool,
 
         for idx, (_, r) in enumerate(top_finish.iterrows()):
             tvec = horse_bin_times(r)
-            # convert to speeds
             svec = [200.0 / t if (pd.notna(t) and t > 0) else np.nan for t in tvec]
-            # align & reverse to left->right
             svec = list(reversed(svec))[:len(y)]
             if normalize:
                 svec = [sv - fv if (pd.notna(sv) and pd.notna(fv)) else np.nan for sv, fv in zip(svec, y)]
             line = ax.plot(x, svec, marker="o", linewidth=1.8, label=f"{int(r['Finish_Pos'])}° {r['Horse']}",
                            zorder=3, color=palette[idx % len(palette)])
-            # make overlay slightly transparent to let black stand out
             for l in line:
                 l.set_alpha(0.9)
 
@@ -500,7 +508,7 @@ def chart_pace_curve_200m(df: pd.DataFrame, distance_m: int, manual_mode: bool,
     ax.grid(True, linestyle="--", alpha=0.3)
     if overlay_n > 0:
         ax.legend(loc="best", fontsize=8, ncol=2)
-    st.pyplot(fig)
+    st.pyplot(fig, dpi=110)
 
 # =========================
 # UI
@@ -537,7 +545,8 @@ try:
         if rounded_dist != int(distance_m):
             st.info(f"Distance rounded up to **{rounded_dist} m** for the grid.")
             distance_m = rounded_dist
-        df_raw = st.data_editor(tmpl, num_rows="fixed", use_container_width=True, key="manual_grid")
+        # Streamlit 1.49+: width='stretch' (no use_container_width)
+        df_raw = st.data_editor(tmpl, num_rows="fixed", width="stretch", key="manual_grid")
         st.success("Manual grid ready. Fill times in seconds (e.g., 11.05).")
 except Exception as e:
     st.error("Input parsing failed.")
@@ -545,7 +554,7 @@ except Exception as e:
     st.stop()
 
 st.subheader("Raw / Manual table preview")
-st.dataframe(df_raw.head(12), use_container_width=True)
+st.dataframe(df_raw.head(12), width="stretch")
 _dbg("Columns", list(df_raw.columns))
 
 # ---------- Compute metrics ----------
@@ -564,8 +573,9 @@ disp = work[show_cols].copy()
 for c in ["RaceTime_s", "Margin_L", "F200%", "tsSPI%", "Accel%", "Grind%", "PI_base", "PI_v2_3G"]:
     if c in disp.columns:
         disp[c] = pd.to_numeric(disp[c], errors="coerce")
+
 st.subheader("Sectional Metrics (new system)")
-st.dataframe(disp.sort_values(["PI_v2_3G"], ascending=False), use_container_width=True)
+st.dataframe(disp.sort_values(["PI_v2_3G"], ascending=False), width="stretch")
 
 # ---------- Charts ----------
 st.subheader("PI Ranking")
