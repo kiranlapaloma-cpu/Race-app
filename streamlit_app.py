@@ -1,5 +1,4 @@
 import io
-import re
 from pathlib import Path
 
 import numpy as np
@@ -7,14 +6,14 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# ----------------------------
+# =========================
 # Page config (no logo)
-# ----------------------------
-st.set_page_config(page_title="RaceEdge — vPI 2.3G", layout="wide")
+# =========================
+st.set_page_config(page_title="RaceEdge — PI v2.3G", layout="wide")
 
-# ----------------------------
+# =========================
 # Debug toggle
-# ----------------------------
+# =========================
 with st.sidebar:
     DEBUG = st.checkbox("Debug mode", value=False)
 
@@ -24,16 +23,16 @@ def _dbg(label, obj=None):
         if obj is not None:
             st.write(obj)
 
-# =====================================================
-# Utilities
-# =====================================================
+# =========================
+# Generic helpers
+# =========================
 def parse_race_time(val):
     """Accept seconds or 'MM:SS.ms' (or 'M:SS.ms'). Return float seconds."""
     if pd.isna(val):
         return np.nan
     s = str(val).strip()
+    # bare float?
     try:
-        # bare float/seconds
         return float(s)
     except Exception:
         pass
@@ -60,22 +59,10 @@ def norm_to_band(x, lo, hi):
 def clamp(x, lo=0.0, hi=1.0):
     return float(min(hi, max(lo, x)))
 
-def to_float(s):
-    try:
-        return float(s)
-    except Exception:
-        return np.nan
-
-# =====================================================
-# Distance-aware PI v2.3G profiles (weights + bonuses)
-# =====================================================
+# =========================
+# PI v2.3G trip profile
+# =========================
 def trip_profile(distance_m: int):
-    """
-    Return dict with weights and bonus/penalty magnitudes based on trip.
-    Buckets:
-      ≤1200 (SPRINT), 1300–1500 (SEVEN), 1550–1700 (MILE-ish),
-      1750–2050 (MIDDLE), ≥2100 (CLASSIC)
-    """
     d = int(distance_m)
     if d <= 1200:
         return dict(bucket="SPRINT",
@@ -107,15 +94,20 @@ def trip_profile(distance_m: int):
                 dom=0.030, win_hi=0.035, win_lo=0.025,
                 cap_lo=-0.07, cap_hi=0.08)
 
-# =====================================================
-# Metric computation from 100m or manual 200m inputs
-# =====================================================
+# =========================
+# Metric computation
+# =========================
+def _list_100m_cols(df, distance_m: int):
+    cols = []
+    for m in range(distance_m - 100, 0, -100):
+        c = f"{m}_Time"
+        if c in df.columns:
+            cols.append(c)
+    if "Finish_Time" in df.columns:
+        cols.append("Finish_Time")
+    return cols
+
 def detect_100m_columns(df, distance_m: int):
-    """
-    For a race distance D, 100m countdown columns are like:
-      D-100, D-200, ..., 100, Finish
-    Return list of present col names like '1200_Time','1100_Time',...,'100_Time','Finish_Time'
-    """
     cols = []
     for m in range(distance_m - 100, 0, -100):
         name = f"{m}_Time"
@@ -126,22 +118,19 @@ def detect_100m_columns(df, distance_m: int):
     return cols
 
 def build_metrics(df_in: pd.DataFrame, distance_m: int, manual_mode: bool) -> pd.DataFrame:
-    """
-    Compute F200%, tsSPI%, Accel%, Grind%, PI v2.3G and helper columns.
-    - CSV mode expects 100m splits.
-    - Manual mode uses 200m splits + Finish (100m).
-    """
     work = df_in.copy()
 
-    # Ensure RaceTime_s & Race_AvgSpeed
-    work["RaceTime_s"] = work["Race Time"].apply(parse_race_time) if "Race Time" in work.columns else np.nan
-    if work["RaceTime_s"].isna().all() and "Race Time" not in work.columns:
-        # If user supplied 'RaceTime' or other variants
-        for alt in ["Race_Time", "RaceTime", "Time"]:
-            if alt in work.columns:
-                work["RaceTime_s"] = work[alt].apply(parse_race_time)
-                break
-    # Fallback: sum of all sectionals (rough)
+    # normalize RaceTime_s
+    if "Race Time" in work.columns:
+        work["RaceTime_s"] = work["Race Time"].apply(parse_race_time)
+    else:
+        rt_col = next((c for c in ["Race_Time", "RaceTime", "Time"] if c in work.columns), None)
+        if rt_col:
+            work["RaceTime_s"] = work[rt_col].apply(parse_race_time)
+        else:
+            work["RaceTime_s"] = np.nan
+
+    # fallback: sum of sectionals
     if work["RaceTime_s"].isna().any():
         sec_cols = [c for c in work.columns if c.endswith("_Time")]
         if sec_cols:
@@ -150,16 +139,14 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int, manual_mode: bool) -> pd
 
     work["Race_AvgSpeed"] = distance_m / work["RaceTime_s"]
 
-    # Cast numeric sectionals
+    # cast numeric
     for c in work.columns:
         if c.endswith("_Time"):
             work[c] = pd.to_numeric(work[c], errors="coerce")
 
-    # ------ Phase times ------
+    # ----- Phase times -----
     if not manual_mode:
         # 100m sheets
-        hundred_cols = detect_100m_columns(work, distance_m)
-        # F200 = first two 100m splits (true first 200m)
         first_200 = []
         for m in [distance_m - 100, distance_m - 200]:
             name = f"{m}_Time"
@@ -167,54 +154,48 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int, manual_mode: bool) -> pd
                 first_200.append(name)
         work["F200_time"] = work[first_200].sum(axis=1, skipna=False) if first_200 else np.nan
 
-        # Accel = 200->100 + 100->Finish (two 100m pieces)
         a_cols = []
         if "200_Time" in work.columns: a_cols.append("200_Time")
         if "100_Time" in work.columns: a_cols.append("100_Time")
         work["Accel_time"] = work[a_cols].sum(axis=1, skipna=False) if a_cols else np.nan
 
-        # Grind = final 100m
         work["Grind_time"] = work["Finish_Time"] if "Finish_Time" in work.columns else np.nan
 
-        # tsSPI: exclude first 200m and last 400m
-        # last 400m = 400→300 + 300→Finish(=200→100 + 100→Finish)
+        # tsSPI: exclude first 200 & last 400
         mid_cols = []
-        for m in range(distance_m - 300, 300, -100):  # from D-300 down to 400 (exclusive), step 100
+        for m in range(distance_m - 300, 300, -100):  # D-300 down to 400, step 100
             name = f"{m}_Time"
             if name in work.columns:
                 mid_cols.append(name)
         work["Mid_time"] = work[mid_cols].sum(axis=1, skipna=True)
-        work["Mid_dist"] = 100.0 * work[mid_cols].notna().sum(axis=1)
+        work["Mid_dist"] = 100.0 * work[mid_cols].notna().count(axis=1)
 
     else:
-        # Manual 200m splits + Finish (100m)
-        # Expected columns like: 'Horse', '<D-200>_Time', '<D-400>_Time', ..., '200_Time', 'Finish_Time'
-        # F200 = first 200m cell
-        first200_col = f"{distance_m-200}_Time"
+        # Manual (200m grid + Finish 100m)
+        # round up distance for grid shape already done earlier
+        first200_col = f"{distance_m - 200}_Time"
         work["F200_time"] = work[first200_col] if first200_col in work.columns else np.nan
-        # Accel = 200->100 + 100->Finish; in manual, we have Finish (100m); ask also '100_Time'? Usually absent.
-        # Approximate Accel using last 200m split if 100_Time not available:
+
         if "200_Time" in work.columns and "100_Time" in work.columns:
             work["Accel_time"] = work["200_Time"] + work["100_Time"]
         elif "200_Time" in work.columns and "Finish_Time" in work.columns:
-            # assume last 100m ~= Finish_Time; 200->100 approximated as half of 200_Time
             work["Accel_time"] = (work["200_Time"] / 2.0) + work["Finish_Time"]
         else:
             work["Accel_time"] = np.nan
-        # Grind = Finish 100m
+
         work["Grind_time"] = work["Finish_Time"] if "Finish_Time" in work.columns else np.nan
-        # tsSPI: exclude first 200 and last 400 (two 200m cells)
+
         mid_cols = []
-        for m in range(distance_m - 400, 400, -200):  # from D-400 down to 600 (exclusive), step 200
+        for m in range(distance_m - 400, 400, -200):  # D-400 down to 600, step 200
             name = f"{m}_Time"
             if name in work.columns:
                 mid_cols.append(name)
         work["Mid_time"] = work[mid_cols].sum(axis=1, skipna=True)
-        work["Mid_dist"] = 200.0 * work[mid_cols].notna().sum(axis=1)
+        work["Mid_dist"] = 200.0 * work[mid_cols].notna().count(axis=1)
 
-    # Speeds / ratios
-    work["F200_speed"] = 200.0 / work["F200_time"]
-    work["Mid_speed"] = np.where(work["Mid_time"] > 0, work["Mid_dist"] / work["Mid_time"], np.nan)
+    # speeds & ratios
+    work["F200_speed"]  = 200.0 / work["F200_time"]
+    work["Mid_speed"]   = np.where(work["Mid_time"] > 0, work["Mid_dist"] / work["Mid_time"], np.nan)
     work["Accel_speed"] = 200.0 / work["Accel_time"]
     work["Grind_speed"] = 100.0 / work["Grind_time"]
 
@@ -223,28 +204,26 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int, manual_mode: bool) -> pd
     work["Accel%"] = (work["Accel_speed"] / work["Mid_speed"])     * 100.0
     work["Grind%"] = (work["Grind_speed"] / work["Race_AvgSpeed"]) * 100.0
 
-    # If Finish_Pos missing, infer from time
+    # Finish_Pos fallback
     if ("Finish_Pos" not in work.columns) or work["Finish_Pos"].isna().all():
         work["Finish_Pos"] = work["RaceTime_s"].rank(method="min").astype("Int64")
 
-    # Margin (lengths @ 0.20s/length)
+    # Margin (lengths @ 0.20s)
     winner_time = work.loc[work["Finish_Pos"] == work["Finish_Pos"].min(), "RaceTime_s"].min()
     work["Margin_L"] = (work["RaceTime_s"] - winner_time) / 0.20
 
     return work
 
-# =====================================================
-# PI v2.3G computation
-# =====================================================
+# =========================
+# PI computation
+# =========================
 def compute_pi(df: pd.DataFrame, distance_m: int) -> pd.DataFrame:
     prof = trip_profile(distance_m)
 
-    # Field medians for context
     spi_med = float(np.nanmedian(df["tsSPI%"]))
     acc_med = float(np.nanmedian(df["Accel%"]))
     gr_med  = float(np.nanmedian(df["Grind%"]))
 
-    # Scaled scores (percentile + band)
     bands = {"F200%": (86, 96),
              "tsSPI%": (100, 109),
              "Accel%": (97, 105),
@@ -254,16 +233,17 @@ def compute_pi(df: pd.DataFrame, distance_m: int) -> pd.DataFrame:
         df[f"a_{k}"] = df[k].apply(lambda x: norm_to_band(x, lo, hi))
         df[f"s_{k}"] = 0.7 * df[f"p_{k}"] + 0.3 * df[f"a_{k}"]
 
-    # Base PI (distance-aware weights)
     wF, wS, wA, wG = prof["wF200"], prof["wSPI"], prof["wACC"], prof["wGR"]
     df["PI_base"] = (
-        df["s_F200%"] * wF +
+        df["s_F200%"]  * wF +
         df["s_tsSPI%"] * wS +
         df["s_Accel%"] * wA +
         df["s_Grind%"] * wG
     )
 
-    # Bonuses / penalties
+    # Winner time (for margins)
+    winner_time = df.loc[df["Finish_Pos"] == df["Finish_Pos"].min(), "RaceTime_s"].min()
+
     def endurance_bonus(r):
         if r["Grind%"] >= gr_med + 3.5 and r["tsSPI%"] >= spi_med:
             return prof["end_hi"]
@@ -273,15 +253,16 @@ def compute_pi(df: pd.DataFrame, distance_m: int) -> pd.DataFrame:
 
     def integrity_penalty(r):
         if r["Accel%"] >= acc_med + 4 and r["Grind%"] <= gr_med - 2:
-            return -0.020  # kept constant across trips
+            return -0.020
         return 0.0
 
-    def dominance_bonus(r, winner_time):
-        if r["tsSPI%"] >= spi_med + 3 and (r["RaceTime_s"] - winner_time) / 0.20 >= 3:
+    def dominance_bonus(r):
+        margin_L = (r["RaceTime_s"] - winner_time) / 0.20
+        if r["tsSPI%"] >= spi_med + 3 and margin_L >= 3:
             return prof["dom"]
         return 0.0
 
-    def winner_bonus(r, winner_time):
+    def winner_bonus(r):
         margin_L = (r["RaceTime_s"] - winner_time) / 0.20
         if r["Finish_Pos"] == 1 and margin_L >= 5:
             return prof["win_hi"]
@@ -289,39 +270,90 @@ def compute_pi(df: pd.DataFrame, distance_m: int) -> pd.DataFrame:
             return prof["win_lo"]
         return 0.0
 
-    winner_time = df.loc[df["Finish_Pos"] == df["Finish_Pos"].min(), "RaceTime_s"].min()
-    df["EndBonus"] = df.apply(endurance_bonus, axis=1)
+    df["EndBonus"]   = df.apply(endurance_bonus, axis=1)
     df["IntPenalty"] = df.apply(integrity_penalty, axis=1)
-    df["DomBonus"] = df.apply(lambda r: dominance_bonus(r, winner_time), axis=1)
-    df["WinBonus"] = df.apply(lambda r: winner_bonus(r, winner_time), axis=1)
+    df["DomBonus"]   = df.apply(dominance_bonus, axis=1)
+    df["WinBonus"]   = df.apply(winner_bonus, axis=1)
 
     extras = (df["EndBonus"] + df["IntPenalty"] + df["DomBonus"] + df["WinBonus"]).clip(prof["cap_lo"], prof["cap_hi"])
     df["PI_v2_3G"] = (df["PI_base"] + extras).clip(0, 1)
 
     return df
 
-# =====================================================
-# Manual input builder (200 m segments + Finish)
-# =====================================================
+# =========================
+# Manual input template
+# =========================
 def make_manual_template(horses: int, distance_m: int) -> pd.DataFrame:
-    # Round distance up to nearest 200 for grid shape (your earlier preference)
+    # Round up to nearest 200 for grid
     if distance_m % 200 != 0:
         distance_m = int(np.ceil(distance_m / 200.0) * 200)
 
     cols = ["Horse"]
-    # countdown 200 m columns
     for m in range(distance_m - 200, 0, -200):
         cols.append(f"{m}_Time")
     cols.append("Finish_Time")  # final 100 m
-    # optional Finish_Pos (user can leave blank)
     cols.append("Finish_Pos")
     df = pd.DataFrame({c: [np.nan] * horses for c in cols})
     df["Horse"] = [f"Runner {i+1}" for i in range(horses)]
     return df, distance_m
 
-# =====================================================
+# =========================
+# Pace curve (200m bins)
+# =========================
+def compute_field_pace_200m(df: pd.DataFrame, distance_m: int, manual_mode: bool):
+    labels = []
+    seg_times = []
+
+    if not manual_mode:
+        hcols = _list_100m_cols(df, distance_m)  # e.g. [D-100, D-200, ..., 100, Finish]
+        pairs = []
+        for i in range(0, len(hcols) - 1, 2):
+            pairs.append((hcols[i], hcols[i+1]))
+
+        # labels from start to finish
+        for k in range(distance_m - 200, -1, -200):
+            labels.append("0" if k == 0 else f"{k}_to_{k+200}")
+
+        for (a, b) in pairs:
+            t = pd.to_numeric(df[a], errors="coerce") + pd.to_numeric(df[b], errors="coerce")
+            seg_times.append(t.values)
+    else:
+        mcols = [c for c in df.columns if c.endswith("_Time") and c != "Finish_Time"]
+        def _dist(c): return int(c.split("_")[0])
+        mcols = sorted(mcols, key=_dist, reverse=True)  # D-200, D-400, ...
+        for c in mcols:
+            k = int(c.split("_")[0])
+            labels.append("0" if k == 200 else f"{k-200}_to_{k}")
+            seg_times.append(pd.to_numeric(df[c], errors="coerce").values)
+
+    avg_speeds = []
+    for t in seg_times:
+        s = pd.Series(t).dropna()
+        if len(s) == 0 or s.mean() <= 0:
+            avg_speeds.append(np.nan)
+        else:
+            avg_speeds.append(200.0 / s.mean())
+
+    n = min(len(labels), len(avg_speeds))
+    return labels[:n], avg_speeds[:n]
+
+def ema(series, alpha=0.3):
+    y = []
+    prev = None
+    for v in series:
+        if np.isnan(v):
+            y.append(np.nan)
+            continue
+        if prev is None or np.isnan(prev):
+            prev = v
+        else:
+            prev = alpha * v + (1 - alpha) * prev
+        y.append(prev)
+    return y
+
+# =========================
 # Charts
-# =====================================================
+# =========================
 def chart_pi_bar(df):
     ranked = df.sort_values("PI_v2_3G", ascending=True)
     names = ranked["Horse"].astype(str).tolist()
@@ -334,7 +366,6 @@ def chart_pi_bar(df):
     for i, v in enumerate(pis):
         ax.text(v + 0.01, i, f"{v:.3f}", va="center", fontsize=8)
 
-    # glyphs on left
     glyphs = []
     for _, r in ranked.iterrows():
         g = ""
@@ -347,7 +378,7 @@ def chart_pi_bar(df):
         ax.text(0.01, i, g, va="center", fontsize=10)
     st.pyplot(fig)
 
-def chart_shape_map(df):
+def chart_shape_map(df, label_mode="Top 8"):
     fig, ax = plt.subplots(figsize=(9, 7))
     x = df["Accel%"].astype(float)
     y = df["Grind%"].astype(float)
@@ -355,19 +386,37 @@ def chart_shape_map(df):
     size = (df["tsSPI%"].astype(float) - df["tsSPI%"].min() + 1.0) * 18.0
 
     x_med, y_med = np.nanmedian(x), np.nanmedian(y)
-    # quadrant shading + median lines
+    # quadrant shading
     ax.axvspan(x_med, max(np.nanmax(x), x_med), ymin=0, ymax=0.5, alpha=0.08)
     ax.axvspan(min(np.nanmin(x), x_med), x_med, ymin=0.5, ymax=1, alpha=0.08)
     ax.axhline(y_med, linestyle="--", linewidth=1.2)
     ax.axvline(x_med, linestyle="--", linewidth=1.2)
 
     sc = ax.scatter(x, y, s=size, c=pi, cmap="viridis", alpha=0.85, edgecolors="white", linewidths=0.8)
-    # label top 8 by PI
-    top_idx = df["PI_v2_3G"].nlargest(min(8, len(df))).index
+
+    # Decide which to label
+    label_idx = []
+    if label_mode == "None":
+        label_idx = []
+    elif label_mode == "All":
+        label_idx = df.index.tolist()
+    elif label_mode == "Top 5":
+        label_idx = df["PI_v2_3G"].nlargest(min(5, len(df))).index.tolist()
+    else:  # Top 8
+        label_idx = df["PI_v2_3G"].nlargest(min(8, len(df))).index.tolist()
+
+    # Arrowed labels (offset + arrowprops)
     for i, r in df.iterrows():
-        if i in top_idx:
-            ax.annotate(str(r["Horse"]), (r["Accel%"], r["Grind%"]),
-                        xytext=(6, 6), textcoords="offset points", fontsize=9, weight="bold")
+        if i in label_idx:
+            ax.annotate(
+                str(r["Horse"]),
+                (r["Accel%"], r["Grind%"]),
+                xytext=(10, 10),
+                textcoords="offset points",
+                fontsize=9,
+                weight="bold",
+                arrowprops=dict(arrowstyle="-", color="black", alpha=0.6, lw=0.75),
+            )
 
     cb = plt.colorbar(sc, ax=ax, shrink=0.9)
     cb.set_label("PI v2.3G")
@@ -376,9 +425,86 @@ def chart_shape_map(df):
     ax.set_title("Sectional Shape Map — Accel vs Grind (bubble = tsSPI, color = PI)")
     st.pyplot(fig)
 
-# =====================================================
+def chart_pace_curve_200m(df: pd.DataFrame, distance_m: int, manual_mode: bool,
+                          overlays="Top 5 finishers", smooth=False, normalize=False):
+    labels, speeds = compute_field_pace_200m(df, distance_m, manual_mode)
+    # X left->right from start to finish
+    x = list(range(len(labels)))[::-1]
+    y = list(reversed(speeds))
+    xlabels = list(reversed(labels))
+
+    y_plot = ema(y) if smooth else y
+
+    fig, ax = plt.subplots(figsize=(10, 4.8))
+    # Field average in black
+    ax.plot(x, y_plot, marker="o", linewidth=2.5, label="Field avg (200m)", zorder=5, color="black")
+
+    # Prepare per-horse overlays (top N finishers)
+    # We'll reconstruct each horse's 200m speeds with same bins
+    # Normalize flag: if True, plot (runner - field_avg) per bin
+    # Determine N
+    overlay_n = {"None": 0, "Top 3 finishers": 3, "Top 5 finishers": 5, "Top 8 finishers": 8}.get(overlays, 5)
+    if overlay_n > 0:
+        # Get top N by Finish_Pos ascending
+        top_finish = df.sort_values("Finish_Pos").head(overlay_n)
+        palette = [
+            # colorblind-friendly-ish distinct set
+            "#4477AA","#EE6677","#228833","#CCBB44","#66CCEE","#AA3377","#BBBBBB","#000000"
+        ]
+        # Build each horse's 200m vector
+        # Helper to get per-horse bin times
+        def horse_bin_times(row):
+            if not manual_mode:
+                hcols = _list_100m_cols(df, distance_m)
+                pairs = []
+                for i in range(0, len(hcols) - 1, 2):
+                    pairs.append((hcols[i], hcols[i+1]))
+                times = []
+                for (a, b) in pairs:
+                    t = pd.to_numeric(pd.Series([row.get(a), row.get(b)])).sum()
+                    times.append(t if pd.notna(t) and t > 0 else np.nan)
+                return times
+            else:
+                mcols = [c for c in df.columns if c.endswith("_Time") and c != "Finish_Time"]
+                def _dist(c): return int(c.split("_")[0])
+                mcols = sorted(mcols, key=_dist, reverse=True)
+                times = [row.get(c) for c in mcols]
+                return times
+
+        for idx, (_, r) in enumerate(top_finish.iterrows()):
+            tvec = horse_bin_times(r)
+            # convert to speeds
+            svec = [200.0 / t if (pd.notna(t) and t > 0) else np.nan for t in tvec]
+            # align & reverse to left->right
+            svec = list(reversed(svec))[:len(y)]
+            if normalize:
+                svec = [sv - fv if (pd.notna(sv) and pd.notna(fv)) else np.nan for sv, fv in zip(svec, y)]
+            line = ax.plot(x, svec, marker="o", linewidth=1.8, label=f"{int(r['Finish_Pos'])}° {r['Horse']}",
+                           zorder=3, color=palette[idx % len(palette)])
+            # make overlay slightly transparent to let black stand out
+            for l in line:
+                l.set_alpha(0.9)
+
+    ax.set_xticks(x)
+    pretty = []
+    for lab in xlabels:
+        if lab == "0":
+            pretty.append("Finish")
+        else:
+            a, _, b = lab.partition("_to_")
+            a, b = int(a), int(b)
+            pretty.append(f"{a}–{b}")
+    ax.set_xticklabels(pretty, rotation=30, ha="right")
+    ax.set_ylabel("Speed (m/s)" if not normalize else "Δ Speed vs Field (m/s)")
+    ax.set_title("Race Pace Curve — 200 m bins")
+    ax.grid(True, linestyle="--", alpha=0.3)
+    if overlay_n > 0:
+        ax.legend(loc="best", fontsize=8, ncol=2)
+    st.pyplot(fig)
+
+# =========================
 # UI
-# =====================================================
+# =========================
 st.title("🏇 RaceEdge — Performance Index v2.3G")
 
 with st.sidebar:
@@ -387,6 +513,12 @@ with st.sidebar:
     distance_m = st.number_input("Race distance (m)", min_value=800, max_value=4000, value=1400, step=50)
     if mode == "Manual input":
         n_horses = st.number_input("Number of horses (manual)", min_value=2, max_value=24, value=8, step=1)
+
+    st.header("Charts")
+    label_mode = st.selectbox("Shape map labels", ["Top 8", "Top 5", "All", "None"], index=0)
+    overlays = st.selectbox("Pace curve overlays", ["Top 5 finishers", "Top 3 finishers", "Top 8 finishers", "None"], index=0)
+    smooth = st.checkbox("Smooth field avg (EMA)", value=False)
+    normalize = st.checkbox("Normalize overlays to field (Δ m/s)", value=False)
 
 df_raw = None
 manual_mode = (mode == "Manual input")
@@ -414,6 +546,7 @@ except Exception as e:
 
 st.subheader("Raw / Manual table preview")
 st.dataframe(df_raw.head(12), use_container_width=True)
+_dbg("Columns", list(df_raw.columns))
 
 # ---------- Compute metrics ----------
 try:
@@ -424,15 +557,13 @@ except Exception as e:
     if DEBUG: st.exception(e)
     st.stop()
 
-# Display core metrics only
+# ---------- Display core metrics ----------
 show_cols = ["Horse", "Finish_Pos", "RaceTime_s", "Margin_L", "F200%", "tsSPI%", "Accel%", "Grind%", "PI_base",
              "EndBonus", "IntPenalty", "DomBonus", "WinBonus", "PI_v2_3G"]
 disp = work[show_cols].copy()
-
 for c in ["RaceTime_s", "Margin_L", "F200%", "tsSPI%", "Accel%", "Grind%", "PI_base", "PI_v2_3G"]:
     if c in disp.columns:
         disp[c] = pd.to_numeric(disp[c], errors="coerce")
-
 st.subheader("Sectional Metrics (new system)")
 st.dataframe(disp.sort_values(["PI_v2_3G"], ascending=False), use_container_width=True)
 
@@ -441,7 +572,11 @@ st.subheader("PI Ranking")
 chart_pi_bar(work)
 
 st.subheader("Sectional Shape Map")
-chart_shape_map(work)
+chart_shape_map(work, label_mode=label_mode)
+
+st.subheader("Race Pace Curve (200 m bins)")
+chart_pace_curve_200m(work, int(distance_m), manual_mode,
+                      overlays=overlays, smooth=smooth, normalize=normalize)
 
 st.caption(
     "Definitions: F200% = first 200 m vs race avg; tsSPI% = sustained mid-race pace (excludes first 200 m & last 400 m); "
