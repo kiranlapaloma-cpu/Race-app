@@ -15,7 +15,7 @@ mpl.rcParams["figure.max_open_warning"] = 0
 Image.MAX_IMAGE_PIXELS = 500_000_000  # belt-and-braces
 
 # =============================================================================
-# Streamlit page (no logo/download per your baseline)
+# Streamlit page (no logo/download)
 # =============================================================================
 st.set_page_config(page_title="RaceEdge — PI v2.4-B++", layout="wide")
 
@@ -90,7 +90,7 @@ def _mad(arr):
     return mad
 
 # =============================================================================
-# Distance profiles (baseline weights from your v2.3G)
+# Distance profiles (baseline weights from v2.3G)
 # =============================================================================
 def trip_profile(distance_m: int):
     d = int(distance_m)
@@ -130,7 +130,7 @@ def make_manual_template(horses: int, distance_m: int) -> tuple[pd.DataFrame, in
     return df, distance_m
 
 # =============================================================================
-# 100 m column lister
+# 100 m columns helper
 # =============================================================================
 def _list_100m_cols(df, distance_m: int):
     cols = []
@@ -143,7 +143,7 @@ def _list_100m_cols(df, distance_m: int):
     return cols
 
 # =============================================================================
-# Build new-era metrics (F200%, tsSPI%, Accel%, Grind%)
+# Build metrics (F200%, tsSPI%, Accel%, Grind%)
 # =============================================================================
 def build_metrics(df_in: pd.DataFrame, distance_m: int, manual_mode: bool) -> pd.DataFrame:
     work = df_in.copy()
@@ -244,18 +244,12 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int, manual_mode: bool) -> pd
 # Context indices for PI v2.4-B++
 # =============================================================================
 def context_indices(df):
-    # field medians
     f200_med = _safe_median(df["F200%"], default=90.0)
     grind_med = _safe_median(df["Grind%"], default=98.0)
-
-    # Early-Heat (positive = fast early). Use (median(F200) - 92)/4 clipped.
-    EHI = (f200_med - 92.0) / 4.0
+    EHI = (f200_med - 92.0) / 4.0  # clip to [-2, 2]
     EHI = float(np.clip(EHI, -2.0, 2.0))
-
-    # Sprint-Home index (higher = more late slowdown / sprint-home)
-    SHI = (100.0 - grind_med) / 2.5
+    SHI = (100.0 - grind_med) / 2.5  # clip to [0, 2]
     SHI = float(np.clip(SHI, 0.0, 2.0))
-
     return EHI, SHI
 
 def renorm_weights(w):
@@ -263,13 +257,12 @@ def renorm_weights(w):
     return {k: (v / s if s > 0 else 0.0) for k, v in w.items()}
 
 # =============================================================================
-# PI v2.4-B++ (Balanced++): context weighting + graded TBB + penalties
+# PI v2.4-B++ (Balanced++)
 # =============================================================================
 def compute_pi_v24_bpp(df: pd.DataFrame, distance_m: int) -> pd.DataFrame:
     prof = trip_profile(distance_m)
 
-    # Build scoring blends (same approach as v2.3G)
-    # s_metric = 0.7 * percentile + 0.3 * band-fit
+    # Scoring blends: s_metric = 0.7 * percentile + 0.3 * band-fit
     s_cols = {}
     for k, (lo, hi) in prof["band"].items():
         pr = percent_rank(df[k])
@@ -282,16 +275,12 @@ def compute_pi_v24_bpp(df: pd.DataFrame, distance_m: int) -> pd.DataFrame:
     # Context-aware reweighting
     w = dict(wF200=prof["wF200"], wSPI=prof["wSPI"], wACC=prof["wACC"], wGR=prof["wGR"])
     EHI, SHI = context_indices(df)
-
     w["wACC"] = w["wACC"] * (1 + 0.10 * max(0.0, -EHI) + 0.05 * SHI)
     w["wGR"]  = w["wGR"]  * (1 + 0.10 * max(0.0,  EHI) + 0.05 * (2 - SHI))
     w["wSPI"] = w["wSPI"] * (1 + 0.05 * abs(EHI))
-    # wF200 unchanged (optionally: w["wF200"] *= (1 + 0.05*EHI) for burn-ups)
-
     w = renorm_weights(w)
     df["_wF200"] = w["wF200"]; df["_wSPI"] = w["wSPI"]; df["_wACC"] = w["wACC"]; df["_wGR"] = w["wGR"]
 
-    # Base with context weights
     df["PI_base_ctx"] = (
         df["s_F200%"]  * w["wF200"] +
         df["s_tsSPI%"] * w["wSPI"]  +
@@ -303,12 +292,9 @@ def compute_pi_v24_bpp(df: pd.DataFrame, distance_m: int) -> pd.DataFrame:
     metrics = ["F200%", "tsSPI%", "Accel%", "Grind%"]
     med = {m: _safe_median(df[m]) for m in metrics}
     mad = {m: _mad(df[m]) for m in metrics}
-    # Guards for zero MAD
     eff_mad = {m: (mad[m] if (not pd.isna(mad[m]) and mad[m] > 1e-6) else np.nan) for m in metrics}
 
     # Below-median penalty (BMP)
-    # Sprint bucket lambdas per your spec; adjust by distance
-    bucket = prof["band"]
     if distance_m <= 1200:
         lam = dict(F200=0.010, tsSPI=0.010, Accel=0.020, Grind=0.015)
     elif distance_m <= 1700:
@@ -320,7 +306,7 @@ def compute_pi_v24_bpp(df: pd.DataFrame, distance_m: int) -> pd.DataFrame:
         k = 1.5
         parts = []
         for M, L in [("F200%", "F200"), ("tsSPI%", "tsSPI"), ("Accel%", "Accel"), ("Grind%", "Grind")]:
-            if pd.isna(eff_mad[M]) or pd.isna(r[M]): 
+            if pd.isna(eff_mad[M]) or pd.isna(r[M]):
                 parts.append(0.0); continue
             z = max(0.0, (med[M] - r[M]) / (1.4826 * eff_mad[M]))
             p = lam[L] * (z / (z + k))
@@ -349,7 +335,7 @@ def compute_pi_v24_bpp(df: pd.DataFrame, distance_m: int) -> pd.DataFrame:
 
     df["IS"] = df.apply(_is_row, axis=1)
 
-    # Spread penalty (max-min across Accel, Grind, tsSPI with tolerance)
+    # Spread penalty (max-min across Accel, Grind, tsSPI with tolerance & archetype half-penalty)
     if distance_m <= 1200: gamma = 0.015
     elif distance_m <= 1700: gamma = 0.012
     else: gamma = 0.010
@@ -375,7 +361,7 @@ def compute_pi_v24_bpp(df: pd.DataFrame, distance_m: int) -> pd.DataFrame:
 
     df["Spread"] = df.apply(_spread_row, axis=1)
 
-    # Triple Balance Bonus (graded): clear all three medians (Accel, Grind, tsSPI)
+    # Triple Balance Bonus (graded)
     def _tbb_row(r):
         vals = {"Accel%": r["Accel%"], "Grind%": r["Grind%"], "tsSPI%": r["tsSPI%"]}
         if any(pd.isna(vals[k]) for k in vals): return 0.0
@@ -392,25 +378,20 @@ def compute_pi_v24_bpp(df: pd.DataFrame, distance_m: int) -> pd.DataFrame:
     times = pd.to_numeric(df["RaceTime_s"], errors="coerce")
     comp = float(times.std(skipna=True) / times.mean(skipna=True)) if times.notna().any() else 0.05
     comp_clip = float(np.clip(comp, 0.02, 0.08))
-    win_cap = 0.03 * (0.8 + 0.2 / comp_clip)  # ≈ 0.03 in tight fields, slightly less if strung out
+    win_cap = 0.03 * (0.8 + 0.2 / comp_clip)
 
     # Small-field damping on penalties
     N = len(df)
     pen_scale = min(1.0, max(0.0, (N - 5) / 7.0))  # 0 at N<=5 → 1 by N>=12
-
     df["BMP_s"] = df["BMP"] * pen_scale
     df["IS_s"]  = df["IS"]  * pen_scale
     df["Spread_s"] = df["Spread"] * pen_scale
 
     # Compose final PI
-    df["Adj_ctx0"] = df["PI_base_ctx"]  # for delta
-    # Existing context bonuses from v2.3G you liked (keep as light hooks)
-    # We'll keep EndBonus/DomBonus/WinBonus shape as zeros (or plug if you have)
     df["EndBonus"] = 0.0
     df["DomBonus"] = 0.0
     df["WinBonus"] = 0.0
 
-    # Winner soft-landing: cap total negative correction for decisive winners
     def _winner_soft_cap(r, net_corr):
         if pd.isna(r["RaceTime_s"]): return net_corr
         margin_L = (r["RaceTime_s"] - winner_time) / 0.20
@@ -418,19 +399,19 @@ def compute_pi_v24_bpp(df: pd.DataFrame, distance_m: int) -> pd.DataFrame:
             return max(net_corr, -win_cap)
         return net_corr
 
-    # Net corrections (clamped ±0.06)
     df["Corr_raw"] = -df["BMP_s"] - df["IS_s"] - df["Spread_s"] + df["TBB"]
     df["Corr_capped"] = df["Corr_raw"].apply(lambda x: float(np.clip(x, -0.06, 0.06)))
     df["Corr_final"] = df.apply(lambda r: _winner_soft_cap(r, r["Corr_capped"]), axis=1)
 
     df["PI_v2_4Bpp"] = (df["PI_base_ctx"] + df["EndBonus"] + df["DomBonus"] + df["WinBonus"] + df["Corr_final"]).clip(0, 1)
 
-    # Context move tag
+    # Context delta (for tags)
+    prof_w = trip_profile(distance_m)
     df["PI_base_plain"] = (
-        df["s_F200%"] * prof["wF200"] +
-        df["s_tsSPI%"] * prof["wSPI"] +
-        df["s_Accel%"] * prof["wACC"] +
-        df["s_Grind%"] * prof["wGR"]
+        df["s_F200%"] * prof_w["wF200"] +
+        df["s_tsSPI%"] * prof_w["wSPI"] +
+        df["s_Accel%"] * prof_w["wACC"] +
+        df["s_Grind%"] * prof_w["wGR"]
     )
     df["CTX_delta"] = df["PI_base_ctx"] - df["PI_base_plain"]
 
@@ -441,7 +422,6 @@ def compute_pi_v24_bpp(df: pd.DataFrame, distance_m: int) -> pd.DataFrame:
         if r["CTX_delta"] <= -0.007: t.append("[CTX-]")
         if r["TBB"] >= 0.012: t.append("[BAL+]")
         if r["Spread_s"] >= 0.008: t.append("[LOPS]")
-        # Winner protection fired if Corr_final > Corr_capped (i.e., soft cap raised result)
         if r["Corr_final"] > r["Corr_capped"] + 1e-9: t.append("[SAFE]")
         return " ".join(t) if t else ""
 
@@ -449,6 +429,7 @@ def compute_pi_v24_bpp(df: pd.DataFrame, distance_m: int) -> pd.DataFrame:
 
     # Narrative line (short)
     def _note_text(r):
+        EHI, SHI = context_indices(df)
         shape = "fast-early" if EHI > 0.5 else ("slow-early / sprint-home" if EHI < -0.5 else "even tempo")
         bits = [f"Race shape: {shape}; weights favoured " + ("Accel" if (EHI < -0.5) else ("Grind" if (EHI > 0.5) else "balance")) + "."]
         prof_str = []
@@ -700,11 +681,13 @@ except Exception as e:
     if DEBUG: st.exception(e)
     st.stop()
 
-# Display metrics
+# =========================
+# Metrics table (no notes)
+# =========================
 show_cols = [
     "Horse","Finish_Pos","RaceTime_s","Margin_L",
     "F200%","tsSPI%","Accel%","Grind%",
-    "PI_base_ctx","BMP_s","IS_s","Spread_s","TBB","CTX_delta","PI_v2_4Bpp","Notes_Tag","Notes_Text"
+    "PI_base_ctx","BMP_s","IS_s","Spread_s","TBB","CTX_delta","PI_v2_4Bpp"
 ]
 disp = work.copy()
 for c in ["RaceTime_s","Margin_L","F200%","tsSPI%","Accel%","Grind%",
@@ -715,7 +698,51 @@ for c in ["RaceTime_s","Margin_L","F200%","tsSPI%","Accel%","Grind%",
 st.subheader("Sectional Metrics (new system + PI v2.4-B++)")
 st.dataframe(disp[show_cols].sort_values(["PI_v2_4Bpp"], ascending=False), width="stretch")
 
+# ======================================
+# Runner-by-runner analysis (narratives)
+# ======================================
+st.subheader("Runner-by-Runner Analysis")
+
+ordered = work.copy().sort_values(["PI_v2_4Bpp","Finish_Pos"], ascending=[False, True])
+
+def _fmt_pct(x):  return "—" if pd.isna(x) else f"{x:.1f}%"
+def _fmt_pi(x):   return "—" if pd.isna(x) else f"{x:.3f}"
+def _fmt_len(x):  return "—" if pd.isna(x) else f"{x:.1f}L"
+
+for _, r in ordered.iterrows():
+    name = str(r.get("Horse", "Runner"))
+    fin  = r.get("Finish_Pos", np.nan)
+    pi   = r.get("PI_v2_4Bpp", np.nan)
+    tags = str(r.get("Notes_Tag","")).strip()
+    note = str(r.get("Notes_Text","")).strip()
+
+    # Header line: Name — Finish — PI — Tags
+    header_bits = [f"**{name}**"]
+    header_bits.append(f"Finish: **{int(fin)}**" if not pd.isna(fin) else "Finish: —")
+    header_bits.append(f"PI: **{_fmt_pi(pi)}**")
+    if tags:
+        header_bits.append(tags)
+    st.markdown(" • ".join(header_bits))
+
+    # Quick sectional cues (same 4 metrics)
+    f200  = _fmt_pct(r.get("F200%", np.nan))
+    tsspi = _fmt_pct(r.get("tsSPI%", np.nan))
+    acc   = _fmt_pct(r.get("Accel%", np.nan))
+    grd   = _fmt_pct(r.get("Grind%", np.nan))
+    margin = _fmt_len(r.get("Margin_L", np.nan))
+
+    st.markdown(
+        f"- F200: **{f200}** | tsSPI: **{tsspi}** | Accel: **{acc}** | Grind: **{grd}** | Margin: **{margin}**"
+    )
+
+    if note:
+        st.markdown(f"> {note}")
+
+    st.markdown("---")
+
+# =========================
 # Charts
+# =========================
 st.subheader("PI Ranking")
 chart_pi_bar(work)
 
@@ -727,8 +754,8 @@ chart_pace_curve_200m(work, int(distance_m), manual_mode,
                       overlays=overlays, smooth=smooth, normalize=normalize)
 
 st.caption(
-    "Definitions: F200% = first 200 m vs race avg; tsSPI% = sustained mid-race pace (excl. first 200 m & last 400 m); "
-    "Accel% = 200→100 vs mid; Grind% = final 100 vs race avg. "
-    "PI v2.4-B++ adds context-aware weights (EHI/SHI), graded triple-balance bonus, and balanced penalties (below-median, imbalance, spread) "
-    "with winner protection, small-field damping, and zero-MAD guards."
+    "Definitions: F200% = first 200 m vs race avg; tsSPI% = sustained mid-race pace "
+    "(excl. first 200 m & last 400 m); Accel% = 200→100 vs mid; Grind% = final 100 vs race avg. "
+    "PI v2.4-B++ adds context-aware weights (EHI/SHI), graded triple-balance bonus, and balanced penalties "
+    "(below-median, imbalance, spread) with winner protection, small-field damping, and zero-MAD guards."
 )
