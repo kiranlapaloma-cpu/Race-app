@@ -333,49 +333,27 @@ def compute_GPI(df_sec_pi: pd.DataFrame, distance_m: float) -> pd.DataFrame:
 RE_SEG = re.compile(r"^(\d+)_Time$")
 
 def extract_segment_columns(df: pd.DataFrame):
-    """
-    Find per-segment time columns like '1400_Time', '1300_Time', ..., '100_Time', 'Finish_Time'.
-    Returns list of (start_marker_m, colname) sorted from race start → finish.
-    """
     segs = []
     for c in df.columns:
         m = RE_SEG.match(str(c))
         if m:
             segs.append((int(m.group(1)), c))
-    # include 'Finish_Time' as 0→finish segment if present
     if "Finish_Time" in df.columns:
         segs.append((0, "Finish_Time"))
-
     if not segs: return []
-
-    # sort from largest marker (near the start) to 0
     segs = sorted(segs, key=lambda x: x[0], reverse=True)
-
-    # infer segment length (100 or 200)
     markers = [m for m, _ in segs if m != 0]
     if len(markers) >= 2:
         diffs = np.diff(markers)
         step = int(abs(pd.Series(diffs).mode().iloc[0]))
     else:
-        step = 100  # default
-
-    # Build x positions from 0→distance in meters covered
-    # Convert markers (distance-from-finish style) to distance-from-start edges
-    # We want speeds plotted at segment midpoints along 0..distance
+        step = 100
     return segs, step
 
 def build_pace_curves(df: pd.DataFrame, distance_m: float):
-    """
-    Returns:
-      x_m (array of segment midpoints from 0..distance),
-      avg_speed (field average),
-      per_horse (dict name -> speeds array)
-    Works with 100m or 200m splits when present; falls back to 2-point curve otherwise.
-    """
     seg_info = extract_segment_columns(df)
     if not seg_info:
-        # fallback to mid vs final 2-point curve
-        x = np.array([distance_m - 600, distance_m - 200])  # just to draw something monotonic
+        x = np.array([distance_m - 600, distance_m - 200])
         avg = np.array([df["Mid400_Speed"].mean(), df["Final400_Speed"].mean()])
         per = {}
         for _, r in df.iterrows():
@@ -383,37 +361,107 @@ def build_pace_curves(df: pd.DataFrame, distance_m: float):
         return x, avg, per
 
     (segs, step) = seg_info
-    # Build speeds per segment (distance / time)
     distances = []
-    for i, (marker, col) in enumerate(segs):
-        if col == "Finish_Time":
-            dist = step if len(segs) >= 2 else 100
-        else:
-            # segment covers [marker, marker-step]
-            dist = step
-        distances.append(dist)
-
-    # x positions = cumulative from start, at segment midpoints
+    for (marker, col) in segs:
+        distances.append(step if col != "Finish_Time" or len(segs) >= 2 else 100)
     x_edges = np.cumsum(distances)
     x_mid = x_edges - (np.array(distances) / 2.0)
 
-    # speeds per runner
     per = {}
     mat = []
     for _, r in df.iterrows():
         sp = []
         for (marker, col), dist in zip(segs, distances):
             t = r.get(col, np.nan)
-            try:
-                val = float(t)
-            except Exception:
-                val = np.nan
+            try: val = float(t)
+            except Exception: val = np.nan
             sp.append(dist / val if pd.notna(val) and val > 0 else np.nan)
-        per[str(r.get("Horse", "Runner"))] = np.array(sp, dtype=float)
-        mat.append(per[str(r.get("Horse", "Runner"))])
-
+        arr = np.array(sp, dtype=float)
+        per[str(r.get("Horse", "Runner"))] = arr
+        mat.append(arr)
     avg = np.nanmean(np.vstack(mat), axis=0)
     return x_mid, avg, per
+
+# ------------------------
+# Narrative helpers
+# ------------------------
+def thresholds_for_distance(distance_m: float):
+    if distance_m <= 1200:
+        return dict(k_high=0.75, g_high=0.60, ts_high=0.70, low=0.35, mid=0.50)
+    if distance_m <= 1600:
+        return dict(k_high=0.70, g_high=0.70, ts_high=0.70, low=0.40, mid=0.50)
+    if distance_m <= 2000:
+        return dict(k_high=0.65, g_high=0.75, ts_high=0.70, low=0.40, mid=0.50)
+    return dict(k_high=0.60, g_high=0.80, ts_high=0.70, low=0.40, mid=0.50)
+
+def classify_trip_pace(row, thr):
+    pK = float(row.get("p_Accel", np.nan))
+    pG = float(row.get("p_Grind", np.nan))
+    pM = float(row.get("p_tsSPI", np.nan))
+    pF = float(row.get("p_F200", np.nan))
+
+    wants = "Trip okay"
+    if pG >= thr["g_high"] and (pK <= thr["mid"] or pF <= thr["mid"]):
+        wants = "Wants further"
+    elif pK >= thr["k_high"] and pG <= thr["low"]:
+        wants = "Wants shorter"
+
+    pace = "Pace-agnostic"
+    if pM >= thr["ts_high"] and pK <= thr["mid"]:
+        pace = "Wants faster early (genuine tempo)"
+    elif pK >= thr["k_high"] and pM <= thr["mid"]:
+        pace = "Prefers slower early (sit-and-sprint)"
+
+    ride = "Flexible ride"
+    if pF >= 0.65 and pM >= thr["mid"]:
+        ride = "Forward/handy suits"
+    elif pF <= 0.35 and pK >= thr["mid"]:
+        ride = "Cold ride / cover then burst"
+
+    return wants, pace, ride
+
+def pi_gpi_note(row):
+    pi = float(row.get("PI", np.nan))
+    gpi = float(row.get("GPI", np.nan))
+    # simple buckets
+    if np.isnan(gpi): gband = "—"
+    elif gpi >= 8.0: gband = "Group-class potential"
+    elif gpi >= 6.0: gband = "Group-placed potential"
+    elif gpi >= 4.0: gband = "Progressing / city-level"
+    else: gband = "Needs to prove more"
+
+    return f"PI {pi:.2f}; GPI {gpi:.2f} ({gband})."
+
+def contribution_note(row):
+    parts = []
+    for k, col, label in [("F200","C_F200","F200"), ("tsSPI","C_tsSPI","tsSPI"), ("Accel","C_Accel","Kick"), ("Grind","C_Grind","Grind")]:
+        v = row.get(col, np.nan)
+        if not pd.isna(v):
+            parts.append(f"{label} {v*100:.0f}%")
+    if parts:
+        return "PI mix: " + ", ".join(parts) + "."
+    return "PI mix: —"
+
+def metric_pct_line(row):
+    def pct(x): 
+        try: return f"{x*100:.0f}%"
+        except: return "—"
+    return (
+        f"Kick {pct(row.get('Accel'))}, Grind {pct(row.get('Grind'))}, "
+        f"tsSPI {pct(row.get('tsSPI'))}, F200 {pct(row.get('F200'))}."
+    )
+
+def runner_paragraph(row, distance_m: float):
+    thr = thresholds_for_distance(distance_m)
+    wants, pace, ride = classify_trip_pace(row, thr)
+    notes = [
+        f"**{str(row.get('Horse',''))}** — Finish: **{int(row['Finish_Pos']) if pd.notna(row.get('Finish_Pos')) else '—'}**",
+        pi_gpi_note(row),
+        contribution_note(row),
+        metric_pct_line(row),
+        f"Trip: {wants}. Pace shape: {pace}. Ride: {ride}."
+    ]
+    return "  \n".join(notes)
 
 # ------------------------
 # UI ingest
@@ -554,7 +602,6 @@ st.pyplot(fig2)
 # ------------------------
 st.subheader("Top 8 by PI — Contribution Breakdown")
 top8 = gpi_df.sort_values("PI", ascending=False).head(8).copy()
-# shares * PI to show stacked height equals PI
 for k, col in [("F200","C_F200"), ("tsSPI","C_tsSPI"), ("Kick","C_Accel"), ("Grind","C_Grind")]:
     if col in top8.columns:
         top8[f"{k}_part"] = top8[col] * top8["PI"]
@@ -577,6 +624,19 @@ ax3.set_xlabel("PI (0–10)")
 ax3.set_title("Top 8 — PI Contribution Breakdown")
 ax3.legend(loc="lower right")
 st.pyplot(fig3)
+
+# ------------------------
+# NEW: Runner-by-Runner Analysis
+# ------------------------
+st.subheader("Runner-by-Runner Analysis")
+ordered = gpi_df.sort_values(["PI", "Finish_Pos"], ascending=[False, True]).reset_index(drop=True)
+for _, row in ordered.iterrows():
+    try:
+        st.markdown(runner_paragraph(row, distance_m))
+        st.markdown("---")
+    except Exception as e:
+        if DEBUG:
+            st.write(f"Note generation failed for {row.get('Horse','?')}: {e}")
 
 st.caption(
     "PI v2.4-B+: distance-aware blend of F200 / tsSPI / Kick / Grind → robust-z → logistic (0–10). "
