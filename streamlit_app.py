@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Race Edge — PI v2.4-B+ & GPI v0.95", layout="wide")
+st.set_page_config(page_title="Race Edge — PI v2.4-B+ / GPI v0.95 + Hidden Horses", layout="wide")
 
 # ------------------------
 # Sidebar / Debug helpers
@@ -22,9 +22,15 @@ def _dbg(label, obj=None):
         if obj is not None:
             st.write(obj)
 
-# ------------------------
-# Generic utils
-# ------------------------
+def relu(x):
+    return np.maximum(0.0, x)
+
+def winsorize(s: pd.Series, p_lo=5, p_hi=95) -> pd.Series:
+    if s is None or len(s) == 0:
+        return s
+    lo, hi = np.nanpercentile(s, [p_lo, p_hi])
+    return s.clip(lo, hi)
+
 def robust_z(x: pd.Series) -> pd.Series:
     med = np.nanmedian(x)
     mad = np.nanmedian(np.abs(x - med))
@@ -33,17 +39,8 @@ def robust_z(x: pd.Series) -> pd.Series:
         sigma = 1.0
     return (x - med) / sigma
 
-def winsorize(s: pd.Series, p_lo=5, p_hi=95) -> pd.Series:
-    if s is None or len(s) == 0:
-        return s
-    lo, hi = np.nanpercentile(s, [p_lo, p_hi])
-    return s.clip(lo, hi)
-
 def to_pct_rank(s: pd.Series) -> pd.Series:
     return s.rank(pct=True, method="average")
-
-def relu(x):
-    return np.maximum(0.0, x)
 
 def round_up_200(x):
     x = int(x)
@@ -59,24 +56,21 @@ def sec_per_length_for_distance(distance_m: float) -> float:
 # ------------------------
 def parse_race_time(val):
     """
-    Robust parser for race times. Accepts:
+    Accepts:
       • seconds:         73.30
       • M:SS.ms:         1:49.540
-      • M:SS:ms|cs:      1:49:540   (milliseconds/centiseconds/tenths)
-      • vendor numerics: 7330 (centiseconds), 73300 (milliseconds)
+      • M:SS:ms|cs:      1:49:540
+      • vendor numerics: 7330 (cs), 73300 (ms)
     Returns seconds (float).
     """
     if pd.isna(val): return np.nan
     s = str(val).strip()
-
     if ":" in s:
         parts = s.split(":")
         if len(parts) == 2:
             m, sec = parts
-            try:
-                return int(m) * 60 + float(sec)
-            except Exception:
-                return np.nan
+            try: return int(m) * 60 + float(sec)
+            except: return np.nan
         if len(parts) == 3:
             m_str, ss_str, frac_str = parts
             try:
@@ -85,14 +79,12 @@ def parse_race_time(val):
                 elif len(frac_str) == 2: frac = int(frac_str) / 100.0
                 else: frac = int(frac_str) / 10.0
                 return m * 60 + ss + frac
-            except Exception:
+            except:
                 return np.nan
-
     try:
         x = float(s)
-    except Exception:
+    except:
         return np.nan
-
     if 5000 <= x < 20000:   # centiseconds
         return x / 100.0
     if 50000 <= x < 200000: # milliseconds
@@ -100,15 +92,14 @@ def parse_race_time(val):
     return x
 
 def normalize_time_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    """Downscale vendor centiseconds/milliseconds to seconds where needed."""
     out = df.copy()
     for c in cols:
         if c not in out.columns: continue
         out[c] = pd.to_numeric(out[c], errors="coerce")
         med = out[c].median()
-        if 100 <= med < 20000:        # likely centiseconds
+        if 100 <= med < 20000:
             out[c] = out[c] / 100.0
-        elif 10000 <= med < 200000:   # likely milliseconds
+        elif 10000 <= med < 200000:
             out[c] = out[c] / 1000.0
     return out
 
@@ -121,7 +112,7 @@ def build_manual_template(distance_m: int, n_horses: int) -> pd.DataFrame:
     base = pd.DataFrame({"Marker_m": rows})
     for i in range(1, n_horses+1):
         base[f"H{i}_Pos"] = np.nan
-        base[f"H{i}_Time"] = np.nan  # per-200m segment time
+        base[f"H{i}_Time"] = np.nan
     return base
 
 def manual_compute_longform_to_wide(man_df: pd.DataFrame, horse_names: list, distance_m: int) -> pd.DataFrame:
@@ -130,7 +121,6 @@ def manual_compute_longform_to_wide(man_df: pd.DataFrame, horse_names: list, dis
     for idx, name in enumerate(horse_names, start=1):
         hpos = pd.to_numeric(df.get(f"H{idx}_Pos"), errors="coerce")
         hseg = pd.to_numeric(df.get(f"H{idx}_Time"), errors="coerce")
-
         race_time = float(np.nansum([t for t in hseg if not pd.isna(t)])) if len(hseg) else np.nan
 
         def seg_time_for_span(start_m, end_m):
@@ -177,8 +167,6 @@ def pi_weights(distance_m: float):
 
 def build_sectionals(df: pd.DataFrame, distance_m: float) -> pd.DataFrame:
     out = df.copy()
-
-    # Race time from "Race Time" when present
     if "Race Time" in out.columns:
         out["RaceTime_s"] = out["Race Time"].apply(parse_race_time)
     elif "RaceTime_s" in out.columns:
@@ -187,22 +175,18 @@ def build_sectionals(df: pd.DataFrame, distance_m: float) -> pd.DataFrame:
         tcols = [c for c in out.columns if c.endswith("_Time") and c.split("_")[0].isdigit()]
         if tcols: out["RaceTime_s"] = out[tcols].sum(axis=1)
 
-    # Downscale vendor numerics if needed
     med_rt = pd.to_numeric(out["RaceTime_s"], errors="coerce").median()
     if 5000 <= med_rt < 20000: out["RaceTime_s"] = out["RaceTime_s"] / 100.0
     elif 50000 <= med_rt < 200000: out["RaceTime_s"] = out["RaceTime_s"] / 1000.0
 
     out["Race_AvgSpeed"] = distance_m / out["RaceTime_s"]
 
-    # Normalize common window columns
     out = normalize_time_columns(out, ["800-400", "400-Finish", "100_Time", "200_Time", "300_Time", "Finish_Time"])
-
-    # Derived speeds
     out["Mid400_Speed"]   = np.where(out["800-400"].notna(), 400.0 / out["800-400"], np.nan)
     out["Final400_Speed"] = np.where(out["400-Finish"].notna(), 400.0 / out["400-Finish"], np.nan)
     out["tsSPI"]          = out["Mid400_Speed"] / out["Race_AvgSpeed"]
 
-    # F200 from the race start (find two earliest segment columns)
+    # F200: earliest 200m from start (use explicit columns if present else two earliest _Time)
     cols = out.columns.tolist()
     def _first200_cols(distance_m: float, cols: list[str]):
         a = f"{int(distance_m)-100}_Time"; b = f"{int(distance_m)-200}_Time"
@@ -231,9 +215,6 @@ def build_sectionals(df: pd.DataFrame, distance_m: float) -> pd.DataFrame:
     return out
 
 def compute_PI(df_sec: pd.DataFrame, distance_m: float) -> pd.DataFrame:
-    """
-    PI v2.4-B+; also returns contribution shares (C_F200, C_tsSPI, C_Accel, C_Grind) for stacked bar.
-    """
     out = df_sec.copy()
     for col in ["F200", "tsSPI", "Accel", "Grind"]:
         if col in out.columns: out[col] = winsorize(out[col])
@@ -241,7 +222,6 @@ def compute_PI(df_sec: pd.DataFrame, distance_m: float) -> pd.DataFrame:
     w = pi_weights(distance_m)
     parts_list = []
     vals = []
-
     for _, r in out.iterrows():
         wparts = {}
         wsum = 0.0
@@ -260,11 +240,11 @@ def compute_PI(df_sec: pd.DataFrame, distance_m: float) -> pd.DataFrame:
     k = 0.9
     out["PI"] = 10.0 * (1.0 / (1.0 + np.exp(-k * z)))
 
-    # contribution shares (sum to 1 when possible)
+    # contribution shares
     C_F200, C_ts, C_Acc, C_Gr = [], [], [], []
     for wparts in parts_list:
         tot = sum(wparts.values())
-        if tot and tot != 0:
+        if tot:
             C_F200.append(wparts.get("F200", 0.0) / tot)
             C_ts.append(wparts.get("tsSPI", 0.0) / tot)
             C_Acc.append(wparts.get("Accel", 0.0) / tot)
@@ -278,9 +258,7 @@ def compute_PI(df_sec: pd.DataFrame, distance_m: float) -> pd.DataFrame:
     return out
 
 def compute_GPI(df_sec_pi: pd.DataFrame, distance_m: float) -> pd.DataFrame:
-    """GPI v0.95 — only added as a column (no visuals)."""
     out = df_sec_pi.copy()
-
     out["p_F200"]  = to_pct_rank(out["F200"])
     out["p_tsSPI"] = to_pct_rank(out["tsSPI"])
     out["p_Accel"] = to_pct_rank(out["Accel"])
@@ -325,6 +303,82 @@ def compute_GPI(df_sec_pi: pd.DataFrame, distance_m: float) -> pd.DataFrame:
     GPI01 = (0.15 * out["p_PI"] + 0.35 * BALp + 0.30 * SEPP + 0.10 * DWB + 0.10 * STRESS + WINB + PLCB)
     one_trick = (spread > 0.35).astype(float) * 0.03
     out["GPI"] = (np.clip(GPI01 - one_trick, 0, 1) * 10.0).round(3)
+    return out
+
+# ------------------------
+# Hidden Horses: RSS + HAS + ASI (dual band)
+# ------------------------
+def compute_RSS_HAS_ASI(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    # --- RSS (relative to field best per metric)
+    metrics = ["F200", "tsSPI", "Accel", "Grind"]
+    # ensure numeric
+    for m in metrics:
+        if m in out.columns:
+            out[m] = pd.to_numeric(out[m], errors="coerce")
+    field_best = {m: out[m].max() if m in out.columns else np.nan for m in metrics}
+    def rss_row(r):
+        vals = []
+        for m in metrics:
+            b = field_best.get(m, np.nan)
+            v = r.get(m, np.nan)
+            if pd.notna(v) and pd.notna(b) and b > 0:
+                vals.append((v / b) * 100.0)
+        return float(np.mean(vals)) if vals else np.nan
+    out["RSS"] = out.apply(rss_row, axis=1)
+
+    # --- pace shape (using medians)
+    f200_med = out["F200"].median()
+    tsspi_med = out["tsSPI"].median()
+    if f200_med >= 105:
+        shape = "fast"
+    elif tsspi_med <= 95:
+        shape = "slow"
+    else:
+        shape = "even"
+    out["RaceShape"] = shape
+
+    # --- HAS (>=2 checks)
+    meds = {m: out[m].median() for m in metrics}
+    def has_row(r):
+        checks = 0
+        if r["RSS"] >= 97: checks += 1
+        if shape == "slow" and r["Accel"] > meds["Accel"]: checks += 1
+        if shape == "fast" and r["Grind"] > meds["Grind"]: checks += 1
+        if (r["Accel"] > meds["Accel"]) or (r["Grind"] > meds["Grind"]): checks += 1
+        return bool(checks >= 2)
+    out["HAS"] = out.apply(has_row, axis=1)
+
+    # --- ASI (dual band)
+    if shape == "fast":
+        denom = out["Grind"].median()
+        out["ASI"] = (out["Grind"] / denom) * 100.0
+    elif shape == "slow":
+        denom = out["Accel"].median()
+        out["ASI"] = (out["Accel"] / denom) * 100.0
+    else:
+        denomK = out["Accel"].median()
+        denomG = out["Grind"].median()
+        out["ASI"] = 0.5 * (out["Accel"] / denomK + out["Grind"] / denomG) * 100.0
+
+    def asi_band(v):
+        if pd.isna(v): return ""
+        if v >= 108: return "🔥 strong"
+        if v >= 103: return "🟡 mild"
+        return ""
+    out["ASI_Band"] = out["ASI"].apply(asi_band)
+
+    # concise reason for table
+    def hh_reason(r):
+        bits = []
+        if r["HAS"]: bits.append("HAS")
+        if isinstance(r["ASI_Band"], str) and r["ASI_Band"]:
+            bits.append(f"ASI {r['ASI_Band']}")
+        if r["RSS"] >= 97: bits.append("RSS≥97")
+        return ", ".join(bits) if bits else "—"
+    out["Hidden_Reason"] = out.apply(hh_reason, axis=1)
+
     return out
 
 # ------------------------
@@ -383,7 +437,7 @@ def build_pace_curves(df: pd.DataFrame, distance_m: float):
     return x_mid, avg, per
 
 # ------------------------
-# Narrative helpers
+# Narrative helpers (trip/pace/ride + ASI badges)
 # ------------------------
 def thresholds_for_distance(distance_m: float):
     if distance_m <= 1200:
@@ -423,13 +477,11 @@ def classify_trip_pace(row, thr):
 def pi_gpi_note(row):
     pi = float(row.get("PI", np.nan))
     gpi = float(row.get("GPI", np.nan))
-    # simple buckets
     if np.isnan(gpi): gband = "—"
     elif gpi >= 8.0: gband = "Group-class potential"
     elif gpi >= 6.0: gband = "Group-placed potential"
     elif gpi >= 4.0: gband = "Progressing / city-level"
     else: gband = "Needs to prove more"
-
     return f"PI {pi:.2f}; GPI {gpi:.2f} ({gband})."
 
 def contribution_note(row):
@@ -438,24 +490,24 @@ def contribution_note(row):
         v = row.get(col, np.nan)
         if not pd.isna(v):
             parts.append(f"{label} {v*100:.0f}%")
-    if parts:
-        return "PI mix: " + ", ".join(parts) + "."
-    return "PI mix: —"
+    return "PI mix: " + (", ".join(parts) if parts else "—") + "."
 
 def metric_pct_line(row):
-    def pct(x): 
+    def pct(x):
         try: return f"{x*100:.0f}%"
         except: return "—"
     return (
         f"Kick {pct(row.get('Accel'))}, Grind {pct(row.get('Grind'))}, "
-        f"tsSPI {pct(row.get('tsSPI'))}, F200 {pct(row.get('F200'))}."
+        f"tsSPI {pct(row.get('tsSPI'))}, F200 {pct(row.get('F200'))}; "
+        f"RSS {row.get('RSS', np.nan):.1f}; ASI {row.get('ASI', np.nan):.1f} {row.get('ASI_Band','')}"
     )
 
 def runner_paragraph(row, distance_m: float):
     thr = thresholds_for_distance(distance_m)
     wants, pace, ride = classify_trip_pace(row, thr)
+    asi_badge = f" {row.get('ASI_Band','')}" if isinstance(row.get('ASI_Band',''), str) and row.get('ASI_Band','') else ""
     notes = [
-        f"**{str(row.get('Horse',''))}** — Finish: **{int(row['Finish_Pos']) if pd.notna(row.get('Finish_Pos')) else '—'}**",
+        f"**{str(row.get('Horse',''))}** — Finish: **{int(row['Finish_Pos']) if pd.notna(row.get('Finish_Pos')) else '—'}**{asi_badge}",
         pi_gpi_note(row),
         contribution_note(row),
         metric_pct_line(row),
@@ -466,8 +518,8 @@ def runner_paragraph(row, distance_m: float):
 # ------------------------
 # UI ingest
 # ------------------------
-st.title("🏇 Race Edge — PI v2.4-B+ & GPI v0.95")
-st.caption("Upload CSV/XLSX (100m splits preferred) or use Manual mode (200m grid). Calculates sectionals, PI (0–10), and GPI (0–10).")
+st.title("🏇 Race Edge — PI v2.4-B+ / GPI v0.95 + Hidden Horses (RSS • HAS • ASI)")
+st.caption("Upload CSV/XLSX (100m splits preferred) or use Manual mode (200m grid). Adds RSS/HAS/ASI with dual-band ASI highlighting.")
 
 with st.sidebar:
     mode = st.radio("Data Source", ["Upload file", "Manual input"], index=0)
@@ -535,6 +587,7 @@ try:
     sec = build_sectionals(work, distance_m)
     pi_df = compute_PI(sec, distance_m)
     gpi_df = compute_GPI(pi_df, distance_m)
+    hh_df  = compute_RSS_HAS_ASI(gpi_df)
 
 except Exception as e:
     st.error("Metric computation failed.")
@@ -545,14 +598,14 @@ except Exception as e:
 # Outputs: table
 # ------------------------
 st.subheader("Sectional Metrics (PI & GPI)")
-disp_cols = ["Horse", "Finish_Pos", "RaceTime_s", "F200", "tsSPI", "Accel", "Grind", "PI", "GPI"]
-present = [c for c in disp_cols if c in gpi_df.columns]
-disp = gpi_df[present].copy()
+disp_cols = ["Horse", "Finish_Pos", "RaceTime_s", "F200", "tsSPI", "Accel", "Grind", "PI", "GPI", "RSS", "ASI"]
+present = [c for c in disp_cols if c in hh_df.columns]
+disp = hh_df[present].copy()
 
 for c in ["F200", "tsSPI", "Accel", "Grind"]:
     if c in disp.columns: disp[c] = (disp[c] * 100.0).round(2)
-if "PI" in disp.columns:  disp["PI"]  = disp["PI"].round(3)
-if "GPI" in disp.columns: disp["GPI"] = disp["GPI"].round(3)
+for c in ["PI", "GPI", "RSS", "ASI"]:
+    if c in disp.columns: disp[c] = disp[c].round(3)
 
 disp = disp.sort_values(["PI", "Finish_Pos"], ascending=[False, True])
 st.dataframe(disp, use_container_width=True)
@@ -562,14 +615,15 @@ st.dataframe(disp, use_container_width=True)
 # ------------------------
 st.subheader("Sectional Shape Map — Kick (Accel) vs Grind")
 fig, ax = plt.subplots()
-x = gpi_df["Accel"] * 100.0
-y = gpi_df["Grind"] * 100.0
+x = hh_df["Accel"] * 100.0
+y = hh_df["Grind"] * 100.0
 ax.scatter(x, y, s=60, alpha=0.9)
 if x.notna().any(): ax.axvline(x.median(), linestyle="--", alpha=0.4)
 if y.notna().any(): ax.axhline(y.median(), linestyle="--", alpha=0.4)
-for _, r in gpi_df.iterrows():
+for _, r in hh_df.iterrows():
     if pd.isna(r.get("Accel")) or pd.isna(r.get("Grind")): continue
-    ax.annotate(str(r.get("Horse", "")),
+    label = str(r.get("Horse", ""))
+    ax.annotate(label,
                 xy=(r["Accel"] * 100.0, r["Grind"] * 100.0),
                 xytext=(5, 5), textcoords="offset points",
                 arrowprops=dict(arrowstyle="-", lw=0.5, alpha=0.5))
@@ -580,13 +634,13 @@ ax.grid(True, linestyle="--", alpha=0.3)
 st.pyplot(fig)
 
 # ------------------------
-# Visual 2: Full-Race Pace Curves
+# Visual 2: Full-Race Pace Curves — Field avg + Top 8 finishers
 # ------------------------
 st.subheader("Full-Race Pace Curves — Field Average (black) + Top 8 Finishers")
-x_mid, avg_speed, per_horse = build_pace_curves(gpi_df, distance_m)
+x_mid, avg_speed, per_horse = build_pace_curves(hh_df, distance_m)
 fig2, ax2 = plt.subplots()
 ax2.plot(x_mid, avg_speed, marker="o", linewidth=3, color="black", label="Average (Field)")
-top8_names = gpi_df.sort_values("Finish_Pos").head(8)["Horse"].astype(str).tolist()
+top8_names = hh_df.sort_values("Finish_Pos").head(8)["Horse"].astype(str).tolist()
 for name in top8_names:
     if name in per_horse:
         ax2.plot(x_mid, per_horse[name], marker="o", linewidth=2, label=name)
@@ -601,7 +655,7 @@ st.pyplot(fig2)
 # Visual 3: Top-8 PI stacked by contributions
 # ------------------------
 st.subheader("Top 8 by PI — Contribution Breakdown")
-top8 = gpi_df.sort_values("PI", ascending=False).head(8).copy()
+top8 = hh_df.sort_values("PI", ascending=False).head(8).copy()
 for k, col in [("F200","C_F200"), ("tsSPI","C_tsSPI"), ("Kick","C_Accel"), ("Grind","C_Grind")]:
     if col in top8.columns:
         top8[f"{k}_part"] = top8[col] * top8["PI"]
@@ -614,22 +668,34 @@ b1 = top8["F200_part"].iloc[::-1]
 b2 = top8["tsSPI_part"].iloc[::-1]
 b3 = top8["Kick_part"].iloc[::-1]
 b4 = top8["Grind_part"].iloc[::-1]
-
 ax3.barh(labels, b1, label="F200")
 ax3.barh(labels, b2, left=b1, label="tsSPI")
 ax3.barh(labels, b3, left=(b1+b2), label="Kick")
 ax3.barh(labels, b4, left=(b1+b2+b3), label="Grind")
-
 ax3.set_xlabel("PI (0–10)")
 ax3.set_title("Top 8 — PI Contribution Breakdown")
 ax3.legend(loc="lower right")
 st.pyplot(fig3)
 
 # ------------------------
-# NEW: Runner-by-Runner Analysis
+# NEW: Hidden Horses (RSS + HAS) + ASI band
+# ------------------------
+st.subheader("Hidden Horses — RSS & HAS (with ASI bands)")
+hidden = hh_df.loc[hh_df["HAS"] == True].copy()
+if hidden.empty:
+    st.write("No hidden horses flagged today under RSS/HAS rules.")
+else:
+    tbl = hidden[["Horse","Finish_Pos","RSS","ASI","ASI_Band","Hidden_Reason"]].copy()
+    tbl["RSS"] = tbl["RSS"].round(1)
+    tbl["ASI"] = tbl["ASI"].round(1)
+    tbl = tbl.sort_values(["RSS","ASI"], ascending=[False, False])
+    st.dataframe(tbl, use_container_width=True)
+
+# ------------------------
+# Runner-by-Runner Analysis (with ASI badge)
 # ------------------------
 st.subheader("Runner-by-Runner Analysis")
-ordered = gpi_df.sort_values(["PI", "Finish_Pos"], ascending=[False, True]).reset_index(drop=True)
+ordered = hh_df.sort_values(["PI", "Finish_Pos"], ascending=[False, True]).reset_index(drop=True)
 for _, row in ordered.iterrows():
     try:
         st.markdown(runner_paragraph(row, distance_m))
@@ -640,7 +706,7 @@ for _, row in ordered.iterrows():
 
 st.caption(
     "PI v2.4-B+: distance-aware blend of F200 / tsSPI / Kick / Grind → robust-z → logistic (0–10). "
-    "Stacked bars show each metric’s share of the horse’s PI. "
-    "Full-race pace curves use every available split (100 m or 200 m). "
-    "GPI v0.95 estimates group potential (0–10) from balance/separation with winner/place guards."
+    "GPI v0.95 estimates group potential from balance & separation with winner/place guards. "
+    "Hidden Horses use RSS (vs field best) + HAS checks; ASI shows against-shape strength with dual bands: "
+    "🟡 mild ≥103, 🔥 strong ≥108."
 )
