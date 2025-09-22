@@ -8,16 +8,16 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# ================================
-# App config (no logo)
-# ================================
+# =========================================
+# App config (logo-free for simplicity)
+# =========================================
 st.set_page_config(page_title="Race Edge — Sectional Analysis", layout="wide")
 st.title("🏇 Race Edge — Sectional Analysis")
 st.caption("Pure sectionals: F200 • tsSPI • Acceleration • Grind • PI v2.4-B++ (Consistency Bonus + Class/Result Safeguard).")
 
-# -------------------
-# Sidebar controls
-# -------------------
+# -----------------------------------------
+# Sidebar
+# -----------------------------------------
 with st.sidebar:
     st.header("Data Source")
     source = st.radio("Choose input type", ["Upload CSV", "Manual entry"], index=0)
@@ -28,7 +28,7 @@ with st.sidebar:
         return int(np.ceil(x / 200.0) * 200)
 
     distance_m_grid = round_up_200(distance_m_input)
-    st.caption(f"Manual grid rounds **up** to nearest 200m → **{distance_m_grid}m** (for grid rows / labels).")
+    st.caption(f"Manual grid rounds **up** to nearest 200m → **{distance_m_grid}m** (for grid labels).")
 
     st.divider()
     DEBUG = st.toggle("Debug mode", value=False)
@@ -39,14 +39,14 @@ def _dbg(label, obj=None):
         if obj is not None:
             st.write(obj)
 
-# ================================
+# =========================================
 # Helpers
-# ================================
+# =========================================
 # Accepts: '100', '100_Time', '100 Time', '1400', '1400_Time', '1400 Time', etc.
 TIME_COL_RE = re.compile(r"^(\d+)(?:[_\s]?Time)?$", flags=re.IGNORECASE)
 
 def parse_time(val):
-    """Parse seconds or 'M:SS.sss' into seconds."""
+    """Parse seconds or 'M:SS.sss' → seconds."""
     if pd.isna(val):
         return np.nan
     s = str(val).strip()
@@ -67,31 +67,53 @@ def parse_time(val):
         return np.nan
 
 def safe_div(num, den):
-    if isinstance(num, pd.Series):
-        return num.divide(den).where((den != 0) & den.notna())
-    return np.nan if (den == 0 or pd.isna(den)) else (num / den)
+    """
+    Safe division that works for scalars or Series in any combination.
+    Returns Series when either input is a Series.
+    """
+    num_is_s = isinstance(num, pd.Series)
+    den_is_s = isinstance(den, pd.Series)
+
+    if num_is_s or den_is_s:
+        if not num_is_s and den_is_s:
+            num = pd.Series(float(num), index=den.index)
+        if num_is_s and not den_is_s:
+            den = pd.Series(float(den), index=num.index)
+        num = num.astype(float)
+        den = den.astype(float)
+        out = num / den
+        out[(den == 0) | den.isna()] = np.nan
+        return out
+    # both scalars
+    if pd.isna(den) or den == 0:
+        return np.nan
+    return float(num) / float(den)
 
 def _collect_time_cols(df):
     """
-    Return {int -> colname} for 100m/200m split columns with flexible headers:
-    '100', '100_Time', '100 Time', ..., '1400', '1400_Time', etc.
+    Return {int -> colname} for 100m split columns with flexible headers.
+    Also map 'Finish_Time'/'Finish' to key 0 (final 100 m) for countdown files.
     """
     mapping = {}
     for c in df.columns:
         c_norm = str(c).strip()
+        lc = c_norm.lower().replace(" ", "_")
+        if lc in ("finish_time", "finish"):
+            mapping[0] = c
+            continue
         m = TIME_COL_RE.match(c_norm)
         if m:
             try:
                 d = int(m.group(1))
-                mapping[d] = c  # keep original column name
+                mapping[d] = c
             except:
                 pass
     return mapping
 
 def _collect_200m_cols(df):
     """
-    Return {int -> colname} for 200m splits (forward or countdown numeric headers).
-    E.g., '200','400',... or '1600','1400',...,'0'
+    Return {int -> colname} for 200m splits (forward or countdown numeric headers),
+    e.g., '200','400',... or '1600','1400',...,'0'
     """
     mapping = {}
     for c in df.columns:
@@ -105,19 +127,17 @@ def _collect_200m_cols(df):
 def build_metrics(df_in: pd.DataFrame, distance_m: int):
     """
     Compute RaceTime_s, Race_AvgSpeed, F200%, tsSPI%, Accel%, Grind% from either:
-      • 100m splits with headers like '100_Time','200_Time',... OR countdown style '1400_Time','1300_Time',...,'0'
-      • 200m splits with headers like '200','400',... OR countdown style 'distance-200',...,'0'
+      • 100m splits (forward '100','200',... or countdown '1400','1300',...,'0'/Finish_Time)
+      • 200m splits (forward '200','400',... or countdown 'distance-200',...,'0')
     """
     w = df_in.copy()
-
-    # normalize column names to strings and strip whitespace
     w.columns = [str(c).strip() for c in w.columns]
 
     if DEBUG:
         st.write("🔧 build_metrics: distance_m =", distance_m)
         st.write("🔧 build_metrics: sample columns =", list(w.columns)[:20])
 
-    # Normalize horse/finish
+    # Horse id
     horse_col = None
     for c in ["Horse", "Runner", "Name"]:
         if c in w.columns:
@@ -130,11 +150,10 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int):
     if "Finish_Pos" not in w.columns:
         w["Finish_Pos"] = np.nan
 
-    # Collect split columns
-    cols_100 = _collect_time_cols(w)   # dict[int -> colname] potentially 100m
-    cols_200 = _collect_200m_cols(w)   # dict[int -> colname] for 200m
+    # Collect splits
+    cols_100 = _collect_time_cols(w)
+    cols_200 = _collect_200m_cols(w)
 
-    # Determine forward vs countdown
     def resolve_direction(keys, dm):
         if not keys:
             return "unknown"
@@ -142,7 +161,6 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int):
         has_zero = (0 in keys)
         has_dm = (dm in keys)
         has_100 = (100 in keys)
-        # if 0 exists or max key ≈ dm-100 and dm not present -> countdown
         if has_zero or (abs(max(ks) - max(dm - 100, 0)) <= 20 and not has_dm):
             return "countdown"
         if has_100:
@@ -152,35 +170,26 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int):
     dir100 = resolve_direction(set(cols_100.keys()), distance_m) if cols_100 else "unknown"
     dir200 = resolve_direction(set(cols_200.keys()), distance_m) if cols_200 else "unknown"
 
-    # Mappers: request by forward distance (covered), return the correct column
     def get100(d_forward):
         if not cols_100:
             return None
-        if dir100 == "forward":
-            return cols_100.get(d_forward)
-        if dir100 == "countdown":
-            return cols_100.get(distance_m - d_forward)
-        return None
+        return cols_100.get(d_forward) if dir100 == "forward" else cols_100.get(distance_m - d_forward)
 
     def get200(d_forward):
         if not cols_200:
             return None
-        if dir200 == "forward":
-            return cols_200.get(d_forward)
-        if dir200 == "countdown":
-            return cols_200.get(distance_m - d_forward)
-        return None
+        return cols_200.get(d_forward) if dir200 == "forward" else cols_200.get(distance_m - d_forward)
 
-    # Race time
+    # Race time (sum of splits if not present)
     if "Race Time" in w.columns:
         w["RaceTime_s"] = w["Race Time"].apply(parse_time)
     else:
         if cols_100:
             seg_cols = [cols_100[k] for k in sorted(cols_100.keys())]
-            w["RaceTime_s"] = w[seg_cols].sum(axis=1, skipna=True)
+            w["RaceTime_s"] = w[seg_cols].apply(pd.to_numeric, errors="coerce").sum(axis=1, skipna=True)
         elif cols_200:
             seg_cols = [cols_200[k] for k in sorted(cols_200.keys())]
-            w["RaceTime_s"] = w[seg_cols].sum(axis=1, skipna=True)
+            w["RaceTime_s"] = w[seg_cols].apply(pd.to_numeric, errors="coerce").sum(axis=1, skipna=True)
         else:
             w["RaceTime_s"] = np.nan
 
@@ -188,33 +197,37 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int):
     if w["Finish_Pos"].isna().all() and w["RaceTime_s"].notna().any():
         w["Finish_Pos"] = w["RaceTime_s"].rank(method="min").astype("Int64")
 
-    # Average speed
+    # Average speed (row-wise safe division)
     w["Race_AvgSpeed"] = safe_div(distance_m, w["RaceTime_s"])
 
-    # F200% (first 200 m vs avg)
+    # ---------- F200% (first 200 vs avg) ----------
     f100a, f100b = get100(100), get100(200)
     if f100a and f100b:
         f200_time = pd.to_numeric(w[f100a], errors="coerce") + pd.to_numeric(w[f100b], errors="coerce")
     else:
         f200_col = get200(200)
-        f200_time = pd.to_numeric(w[f200_col], errors="coerce") if f200_col else np.nan
-    f200_speed = safe_div(200.0, f200_time) if isinstance(f200_time, pd.Series) else np.nan
-    w["F200%"] = safe_div(f200_speed, w["Race_AvgSpeed"]) * 100 if isinstance(f200_speed, pd.Series) else np.nan
+        f200_time = pd.to_numeric(w[f200_col], errors="coerce") if f200_col else pd.Series(np.nan, index=w.index)
+    f200_speed = safe_div(200.0, f200_time)
+    w["F200%"] = safe_div(f200_speed, w["Race_AvgSpeed"]) * 100.0
 
-    # Grind% (last 100 preferred, else last 200)
+    # ---------- Grind% (last 100 preferred; else last 200) ----------
     last100_col = get100(distance_m)
+    if not last100_col:
+        finish_like = [c for c in w.columns if str(c).strip().lower().replace(" ", "_") in ("finish_time", "finish")]
+        if finish_like:
+            last100_col = finish_like[0]
     if last100_col:
         g100_speed = safe_div(100.0, pd.to_numeric(w[last100_col], errors="coerce"))
-        w["Grind%"] = safe_div(g100_speed, w["Race_AvgSpeed"]) * 100
+        w["Grind%"] = safe_div(g100_speed, w["Race_AvgSpeed"]) * 100.0
     else:
         last200_col = get200(distance_m)
         if last200_col:
             g200_speed = safe_div(200.0, pd.to_numeric(w[last200_col], errors="coerce"))
-            w["Grind%"] = safe_div(g200_speed, w["Race_AvgSpeed"]) * 100
+            w["Grind%"] = safe_div(g200_speed, w["Race_AvgSpeed"]) * 100.0
         else:
             w["Grind%"] = np.nan
 
-    # tsSPI% (exclude first 200 & last 400)
+    # ---------- tsSPI% (exclude first 200 & last 400) ----------
     if cols_100:
         mids = []
         for d in range(300, max(distance_m - 400, 0) + 1, 100):
@@ -225,7 +238,7 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int):
             mid_time = w[mids].apply(pd.to_numeric, errors="coerce").sum(axis=1, skipna=True)
             mid_dist = 100.0 * len(mids)
             mid_speed = safe_div(mid_dist, mid_time)
-            w["tsSPI%"] = safe_div(mid_speed, w["Race_AvgSpeed"]) * 100
+            w["tsSPI%"] = safe_div(mid_speed, w["Race_AvgSpeed"]) * 100.0
         else:
             w["tsSPI%"] = np.nan
     elif cols_200:
@@ -238,43 +251,39 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int):
             mid_time = w[mids].apply(pd.to_numeric, errors="coerce").sum(axis=1, skipna=True)
             mid_dist = 200.0 * len(mids)
             mid_speed = safe_div(mid_dist, mid_time)
-            w["tsSPI%"] = safe_div(mid_speed, w["Race_AvgSpeed"]) * 100
+            w["tsSPI%"] = safe_div(mid_speed, w["Race_AvgSpeed"]) * 100.0
         else:
             w["tsSPI%"] = np.nan
     else:
         w["tsSPI%"] = np.nan
 
-    # Accel% (kick: 200→100 preferred; else last 200 vs mid)
+    # ---------- Accel% (200→100 vs mid; else last 200 vs mid) ----------
     prev100_col = get100(distance_m - 100)
     if prev100_col:
         a100_speed = safe_div(100.0, pd.to_numeric(w[prev100_col], errors="coerce"))
-        if w["tsSPI%"].notna().any():
-            mid_speed = (w["tsSPI%"] / 100.0) * w["Race_AvgSpeed"]
-            w["Accel%"] = safe_div(a100_speed, mid_speed) * 100
-        else:
-            w["Accel%"] = np.nan
+        mid_speed = safe_div(w["tsSPI%"], 100.0) * w["Race_AvgSpeed"]
+        w["Accel%"] = safe_div(a100_speed, mid_speed) * 100.0
     else:
         last200_col = get200(distance_m)
-        if last200_col and w["tsSPI%"].notna().any():
+        if last200_col:
             fin200_speed = safe_div(200.0, pd.to_numeric(w[last200_col], errors="coerce"))
-            mid_speed = (w["tsSPI%"] / 100.0) * w["Race_AvgSpeed"]
-            w["Accel%"] = safe_div(fin200_speed, mid_speed) * 100
+            mid_speed = safe_div(w["tsSPI%"], 100.0) * w["Race_AvgSpeed"]
+            w["Accel%"] = safe_div(fin200_speed, mid_speed) * 100.0
         else:
             w["Accel%"] = np.nan
 
-    # If nothing computed, raise a clear error
+    # If nothing usable, raise a clear error
     needed = ["F200%", "tsSPI%", "Accel%", "Grind%"]
     if all((col not in w.columns) or w[col].isna().all() for col in needed):
         raise ValueError(
             "No usable split columns detected. Expected 100m headers like '100_Time'/'100 Time'/100 "
-            "or 200m headers like '200','400',...(forward) or countdown style ending at 0."
+            "or 200m headers like '200','400',... (forward) or countdown with 'Finish_Time'/0."
         )
-
     return w
 
-# ================================
-# PI v2.4-B++ + CB + CRS
-# ================================
+# =========================================
+# PI v2.4-B++ + Consistency Bonus + CRS
+# =========================================
 def pi_weights(dist_m: float):
     d = float(dist_m or 1400)
     if d <= 1200:   return dict(F200=0.08, tsSPI=0.30, Accel=0.20, Grind=0.42)
@@ -328,14 +337,12 @@ def pace_trust_flag(w: pd.DataFrame):
     return T
 
 def apply_crs(w: pd.DataFrame, distance_m: int, PI_core_cb: pd.Series):
-    """Class/Result Safeguard: Result Anchor (winner/close placers) + soft floor for winner."""
     if "Finish_Pos" in w.columns and w["Finish_Pos"].notna().any():
         idx_win = w["Finish_Pos"].idxmin()
     else:
         idx_win = w["RaceTime_s"].idxmin()
     t_win = w.loc[idx_win, "RaceTime_s"]
 
-    # convert time-behind to lengths
     sec_per_len = 0.17 if distance_m <= 1200 else (0.18 if distance_m <= 1600 else (0.20 if distance_m <= 2000 else 0.21))
     Lbehind = (w["RaceTime_s"] - t_win) / sec_per_len
 
@@ -372,13 +379,12 @@ def apply_crs(w: pd.DataFrame, distance_m: int, PI_core_cb: pd.Series):
         PI_floor = max(0.64, 0.58 + 0.014 * math.log1p(lb_win))
 
     PI_final = (PI_core_cb + RA).copy()
-    # winner soft-lift (≤ +0.015)
     PI_final.loc[idx_win] = max(PI_final.loc[idx_win], min(PI_floor, PI_final.loc[idx_win] + 0.015))
     return PI_final, RA, T, lb_win
 
-# ================================
-# Runner narratives (short)
-# ================================
+# -----------------------------------------
+# Runner notes (compact)
+# -----------------------------------------
 def short_note(row, med_tsspi, med_accel, med_grind):
     name = str(row["Horse"])
     f200 = row.get("F200%", np.nan)
@@ -389,29 +395,33 @@ def short_note(row, med_tsspi, med_accel, med_grind):
     fin  = row.get("Finish_Pos", np.nan)
 
     tags = []
-    if pd.notna(acc) and acc > np.nanpercentile(metrics["Accel%"], 75): tags.append("Kick")
-    if pd.notna(grd) and grd > np.nanpercentile(metrics["Grind%"], 75): tags.append("Grind")
-    if pd.notna(tsm) and tsm > np.nanpercentile(metrics["tsSPI%"], 75): tags.append("Cruise")
-    if pd.notna(f200) and f200 > np.nanpercentile(metrics["F200%"], 75): tags.append("Gate")
+    # These percentiles are computed later on full metrics; guard if missing
+    try:
+        if pd.notna(acc) and acc > np.nanpercentile(metrics["Accel%"], 75): tags.append("Kick")
+        if pd.notna(grd) and grd > np.nanpercentile(metrics["Grind%"], 75): tags.append("Grind")
+        if pd.notna(tsm) and tsm > np.nanpercentile(metrics["tsSPI%"], 75): tags.append("Cruise")
+        if pd.notna(f200) and f200 > np.nanpercentile(metrics["F200%"], 75): tags.append("Gate")
+    except Exception:
+        pass
 
     shape_bits = []
     if pd.notna(tsm) and tsm > med_tsspi + 1.0: shape_bits.append("strong mid-race engine")
     if pd.notna(acc) and acc > med_accel + 1.0: shape_bits.append("sharp late kick")
     if pd.notna(grd) and grd > med_grind + 1.0: shape_bits.append("kept grinding late")
-
     shape = "balanced profile" if not shape_bits else ", ".join(shape_bits)
+
     tag_str = f" **[{', '.join(tags)}]**" if tags else ""
     fpos = int(fin) if pd.notna(fin) else "—"
     return f"**{name}** — Finish **{fpos}**, PI **{pi:.3f}**{tag_str}. Sectional shape: {shape}."
 
-# ================================
+# =========================================
 # INPUTS
-# ================================
+# =========================================
 df_raw = None
 
 if source == "Upload CSV":
     uploaded = st.file_uploader(
-        "Upload CSV (per-100m or 200m splits). Headers may be forward ('100','200',...) or countdown ('1400','1300',...,'0').",
+        "Upload CSV (per-100m or 200m splits). Headers may be forward ('100','200',...) or countdown ('1400','1300',...,'0'/'Finish_Time').",
         type=["csv"]
     )
     if not uploaded:
@@ -419,7 +429,6 @@ if source == "Upload CSV":
         st.stop()
     try:
         df_raw = pd.read_csv(uploaded)
-        # normalize column names early
         df_raw.columns = [str(c).strip() for c in df_raw.columns]
         st.success("File loaded.")
     except Exception as e:
@@ -430,8 +439,8 @@ else:
     st.subheader("Manual Entry")
     st.caption("Enter horse names and **200m split times (seconds)**. Grid counts **down** from the rounded-up race distance.")
     n_horses = st.number_input("Number of horses", min_value=2, max_value=24, value=12, step=1)
-    steps = list(range(distance_m_grid, 0, -200))  # countdown labels
 
+    steps = list(range(distance_m_grid, 0, -200))  # countdown labels
     cols = ["Horse"] + [f"{d}" for d in steps]
     data = []
     for i in range(int(n_horses)):
@@ -455,24 +464,22 @@ else:
     else:
         st.stop()
 
-# ================================
-# Show raw
-# ================================
+# =========================================
+# Show raw / converted
+# =========================================
 st.subheader("Raw / Converted Table")
 st.dataframe(df_raw.head(12), use_container_width=True)
-if DEBUG:
-    st.write("📋 Columns in df_raw:", list(df_raw.columns))
-    st.dataframe(df_raw.head(3))
+_dbg("Columns in df_raw", list(df_raw.columns))
 
-# ================================
+# =========================================
 # Compute metrics & PI
-# ================================
+# =========================================
 try:
     metrics = build_metrics(df_raw, distance_m=int(distance_m_input))
 except Exception as e:
     st.error("Metric computation failed.")
     if DEBUG:
-        st.exception(e)  # full traceback
+        st.exception(e)
     st.stop()
 
 if ("Finish_Pos" not in metrics.columns) or metrics["Finish_Pos"].isna().all():
@@ -484,30 +491,29 @@ CB = consistency_bonus(sF, sM, sA, sG, field_size=len(metrics))
 PI_core_cb = PI_core + CB
 PI_final, RA_vec, T_factor, win_margin_L = apply_crs(metrics, int(distance_m_input), PI_core_cb)
 
-metrics["PI_core"] = PI_core
-metrics["CB"] = CB
-metrics["RA"] = RA_vec
-metrics["PI_final"] = PI_final
+metrics["PI_core"]   = PI_core
+metrics["CB"]        = CB
+metrics["RA"]        = RA_vec
+metrics["PI_final"]  = PI_final
 
-# ================================
-# Sectional Metrics table (new system only)
-# ================================
-st.subheader("Sectional Metrics (new system)")
-disp = metrics[["Horse", "Finish_Pos", "RaceTime_s", "F200%", "tsSPI%", "Accel%", "Grind%", "PI_final"]].copy()
-for c in ["RaceTime_s", "F200%", "tsSPI%", "Accel%", "Grind%", "PI_final"]:
+# =========================================
+# Sectional Metrics table (new-only)
+# =========================================
+st.subheader("Sectional Metrics")
+disp = metrics[["Horse","Finish_Pos","RaceTime_s","F200%","tsSPI%","Accel%","Grind%","PI_final"]].copy()
+for c in ["RaceTime_s","F200%","tsSPI%","Accel%","Grind%","PI_final"]:
     if c in disp.columns:
         disp[c] = pd.to_numeric(disp[c], errors="coerce").astype(float).round(3)
 st.dataframe(disp.sort_values("PI_final", ascending=False), use_container_width=True)
 
-# ================================
+# =========================================
 # Visual 1: Sectional Shape Map (Kick vs Grind)
-# ================================
+# =========================================
 st.subheader("Sectional Shape Map — Kick vs Grind")
 if metrics["Accel%"].notna().any() and metrics["Grind%"].notna().any():
     fig, ax = plt.subplots()
     x = metrics["Accel%"]
     y = metrics["Grind%"]
-    # safe size scale
     span = float(metrics["PI_final"].max() - metrics["PI_final"].min()) if metrics["PI_final"].notna().any() else 0.0
     size = 60.0 if span == 0 else (200 * (metrics["PI_final"] - metrics["PI_final"].min()) / (span + 1e-9) + 60)
     ax.scatter(x, y, s=size, alpha=0.7, edgecolors="k", linewidths=0.5)
@@ -516,7 +522,8 @@ if metrics["Accel%"].notna().any() and metrics["Grind%"].notna().any():
     top8_idx = metrics["PI_final"].rank(ascending=False, method="min") <= 8
     for _, r in metrics[top8_idx].iterrows():
         if pd.notna(r["Accel%"]) and pd.notna(r["Grind%"]):
-            ax.annotate(r["Horse"], xy=(r["Accel%"], r["Grind%"]), xytext=(5, 5), textcoords="offset points", fontsize=9)
+            ax.annotate(r["Horse"], xy=(r["Accel%"], r["Grind%"]),
+                        xytext=(5, 5), textcoords="offset points", fontsize=9)
 
     ax.axvline(np.nanmedian(x), linestyle="--", alpha=0.2)
     ax.axhline(np.nanmedian(y), linestyle="--", alpha=0.2)
@@ -526,18 +533,14 @@ if metrics["Accel%"].notna().any() and metrics["Grind%"].notna().any():
     ax.grid(True, linestyle="--", alpha=0.3)
     st.pyplot(fig, use_container_width=True)
 else:
-    st.info("Not enough non-NaN values to plot the sectional shape map.")
+    st.info("Not enough non-NaN values to plot the shape map.")
 
-# ================================
-# Visual 2: Pace curve (avg vs Top-8 finishers) over 200m intervals
-# ================================
+# =========================================
+# Visual 2: Pace curve (avg + Top-8 finishers) over 200m
+# =========================================
 st.subheader("Pace Curve — average (black) + Top-8 finishers")
 
 def extract_200m_speeds(df_src: pd.DataFrame, distance_m: int):
-    """
-    Returns xs (200,400,...,distance) and a DataFrame of per-runner speeds for each 200m segment.
-    Uses 200m columns if present; otherwise sums pairs of 100m splits. Handles forward/countdown headers.
-    """
     local = df_src.copy()
     local.columns = [str(c).strip() for c in local.columns]
     cols_100 = _collect_time_cols(local)
@@ -576,13 +579,12 @@ def extract_200m_speeds(df_src: pd.DataFrame, distance_m: int):
     return np.array(xs), seg_speeds
 
 xs, seg_speed = extract_200m_speeds(df_raw, int(distance_m_input))
-
 if seg_speed.notna().sum().sum() > 0:
     avg_speed = seg_speed.mean(axis=0).values
     fig_pc, ax_pc = plt.subplots()
     ax_pc.plot(xs, avg_speed, linewidth=3, color="black", marker="o", label="Average (Field)")
 
-    # Top 8 by finish (if missing, by PI)
+    # Top 8 by finish (fallback: by PI)
     if "Finish_Pos" in metrics.columns and metrics["Finish_Pos"].notna().any():
         top_idxs = metrics.sort_values("Finish_Pos").index[:8]
     else:
@@ -603,9 +605,9 @@ if seg_speed.notna().sum().sum() > 0:
 else:
     st.info("Not enough split data to draw the pace curve.")
 
-# ==========================
-# VISUALS: Radar + Top-8 Contribution Bars (with sort toggle & winner highlight)
-# ==========================
+# =========================================
+# Visual 3: Radar + Top-8 Contribution Bars
+# =========================================
 def _col(df, opts):
     for o in opts:
         if o in df.columns:
@@ -666,7 +668,6 @@ else:
             values = np.r_[values, values[0]]
             ref = np.r_[ref, ref[0]]
             angles = np.r_[angles, angles[0]]
-
             ax.set_theta_offset(np.pi / 2)
             ax.set_theta_direction(-1)
             ax.set_xticks(angles[:-1])
@@ -698,7 +699,6 @@ else:
             "PI":    viz["PI"]
         })
 
-        # choose ordering
         if sort_by == "Finish" and COL_FINPOS and metrics[COL_FINPOS].notna().any():
             order_idx2 = metrics.sort_values(COL_FINPOS).index
         else:
@@ -707,7 +707,6 @@ else:
         contrib = contrib.loc[order_idx2]
         top8 = contrib.head(8).reset_index(drop=True)
 
-        # winner highlight
         winner_name = None
         if COL_FINPOS and metrics[COL_FINPOS].notna().any():
             idx_w = metrics[COL_FINPOS].idxmin()
@@ -729,7 +728,6 @@ else:
                                   f"{pct:.0f}%", ha="center", va="center", fontsize=8)
             bottom += top8[key].values
 
-        # winner outline
         if winner_name is not None:
             try:
                 win_pos = top8.index[top8["Horse"] == winner_name].tolist()
@@ -754,9 +752,9 @@ else:
             "Winner has a thin outline. Toggle sorting to compare ability (PI) vs finishing order."
         )
 
-# ================================
+# =========================================
 # Runner-by-runner notes
-# ================================
+# =========================================
 st.subheader("Runner-by-runner notes")
 med_tsspi = np.nanmedian(metrics["tsSPI%"])
 med_accel = np.nanmedian(metrics["Accel%"])
