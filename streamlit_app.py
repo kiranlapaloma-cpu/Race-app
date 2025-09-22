@@ -427,28 +427,101 @@ def compute_pi_v24_bpp(df: pd.DataFrame, distance_m: int) -> pd.DataFrame:
 
     df["Notes_Tag"] = df.apply(_tags, axis=1)
 
-    # Narrative line (short)
+    # Narrative line (richer, descriptive)
     def _note_text(r):
-        EHI, SHI = context_indices(df)
+        EHI, SHI = context_indices(df)  # slow-early if EHI<-0.5; fast-early if EHI>0.5
         shape = "fast-early" if EHI > 0.5 else ("slow-early / sprint-home" if EHI < -0.5 else "even tempo")
-        bits = [f"Race shape: {shape}; weights favoured " + ("Accel" if (EHI < -0.5) else ("Grind" if (EHI > 0.5) else "balance")) + "."]
-        prof_str = []
-        if pd.notna(r["Accel%"]) and pd.notna(med["Accel%"]):
-            if r["Accel%"] >= med["Accel%"] + 2: prof_str.append("good kick")
-            elif r["Accel%"] <= med["Accel%"] - 2: prof_str.append("limited kick")
-        if pd.notna(r["Grind%"]) and pd.notna(med["Grind%"]):
-            if r["Grind%"] >= med["Grind%"] + 2: prof_str.append("strong late")
-            elif r["Grind%"] <= med["Grind%"] - 2: prof_str.append("weak late")
-        if pd.notna(r["tsSPI%"]) and pd.notna(med["tsSPI%"]):
-            if r["tsSPI%"] >= med["tsSPI%"] + 2: prof_str.append("solid mid engine")
-        if r["Notes_Tag"]:
-            prof_str.append(r["Notes_Tag"].replace("[","").replace("]",""))
-        if prof_str:
-            bits.append("Profile: " + ", ".join(prof_str) + ".")
-        return " ".join(bits)
+        fav = "Accel" if (EHI < -0.5) else ("Grind" if (EHI > 0.5) else "balance")
+
+        a_med, g_med, m_med, f_med = med["Accel%"], med["Grind%"], med["tsSPI%"], med["F200%"]
+        A = r["Accel%"]; G = r["Grind%"]; M = r["tsSPI%"]; F = r["F200%"]
+        tags = str(r.get("Notes_Tag","")).replace("[","").replace("]","").strip()
+        ctx_delta = r.get("CTX_delta", 0.0)
+
+        # Archetype classification
+        if pd.notna(A) and pd.notna(G):
+            if (A >= a_med + 2) and (G >= g_med + 2):
+                archetype = "Balanced Stalker (kick + late)"
+            elif (A >= a_med + 2) and (G <= g_med - 2):
+                archetype = "Pop-and-Stop (sharp kick, fades late)"
+            elif (A <= a_med - 2) and (G >= g_med + 2):
+                archetype = "Grinder (sustains late)"
+            elif (A >= a_med) and (G >= g_med):
+                archetype = "All-rounder"
+            elif (A <= a_med - 2) and (G <= g_med - 2):
+                archetype = "One-paced"
+            else:
+                archetype = "Mixed profile"
+        else:
+            archetype = "Profile unclear"
+
+        # Race-shape fit
+        fit_bits = []
+        if EHI < -0.5:
+            if pd.notna(A) and A >= a_med + 2: fit_bits.append("tempo suited a sharp turn-of-foot")
+            if pd.notna(G) and G <= g_med - 2: fit_bits.append("late test exposed limited stamina")
+        elif EHI > 0.5:
+            if pd.notna(G) and G >= g_med + 2: fit_bits.append("withstood pressure and stayed on well")
+            if pd.notna(A) and A <= a_med - 2: fit_bits.append("lacked change of gears when pace eased")
+        else:
+            fit_bits.append("neutral shape; no extreme bias")
+
+        # Distance hint
+        dist_hint = None
+        if pd.notna(A) and pd.notna(G):
+            if (A >= a_med + 2) and (G <= g_med - 1):
+                dist_hint = "could be better a touch shorter or with a softer mid-race."
+            elif (G >= g_med + 2) and (A <= a_med - 1):
+                dist_hint = "likely to appreciate a little further or a stronger early clip."
+            elif (A >= a_med + 1) and (G >= g_med + 1):
+                dist_hint = "versatile at this trip; setup dependent."
+        if pd.notna(M):
+            if M >= m_med + 2 and (dist_hint is None):
+                dist_hint = "mid-race engine suggests similar or slightly further may suit."
+            if M <= m_med - 2 and (dist_hint is None):
+                dist_hint = "mid-race lull suggests sharper setups may help."
+
+        # Setup suggestion
+        setup = []
+        if pd.notna(F) and F >= f_med + 2:
+            setup.append("draw/ride to hold a handy spot early")
+        if pd.notna(M) and M >= m_med + 2:
+            setup.append("sustained pace (genuine mid) brings out best")
+        if pd.notna(A) and A >= a_med + 2:
+            setup.append("profits in sprint-home patterns")
+        if pd.notna(G) and G >= g_med + 2:
+            setup.append("thrives when early heat is on")
+        if not setup:
+            setup.append("no strong setup dependency flagged")
+
+        # Assemble note
+        lines = []
+        lines.append(
+            f"Race shape: **{shape}**; weights favoured **{fav}**"
+            + (f" (context shift {ctx_delta:+.3f})" if abs(ctx_delta) >= 0.007 else "")
+            + "."
+        )
+        lines.append(f"Archetype: **{archetype}**.")
+        prof_desc = []
+        if pd.notna(A):
+            prof_desc.append(f"Accel {A:.1f}% vs med {a_med:.1f}%")
+        if pd.notna(G):
+            prof_desc.append(f"Grind {G:.1f}% vs med {g_med:.1f}%")
+        if pd.notna(M):
+            prof_desc.append(f"tsSPI {M:.1f}% vs med {m_med:.1f}%")
+        if prof_desc:
+            lines.append("Profile: " + "; ".join(prof_desc) + ".")
+        if fit_bits:
+            lines.append("Shape fit: " + "; ".join(fit_bits) + ".")
+        if dist_hint:
+            lines.append("Distance: " + dist_hint)
+        if setup:
+            lines.append("Setup: " + "; ".join(setup) + ".")
+        if tags:
+            lines.append(f"Flags: {tags}.")
+        return " ".join(lines)
 
     df["Notes_Text"] = df.apply(_note_text, axis=1)
-
     return df
 
 # =============================================================================
@@ -716,7 +789,6 @@ for _, r in ordered.iterrows():
     tags = str(r.get("Notes_Tag","")).strip()
     note = str(r.get("Notes_Text","")).strip()
 
-    # Header line: Name — Finish — PI — Tags
     header_bits = [f"**{name}**"]
     header_bits.append(f"Finish: **{int(fin)}**" if not pd.isna(fin) else "Finish: —")
     header_bits.append(f"PI: **{_fmt_pi(pi)}**")
@@ -724,7 +796,6 @@ for _, r in ordered.iterrows():
         header_bits.append(tags)
     st.markdown(" • ".join(header_bits))
 
-    # Quick sectional cues (same 4 metrics)
     f200  = _fmt_pct(r.get("F200%", np.nan))
     tsspi = _fmt_pct(r.get("tsSPI%", np.nan))
     acc   = _fmt_pct(r.get("Accel%", np.nan))
@@ -734,10 +805,8 @@ for _, r in ordered.iterrows():
     st.markdown(
         f"- F200: **{f200}** | tsSPI: **{tsspi}** | Accel: **{acc}** | Grind: **{grd}** | Margin: **{margin}**"
     )
-
     if note:
         st.markdown(f"> {note}")
-
     st.markdown("---")
 
 # =========================
