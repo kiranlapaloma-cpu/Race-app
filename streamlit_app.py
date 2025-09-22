@@ -510,4 +510,4 @@ if not radar_df.empty:
     ax3.set_title(f"Sectional Radar — {pick}")
     st.pyplot(fig3)
 else:
-    st.info("Radar requires non
+    st.info("Radar requires non-empty data to display.")
