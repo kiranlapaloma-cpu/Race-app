@@ -727,7 +727,7 @@ def hh_tier(s):
         return ""
     if s >= 1.8:
         return "🔥 Top Hidden"
-    if s >= 1.2:
+    if s >= 1.1:
         return "🟡 Notable Hidden"
     return ""
 
