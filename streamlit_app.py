@@ -238,22 +238,34 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int):
     else:
         w["Grind"] = np.nan
 
-    # ---------- PI v3.1 (distance-aware weights) ----------
-    PI_W = pi_weights(distance_m)
+# ---------- PI v3.1 (distance-aware weights, robust 0–10 scaling) ----------
+PI_W = pi_weights(distance_m)
 
-    def pi_row(row):
-        parts, weights = [], []
-        for k, wgt in PI_W.items():
-            v = row.get(k, np.nan)
-            if pd.notna(v):
-                parts.append(wgt * (v - 100.0))
-                weights.append(wgt)
-        if not weights:
-            return np.nan
-        scaled = sum(parts) / sum(weights)     # index points above/below 100
-        return max(0.0, round(scaled / 5.0, 3))  # map to ~0–10
+def pi_points(row):
+    parts, weights = [], []
+    for k, wgt in PI_W.items():
+        v = row.get(k, np.nan)
+        if pd.notna(v):
+            parts.append(wgt * (float(v) - 100.0))  # points above/below par
+            weights.append(wgt)
+    if not weights:
+        return np.nan
+    return sum(parts) / sum(weights)  # raw points (no /5 here)
 
-    w["PI"] = w.apply(pi_row, axis=1)
+w["PI_pts"] = w.apply(pi_points, axis=1)
+
+# robust center & spread in-race
+pts = pd.to_numeric(w["PI_pts"], errors="coerce")
+med = float(np.nanmedian(pts))
+mad = float(np.nanmedian(np.abs(pts - med)))
+sigma = 1.4826 * mad           # MAD -> robust sigma
+if not np.isfinite(sigma) or sigma <= 1e-6:
+    sigma = 1.0                 # guard so flat races don't collapse
+
+# map z -> 0..10 (center=5). ±2.2σ ≈ [0..10]
+z = (pts - med) / sigma
+PI_display = 5.0 + 2.2 * z
+w["PI"] = PI_display.clip(0.0, 10.0).round(2)
 
     # ---------- GCI (0–10) ----------
     def bucket(dm):
