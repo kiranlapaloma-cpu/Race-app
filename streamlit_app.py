@@ -303,136 +303,131 @@ for c in show_cols:
 st.dataframe(metrics[show_cols].sort_values(["PI","Finish_Pos"], ascending=[False, True]),
              use_container_width=True)
 
-# ======================= Visual: Shape Map (improved) =======================
+# ===================== Sectional Shape Map — Accel vs Grind (full drop-in) =====================
+# Expects columns in `metrics`: ["Horse","Accel","Grind","tsSPI","PI"]
+# Accel & Grind are in "index points" (100 = field average). tsSPI is also index (100 = field avg).
+
 from matplotlib.patches import Rectangle
 from matplotlib.colors import TwoSlopeNorm
+from matplotlib.lines import Line2D
 
 st.markdown("## Sectional Shape Map — Accel (600→200) vs Grind (200→Finish)")
 
-# knobs you can tweak
-TOP_LABELS = 8                 # how many runners get arrowed labels
-LABEL_BY   = "both"            # "swing" (|Accel|+|Grind|), "tsspi", or "both"
-DOT_MIN, DOT_MAX = 40, 140     # point-size range for PI bubbles
-TINT = 0.06                    # quadrant tint alpha (0–1)
-
-# data
-x = (metrics["Accel"] - 100.0).rename("AccelΔ")     # + = late acceleration
-y = (metrics["Grind"] - 100.0).rename("GrindΔ")     # + = strong last 200
-c = (metrics["tsSPI"] - 100.0).rename("tsSPIΔ")     # colour
-pi = metrics["PI"].fillna(0)
-names = metrics["Horse"].astype(str)
-
-mask = x.notna() & y.notna() & c.notna()
-if mask.sum() == 0:
-    st.info("Not enough data to draw the shape map.")
+needed_cols = {"Horse","Accel","Grind","tsSPI","PI"}
+if not needed_cols.issubset(metrics.columns):
+    st.warning("Shape Map: required columns missing: " + ", ".join(sorted(needed_cols - set(metrics.columns))))
 else:
-    xv, yv, cv = x[mask].to_numpy(), y[mask].to_numpy(), c[mask].to_numpy()
-    piv = pi[mask].to_numpy()
-    namev = names[mask].tolist()
-
-    # bubble size from PI (safe scaling)
-    if np.isfinite(piv).any():
-        piv_norm = (piv - np.nanmin(piv)) / (np.nanmax(piv) - np.nanmin(piv) + 1e-9)
-        sizes = DOT_MIN + piv_norm * (DOT_MAX - DOT_MIN)
+    # Prepare data
+    dfm = metrics.copy()
+    dfm = dfm[["Horse","Accel","Grind","tsSPI","PI"]].dropna(subset=["Accel","Grind","tsSPI"])
+    if dfm.empty:
+        st.info("Not enough data to draw the shape map.")
     else:
-        sizes = np.full_like(xv, DOT_MIN)
+        # Δ from field = index − 100
+        dfm["AccelΔ"] = dfm["Accel"] - 100.0
+        dfm["GrindΔ"] = dfm["Grind"] - 100.0
+        dfm["tsSPIΔ"] = dfm["tsSPI"] - 100.0
 
-# ---- replace the previous "arrowed labels" loop with this (label EVERY runner) ----
-# parameters you can tweak
-LABEL_FONT = 8.5
-ARROW_LEN  = 0.85   # relative axis units for default offset length
-HALO_ALPHA = 0.70
+        # Arrays
+        names = dfm["Horse"].astype(str).to_list()
+        xv = dfm["AccelΔ"].to_numpy()
+        yv = dfm["GrindΔ"].to_numpy()
+        cv = dfm["tsSPIΔ"].to_numpy()
+        piv = dfm["PI"].fillna(0).to_numpy()
 
-# helper: quadrant-aware base angle so labels fan out in different directions
-def base_angle(xi, yi):
-    if   xi >= 0 and yi >= 0:  # Q1
-        return 35
-    elif xi < 0 and yi >= 0:   # Q2
-        return 145
-    elif xi < 0 and yi < 0:    # Q3
-        return 215
-    else:                      # Q4
-        return 325
+        # Bubble sizes from PI
+        DOT_MIN, DOT_MAX = 40.0, 140.0
+        piv_min, piv_max = float(np.nanmin(piv)), float(np.nanmax(piv))
+        if piv_max - piv_min < 1e-9:
+            sizes = np.full_like(xv, DOT_MIN)
+        else:
+            piv_norm = (piv - piv_min) / (piv_max - piv_min)
+            sizes = DOT_MIN + piv_norm * (DOT_MAX - DOT_MIN)
 
-# spiral offsets to reduce overlaps without extra libs
-# we sort by (biggest bubbles first) so smaller ones adjust around them
-order = np.argsort(-sizes)
-for k, i in enumerate(order):
-    # spiral step grows slowly with k to spread labels
-    step = 0.12 + 0.055 * k
-    ang  = np.deg2rad(base_angle(xv[i], yv[i]) + (k * 19) % 360)  # rotate a bit each label
-    dx   = (ARROW_LEN * step) * np.cos(ang)
-    dy   = (ARROW_LEN * step) * np.sin(ang)
+        # Figure & axes
+        fig, ax = plt.subplots(figsize=(7.6, 6.4))
 
-    ax.annotate(
-        namev[i],
-        xy=(xv[i], yv[i]),
-        xytext=(xv[i] + dx, yv[i] + dy),
-        fontsize=LABEL_FONT,
-        ha="left", va="center",
-        arrowprops=dict(arrowstyle="->", lw=0.7, shrinkA=0, shrinkB=3, color="black", alpha=0.9),
-        bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=HALO_ALPHA)
-    )
-# -------------------------------------------------------------------------------
+        # Determine limits and tint quadrants
+        lim = max(4.5, np.ceil(max(np.max(np.abs(xv)), np.max(np.abs(yv))) / 1.5) * 1.5)
+        TINT = 0.06
+        ax.add_patch(Rectangle((0, 0),  lim,  lim, facecolor="#4daf4a", alpha=TINT, edgecolor="none"))   # +accel +grind
+        ax.add_patch(Rectangle((-lim,0), lim,  lim, facecolor="#377eb8", alpha=TINT, edgecolor="none"))   # -accel +grind
+        ax.add_patch(Rectangle((0,-lim), lim, lim, facecolor="#ff7f00", alpha=TINT, edgecolor="none"))    # +accel -grind
+        ax.add_patch(Rectangle((-lim,-lim),lim, lim, facecolor="#984ea3", alpha=TINT, edgecolor="none"))  # -accel -grind
 
-    # figure
-    fig, ax = plt.subplots(figsize=(7.2, 6.0))
+        # Zero lines
+        ax.axvline(0, color="gray", lw=1.3, ls=(0,(3,3)))
+        ax.axhline(0, color="gray", lw=1.3, ls=(0,(3,3)))
 
-    # quadrant tinting (very light)
-    lim = max(4.5, np.ceil(max(np.max(np.abs(xv)), np.max(np.abs(yv))) / 1.5) * 1.5)
-    ax.add_patch(Rectangle((0, 0),  lim,  lim, facecolor="#4daf4a", alpha=TINT, edgecolor="none"))  # +accel +grind
-    ax.add_patch(Rectangle((-lim, 0), lim,  lim, facecolor="#377eb8", alpha=TINT, edgecolor="none")) # -accel +grind
-    ax.add_patch(Rectangle((0, -lim), lim, lim, facecolor="#ff7f00", alpha=TINT, edgecolor="none"))  # +accel -grind
-    ax.add_patch(Rectangle((-lim, -lim), lim, lim, facecolor="#984ea3", alpha=TINT, edgecolor="none"))# -accel -grind
+        # Colour centered on 0
+        vmin = float(np.min(cv)) if np.isfinite(cv).any() else -1.0
+        vmax = float(np.max(cv)) if np.isfinite(cv).any() else 1.0
+        if vmin == vmax:
+            vmin, vmax = -1.0, 1.0
+        norm = TwoSlopeNorm(vcenter=0.0, vmin=vmin, vmax=vmax)
 
-    # zero lines
-    ax.axvline(0, color="gray", lw=1.3, ls=(0,(3,3)))
-    ax.axhline(0, color="gray", lw=1.3, ls=(0,(3,3)))
+        sc = ax.scatter(xv, yv, s=sizes, c=cv, cmap="coolwarm", norm=norm,
+                        edgecolor="black", linewidth=0.6, alpha=0.95)
 
-    # colour centered at 0
-    norm = TwoSlopeNorm(vcenter=0.0, vmin=min(-1.0, float(np.min(cv))), vmax=max(1.0, float(np.max(cv))))
-    sc = ax.scatter(xv, yv, s=sizes, c=cv, cmap="coolwarm", norm=norm,
-                    edgecolor="black", linewidth=0.5, alpha=0.95)
+        # Label EVERY runner with quadrant-aware spiral offsets
+        LABEL_FONT = 8.6
+        ARROW_LEN  = 0.85
+        HALO_ALPHA = 0.70
 
-    # arrowed labels for top runners (simple collision-lite offsets)
-    angles = np.linspace(20, 340, num=max(1, len(label_idx)), endpoint=False)
-    for k, i in enumerate(label_idx):
-        dx = 0.85 * np.cos(np.deg2rad(angles[k]))
-        dy = 0.85 * np.sin(np.deg2rad(angles[k]))
-        ax.annotate(
-            namev[i],
-            xy=(xv[i], yv[i]),
-            xytext=(xv[i] + dx, yv[i] + dy),
-            fontsize=8,
-            ha="left", va="center",
-            arrowprops=dict(arrowstyle="->", lw=0.7, shrinkA=0, shrinkB=3, color="black", alpha=0.9),
-            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.6)
+        def base_angle(xi, yi):
+            # Return a base angle (deg) so labels fan per quadrant
+            if   xi >= 0 and yi >= 0:  # Q1
+                return 35
+            elif xi < 0 and yi >= 0:   # Q2
+                return 145
+            elif xi < 0 and yi < 0:    # Q3
+                return 215
+            else:                      # Q4
+                return 325
+
+        # Order by bubble size (bigger first) so smaller ones route around
+        order = np.argsort(-sizes)
+        for k, i in enumerate(order):
+            step = 0.12 + 0.055 * k
+            ang  = np.deg2rad(base_angle(xv[i], yv[i]) + (k * 19) % 360)
+            dx   = (ARROW_LEN * step) * np.cos(ang)
+            dy   = (ARROW_LEN * step) * np.sin(ang)
+
+            ax.annotate(
+                names[i],
+                xy=(xv[i], yv[i]),
+                xytext=(xv[i] + dx, yv[i] + dy),
+                fontsize=LABEL_FONT,
+                ha="left", va="center",
+                arrowprops=dict(arrowstyle="->", lw=0.7, shrinkA=0, shrinkB=3, color="black", alpha=0.9),
+                bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=HALO_ALPHA)
+            )
+
+        # Axes cosmetics
+        ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
+        ax.set_xlabel("Acceleration vs field (points)  →")
+        ax.set_ylabel("Grind vs field (points)  ↑")
+        ax.set_title("Quadrants: +X = late acceleration; +Y = strong last 200. Colour = tsSPI deviation")
+
+        # Size legend (PI)
+        s_ex = [DOT_MIN, 0.5*(DOT_MIN+DOT_MAX), DOT_MAX]
+        h_ex = [Line2D([0],[0], marker='o', color='w', markerfacecolor='gray',
+                       markersize=np.sqrt(s/np.pi), markeredgecolor='black') for s in s_ex]
+        ax.legend(h_ex, ["PI: low", "PI: mid", "PI: high"],
+                  loc="upper left", frameon=False, fontsize=8)
+
+        # Colorbar
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("tsSPI − 100")
+
+        ax.grid(True, linestyle=":", alpha=0.25)
+        st.pyplot(fig)
+        st.caption(
+            "Each bubble is a runner. Size = PI (bigger = stronger overall). "
+            "X: late acceleration (600→200) vs field; Y: last-200 grind vs field. "
+            "Colour shows cruise strength (tsSPI vs field): red = faster mid-race, blue = slower."
         )
-
-    ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
-    ax.set_xlabel("Acceleration vs field (points)  →")
-    ax.set_ylabel("Grind vs field (points)  ↑")
-    ax.set_title("Quadrants: +X = late acceleration; +Y = strong last 200. Colour = tsSPI deviation")
-
-    # size legend (PI)
-    from matplotlib.lines import Line2D
-    s_ex = [DOT_MIN, 0.5*(DOT_MIN+DOT_MAX), DOT_MAX]
-    h_ex = [Line2D([0],[0], marker='o', color='w', markerfacecolor='gray',
-                   markersize=np.sqrt(s/np.pi), markeredgecolor='black') for s in s_ex]
-    ax.legend(h_ex, ["PI: low", "PI: mid", "PI: high"],
-              loc="upper left", frameon=False, fontsize=8)
-
-    # colorbar, below plot
-    cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("tsSPI − 100")
-
-    ax.grid(True, linestyle=":", alpha=0.25)
-    st.pyplot(fig)
-    st.caption(
-        "Bubble size = PI (bigger = stronger overall). Red = faster cruise (tsSPI>field), blue = slower. "
-        "Top labels mark the most shape-extreme or cruise-extreme runners."
-    )
-
+# ===============================================================================================
 # ======================= Visual 2: Pace Curve =============
 st.markdown("## Pace Curve — field average (black) + Top 8 finishers")
 
