@@ -556,123 +556,76 @@ else:
             "(start→end labels). Thin lines & small markers for clarity."
         )
 
-# ======================= Visual 3: Top-8 PI — stacked contributions (improved) =================
+# ======================= Visual 3: Top-8 PI — stacked contributions (sum matches PI) =========
 st.markdown("## Top-8 PI — stacked contributions")
 
 PI_W = {"F200_idx": 0.08, "tsSPI": 0.37, "Accel": 0.30, "Grind": 0.25}
 
-def pi_parts(row):
-    """Return dict of absolute contributions that sum to PI (in PI points)."""
-    parts = {}
-    weights = []
-    for k, wgt in PI_W.items():
-        v = row.get(k)
-        if pd.notna(v):
-            parts[k] = wgt * (float(v) - 100.0)
-            weights.append(wgt)
-        else:
-            parts[k] = np.nan
-    wsum = sum(weights) if weights else 1.0
-    # convert “index delta × weight” into PI points (divide by 5 as in PI definition)
-    for k in parts:
-        if pd.notna(parts[k]):
-            parts[k] = parts[k] / wsum / 5.0
-        else:
-            parts[k] = 0.0
-    return parts
+def parts_scaled_to_total(row, total_pi, zero_floor=True):
+    """Return component contributions rescaled so their sum equals total_pi."""
+    # 1) raw weighted deltas (no /5 here)
+    raw = {
+        "F200_idx": PI_W["F200_idx"] * (float(row.get("F200_idx", 100.0)) - 100.0),
+        "tsSPI":    PI_W["tsSPI"]    * (float(row.get("tsSPI",    100.0)) - 100.0),
+        "Accel":    PI_W["Accel"]    * (float(row.get("Accel",    100.0)) - 100.0),
+        "Grind":    PI_W["Grind"]    * (float(row.get("Grind",    100.0)) - 100.0),
+    }
+    # 2) optional zero-floor to avoid negative slices
+    if zero_floor:
+        raw = {k: max(0.0, v) for k, v in raw.items()}
 
-# take top 8 by PI (ties broken by finish)
-top8_pi = metrics.copy()
-if "PI" in top8_pi.columns:
-    top8_pi = top8_pi.sort_values(["PI", "Finish_Pos"], ascending=[False, True]).head(8).reset_index(drop=True)
-else:
-    top8_pi = pd.DataFrame(columns=metrics.columns)
+    s = sum(raw.values())
+    if not np.isfinite(total_pi) or total_pi <= 0 or not np.isfinite(s) or s <= 0:
+        return {"F200_idx": 0.0, "tsSPI": 0.0, "Accel": 0.0, "Grind": 0.0}
 
-if not top8_pi.empty:
-    horses, totals = [], []
-    c_F200, c_tsSPI, c_Accel, c_Grind = [], [], [], []
+    # 3) rescale so slices sum to total_pi
+    scale = float(total_pi) / float(s)
+    return {k: v * scale for k, v in raw.items()}
+
+# pick top-8 by PI, tie-break by finish
+top8 = metrics.sort_values(["PI", "Finish_Pos"], ascending=[False, True]).head(8).copy()
+if not top8.empty:
+    horses = []
+    stacks = {"F200_idx": [], "tsSPI": [], "Accel": [], "Grind": []}
+    totals = []
     is_winner = []
 
-    for _, r in top8_pi.iterrows():
+    for _, r in top8.iterrows():
+        total_pi = float(r.get("PI", 0.0))
+        parts = parts_scaled_to_total(r, total_pi, zero_floor=True)
+        for k in stacks:
+            stacks[k].append(parts[k])
+        totals.append(total_pi)
         horses.append(str(r.get("Horse", "")))
-        parts = pi_parts(r)
-        c_F200.append(parts["F200_idx"])
-        c_tsSPI.append(parts["tsSPI"])
-        c_Accel.append(parts["Accel"])
-        c_Grind.append(parts["Grind"])
-        totals.append(float(r.get("PI", 0.0)))
         is_winner.append(int(r.get("Finish_Pos", 0)) == 1)
 
-    # figure
-    fig3, ax3 = plt.subplots(figsize=(max(7.5, 0.95 * len(horses)), 4.8))
+    fig, ax = plt.subplots(figsize=(max(7.5, 0.95*len(horses)), 4.8))
     x = np.arange(len(horses))
-
     palette = {"F200_idx": "#6baed6", "tsSPI": "#9e9ac8", "Accel": "#74c476", "Grind": "#fd8d3c"}
-    edgecolor = "black"
 
     bottoms = np.zeros(len(horses))
-    stacks = {
-        "F200_idx": np.array(c_F200),
-        "tsSPI":   np.array(c_tsSPI),
-        "Accel":   np.array(c_Accel),
-        "Grind":   np.array(c_Grind),
-    }
-
-    for key in ["F200_idx", "tsSPI", "Accel", "Grind"]:
-        vals = stacks[key]
-        bars = ax3.bar(
-            x, vals, bottom=bottoms, label=key.replace("_idx","F200"),
-            color=palette[key], edgecolor=edgecolor, linewidth=0.4
-        )
-        # annotate % mix inside segments (only if the slice is at least 10% of the total bar)
-        for i, b in enumerate(bars):
-            total = totals[i] if totals[i] > 0 else 0
-            share = vals[i] / total if total > 0 else 0
-            if share >= 0.10 and vals[i] > 0:
-                ax3.text(
-                    b.get_x() + b.get_width()/2, b.get_y() + b.get_height()/2,
-                    f"{int(round(share*100,0))}%",
-                    ha="center", va="center", fontsize=8, color="black"
-                )
+    for key, label in [("F200_idx","F200"), ("tsSPI","tsSPI"), ("Accel","Accel"), ("Grind","Grind")]:
+        vals = np.array(stacks[key], dtype=float)
+        ax.bar(x, vals, bottom=bottoms, label=label, color=palette[key], edgecolor="black", linewidth=0.4)
         bottoms += vals
 
-    # highlight winner: thicker golden outline on its whole stack
-    for i, win in enumerate(is_winner):
-        if win:
-            ax3.add_patch(plt.Rectangle(
-                (i-0.5, 0), 1.0, max(totals[i], bottoms[i]),
-                fill=False, lw=2.0, ec="#d4af37"
-            ))
-            horses[i] = f"★ {horses[i]}"
-
-    # labels & cosmetics
-    ax3.set_xticks(x); ax3.set_xticklabels(horses, rotation=45, ha="right")
-    ax3.set_ylabel("PI (stacked contributions)")
+    # winner highlight + totals
     ymax = max(0.1, max(totals)*1.20)
-    ax3.set_ylim(0, ymax)
-    ax3.grid(axis="y", linestyle="--", alpha=0.3)
-
-    # total PI numbers above each bar
     for i, tot in enumerate(totals):
-        ax3.text(i, tot + ymax*0.03, f"{tot:.2f}", ha="center", va="bottom", fontsize=9)
+        if is_winner[i]:
+            ax.add_patch(plt.Rectangle((i-0.5, 0), 1.0, max(tot, bottoms[i]), fill=False, lw=2.0, ec="#d4af37"))
+            horses[i] = f"★ {horses[i]}"
+        ax.text(i, tot + ymax*0.03, f"{tot:.2f}", ha="center", va="bottom", fontsize=9)
 
-    # lean legend under the plot
-    leg_labels = ["F200", "tsSPI", "Accel", "Grind"]
-    handles = [plt.Rectangle((0,0),1,1, fc=palette["F200_idx"], ec=edgecolor),
-               plt.Rectangle((0,0),1,1, fc=palette["tsSPI"],   ec=edgecolor),
-               plt.Rectangle((0,0),1,1, fc=palette["Accel"],   ec=edgecolor),
-               plt.Rectangle((0,0),1,1, fc=palette["Grind"],   ec=edgecolor)]
-    ax3.legend(handles, leg_labels, loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=4, frameon=False)
-
-    st.pyplot(fig3)
-    st.caption(
-        "Bars split each horse’s PI into F200 / tsSPI / Accel / Grind contributions. "
-        "Total PI is shown above each bar. Percent labels inside slices when a component "
-        "is ≥10% of that horse’s PI. ★ = race winner."
-    )
+    ax.set_xticks(x); ax.set_xticklabels(horses, rotation=45, ha="right")
+    ax.set_ylim(0, ymax)
+    ax.set_ylabel("PI (stacked contributions)")
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=4, frameon=False)
+    st.pyplot(fig)
+    st.caption("Slices are rescaled to sum exactly to each horse’s PI. ★ = race winner.")
 else:
     st.info("No PI values available to plot the stacked contributions.")
-
 # ======================= Hidden Horses v2 =================
 st.markdown("## Hidden Horses (v2)")
 
