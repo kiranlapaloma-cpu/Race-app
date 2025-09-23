@@ -106,8 +106,8 @@ try:
         st.info("Enter **segment times (seconds)** for each 200 m leg; positions optional.")
         work = st.data_editor(template, num_rows="dynamic", use_container_width=True, key="manual_grid").copy()
         st.success("Manual grid captured.")
-except Exception as e:
-    st.error("Input parsing failed.")
+except Exception as e
+    st.error("Input parsing failed."
     if DEBUG:
         st.exception(e)
     st.stop()
@@ -115,8 +115,221 @@ except Exception as e:
 st.markdown("### Raw / Converted Table")
 st.dataframe(work.head(12), use_container_width=True)
 _dbg("Columns", list(work.columns))
-
 # ======================= Core metric build =================
+def build_metrics(df_in: pd.DataFrame, distance_m: int):
+    w = df_in.copy()
+
+    # numeric finish pos (if present)
+    if "Finish_Pos" in w.columns:
+        w["Finish_Pos"] = as_num(w["Finish_Pos"])
+
+    # find 200m *_Time columns -> integer markers (e.g., 1200, 1000, ..., 200)
+    time_cols = [c for c in w.columns if str(c).endswith("_Time")]
+    seg_markers = []
+    for c in time_cols:
+        try:
+            seg_markers.append(int(str(c).split("_")[0]))
+        except Exception:
+            pass
+    seg_markers = sorted(set(seg_markers), reverse=True)
+
+    # per-segment speeds
+    for m in seg_markers:
+        w[f"spd_{m}"] = 200.0 / as_num(w[f"{m}_Time"])
+
+    # race time = sum of segment times (fallback to provided)
+    if seg_markers:
+        sum_cols = [f"{m}_Time" for m in seg_markers if f"{m}_Time" in w.columns]
+        w["RaceTime_s"] = w[sum_cols].apply(pd.to_numeric, errors="coerce").sum(axis=1)
+    else:
+        w["RaceTime_s"] = as_num(w.get("Race Time", np.nan))
+
+    # ---------- small-field stabilizers ----------
+    def shrink_center(idx_series):
+        x = idx_series.dropna().values
+        N_eff = len(x)
+        if N_eff == 0:
+            return 100.0, 0
+        med_race = float(np.median(x))
+        alpha = N_eff / (N_eff + 6.0)    # gentle pull to 100 when N is small
+        return alpha * med_race + (1 - alpha) * 100.0, N_eff
+
+    def dispersion_equalizer(delta_series, N_eff, N_ref=10, beta=0.20, cap=1.20):
+        gamma = 1.0 + beta * max(0, N_ref - N_eff) / N_ref
+        return delta_series * min(gamma, cap)
+
+    def variance_floor(idx_series, floor=1.5, cap=1.25):
+        deltas = idx_series - 100.0
+        sigma = mad_std(deltas)
+        if not np.isfinite(sigma) or sigma <= 0:
+            return idx_series
+        if sigma < floor:
+            factor = min(cap, floor / sigma)
+            return 100.0 + deltas * factor
+        return idx_series
+
+    # ---------- F200 ----------
+    first_mark = max(seg_markers) if seg_markers else None
+    if first_mark and f"spd_{first_mark}" in w.columns:
+        base = w[f"spd_{first_mark}"]
+        prelim = 100.0 * (base / base.median(skipna=True))
+        center, n_eff = shrink_center(prelim)
+        f200 = 100.0 * (base / (center / 100.0 * base.median(skipna=True)))
+        f200 = 100.0 + dispersion_equalizer(f200 - 100.0, n_eff)
+        f200 = variance_floor(f200)
+        w["F200_idx"] = f200
+    else:
+        w["F200_idx"] = np.nan
+
+    # ---------- tsSPI (exclude first 200 & last 600; adaptive fallback) ----------
+    last_mark = min(seg_markers) if seg_markers else None
+
+    def tsspi_avg(row):
+        if len(seg_markers) == 0:
+            return np.nan
+        mids = seg_markers[1:-3]          # drop first & last 600
+        if len(mids) < 2: mids = seg_markers[1:-2]
+        if len(mids) < 1: mids = seg_markers[1:2]
+        vals = [row.get(f"spd_{m}") for m in mids if f"spd_{m}" in row.index]
+        vals = [v for v in vals if pd.notna(v)]
+        return np.nan if not vals else float(np.mean(vals))
+
+    w["_mid_spd"] = w.apply(tsspi_avg, axis=1)
+    mid_med = w["_mid_spd"].median(skipna=True)
+    w["tsSPI_raw"] = 100.0 * (w["_mid_spd"] / mid_med)
+    center_ts, n_ts = shrink_center(w["tsSPI_raw"])
+    tsSPI = 100.0 * (w["_mid_spd"] / (center_ts / 100.0 * mid_med))
+    tsSPI = 100.0 + dispersion_equalizer(tsSPI - 100.0, n_ts)
+    tsSPI = variance_floor(tsSPI)
+    w["tsSPI"] = tsSPI
+
+    # ---------- Accel: 600→200 (adaptive up to 3 segments) ----------
+    pre_marks = [m for m in seg_markers if last_mark and m > last_mark]
+    accel_win = pre_marks[-3:] if len(pre_marks) >= 3 else (pre_marks[-2:] if len(pre_marks) >= 2 else pre_marks[-1:])
+
+    def mean_marks(row, marks):
+        vals = [row.get(f"spd_{m}") for m in marks if f"spd_{m}" in row.index]
+        vals = [v for v in vals if pd.notna(v)]
+        return np.nan if not vals else float(np.mean(vals))
+
+    w["_accel_spd"] = w.apply(lambda r: mean_marks(r, accel_win), axis=1)
+    a_med = w["_accel_spd"].median(skipna=True)
+    w["Accel_raw"] = 100.0 * (w["_accel_spd"] / a_med)
+    center_a, n_a = shrink_center(w["Accel_raw"])
+    Accel = 100.0 * (w["_accel_spd"] / (center_a / 100.0 * a_med))
+    Accel = 100.0 + dispersion_equalizer(Accel - 100.0, n_a)
+    Accel = variance_floor(Accel)
+    w["Accel"] = Accel
+
+    # ---------- Grind: last 200 ----------
+    if last_mark and f"spd_{last_mark}" in w.columns:
+        g_base = w[f"spd_{last_mark}"]
+        g_med = g_base.median(skipna=True)
+        w["Grind_raw"] = 100.0 * (g_base / g_med)
+        center_g, n_g = shrink_center(w["Grind_raw"])
+        Grind = 100.0 * (g_base / (center_g / 100.0 * g_med))
+        Grind = 100.0 + dispersion_equalizer(Grind - 100.0, n_g)
+        Grind = variance_floor(Grind)
+        w["Grind"] = Grind
+    else:
+        w["Grind"] = np.nan
+
+    # ---------- PI v3.1 (distance-aware weights) ----------
+    def pi_weights(dm):
+        f200, tssp, accel, grind = 0.08, 0.37, 0.30, 0.25
+        if dm > 1200:
+            add = max(0.0, (dm - 1200) / 100.0 * 0.01)          # +0.01 per +100m
+            add = min(add, 0.40 - grind)                        # cap grind at 0.40
+            grind += add
+            tssp  -= add
+        return {"F200_idx": f200, "tsSPI": tssp, "Accel": accel, "Grind": grind}
+
+    PI_W = pi_weights(distance_m)
+
+    def pi_row(row):
+        parts, weights = [], []
+        for k, wgt in PI_W.items():
+            v = row.get(k, np.nan)
+            if pd.notna(v):
+                parts.append(wgt * (v - 100.0))
+                weights.append(wgt)
+        if not weights:
+            return np.nan
+        scaled = sum(parts) / sum(weights)     # index points above/below 100
+        return max(0.0, round(scaled / 5.0, 3))  # map to ~0–10
+
+    w["PI"] = w.apply(pi_row, axis=1)
+
+    # ---------- GCI (0–10) ----------
+    def bucket(dm):
+        if dm <= 1400: return "SPRINT"
+        if dm < 1800:  return "MILE"
+        if dm < 2200:  return "MIDDLE"
+        return "STAY"
+
+    profile = {
+        "SPRINT": dict(wT=0.20, wPACE=0.45, wSS=0.25, wEFF=0.10),
+        "MILE":   dict(wT=0.24, wPACE=0.40, wSS=0.26, wEFF=0.10),
+        "MIDDLE": dict(wT=0.26, wPACE=0.38, wSS=0.26, wEFF=0.10),
+        "STAY":   dict(wT=0.28, wPACE=0.35, wSS=0.27, wEFF=0.10),
+    }[bucket(distance_m)]
+
+    winner_time = None
+    if "RaceTime_s" in w.columns and w["RaceTime_s"].notna().any():
+        try:
+            winner_time = float(w["RaceTime_s"].min())
+        except Exception:
+            winner_time = None
+
+    def map_pct(x, lo=98.0, hi=104.0):
+        if pd.isna(x): return 0.0
+        return clamp((float(x) - lo) / (hi - lo), 0.0, 1.0)
+
+    gci_vals = []
+    for _, r in w.iterrows():
+        # T = closeness to winner on raw race time
+        T = 0.0
+        if winner_time is not None and pd.notna(r.get("RaceTime_s")):
+            d = float(r["RaceTime_s"]) - winner_time
+            if d <= 0.30:   T = 1.0
+            elif d <= 0.60: T = 0.7
+            elif d <= 1.00: T = 0.4
+            else:           T = 0.2
+
+        LQ = 0.6 * map_pct(r.get("Accel")) + 0.4 * map_pct(r.get("Grind"))
+        SS = map_pct(r.get("tsSPI"))
+
+        acc, grd = r.get("Accel"), r.get("Grind")
+        if pd.isna(acc) or pd.isna(grd):
+            EFF = 0.0
+        else:
+            dev = (abs(acc - 100.0) + abs(grd - 100.0)) / 2.0
+            EFF = clamp(1.0 - dev / 8.0, 0.0, 1.0)
+
+        score01 = (profile["wT"] * T +
+                   profile["wPACE"] * LQ +
+                   profile["wSS"] * SS +
+                   profile["wEFF"] * EFF)
+        gci_vals.append(round(10.0 * score01, 3))
+
+    w["GCI"] = gci_vals
+
+    # tidy rounding
+    for c in ["F200_idx", "tsSPI", "Accel", "Grind", "PI", "GCI", "RaceTime_s"]:
+        if c in w.columns:
+            w[c] = w[c].round(3)
+
+    return w, seg_markers
+
+
+# ---- call it safely
+try:
+    metrics, seg_markers = build_metrics(work, rounded_distance)
+except Exception as e:
+    st.error("Metric computation failed.")
+    if DEBUG:
+        st.exception(e)
+    st.stop()# ======================= Core metric build =================
 def build_metrics(df_in: pd.DataFrame, distance_m: int):
     w = df_in.copy()
 
