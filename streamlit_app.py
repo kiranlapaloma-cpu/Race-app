@@ -141,9 +141,24 @@ def safe_div(num, den):
 def speed_from_time(meters: float, secs):
     return safe_div(meters, secs)
 
-def idx_vs_field(series_speed: pd.Series) -> pd.Series:
-    fld = series_speed.mean(skipna=True)
-    return 100.0 * (series_speed / fld)
+def idx_vs_field(series_speed) -> pd.Series:
+    """
+    Return 100-based index vs field average speed.
+    Handles both pandas Series and numpy arrays safely,
+    ignores NaNs, and avoids division by zero.
+    """
+    # Force to numeric pandas Series
+    ser = pd.to_numeric(pd.Series(series_speed), errors="coerce")
+
+    # Compute field average speed ignoring NaNs
+    fld = np.nanmean(ser.to_numpy(dtype=float))
+
+    # Guard against all-NaN or zero division
+    if not np.isfinite(fld) or fld == 0:
+        return pd.Series(np.nan, index=ser.index)
+
+    # Scale vs field average
+    return 100.0 * (ser / fld)
 
 def sum_cols(df, cols: list[str]) -> pd.Series:
     present = [c for c in cols if c in df.columns]
