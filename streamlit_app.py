@@ -37,6 +37,35 @@ def winsorize(s, p_lo=0.10, p_hi=0.90):
     hi = s.quantile(p_hi)
     return s.clip(lower=lo, upper=hi)
 
+# ------------------ Distance-aware PI weights (Grind cap = 0.40) ------------------
+def pi_weights(distance_m: int) -> dict:
+    """
+    Baseline at 1200m: F200=0.08, tsSPI=0.37, Accel=0.30, Grind=0.25
+    For each +100m above 1200, shift 0.01 from tsSPI -> Grind.
+    Grind is capped at 0.40; when capped, tsSPI is rebalanced to keep sum=1.0.
+    F200 and Accel stay fixed.
+    """
+    F200 = 0.08
+    ACC  = 0.30
+    base_ts = 0.37
+    base_gr = 0.25
+    if distance_m is None:
+        distance_m = 1200
+    delta = max(0, int((int(distance_m) - 1200) // 100))
+
+    # raw linear shift
+    grind = base_gr + 0.01 * delta
+    tssp1 = base_ts - 0.01 * delta
+
+    # cap grind at 0.40 and rebalance tsSPI to keep weights summing to 1.0
+    if grind > 0.40:
+        grind = 0.40
+        tssp1 = 1.0 - F200 - ACC - grind
+    # guard (shouldn’t be needed, but safe)
+    tssp1 = max(0.0, tssp1)
+
+    return {"F200_idx": F200, "tsSPI": tssp1, "Accel": ACC, "Grind": grind}
+
 # ======================= Sidebar ===========================
 with st.sidebar:
     st.markdown("### Data source")
@@ -216,9 +245,23 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int):
         w["_grind_spd"] = np.nan
         w["Grind"] = np.nan
 
-    # ---------- PI v3.1 (robust 0–10 display; baseline = 5) ----------
-    # 1) Compute raw sectional advantage in "points vs field"
-    PI_W = {"F200_idx": 0.08, "tsSPI": 0.37, "Accel": 0.30, "Grind": 0.25}
+# ---------- PI v3.1 (distance-aware weights; baseline 100 -> 0) ----------
+PI_W = pi_weights(distance_m)  # distance_m should be your rounded_distance/race distance variable
+
+def pi_row(row):
+    parts, weights = [], []
+    for k, wgt in PI_W.items():
+        v = row.get(k, np.nan)
+        if pd.notna(v):
+            parts.append(wgt * (v - 100.0))
+            weights.append(wgt)
+    if not weights:
+        return np.nan
+    scaled = sum(parts) / sum(weights)
+    # keep same 0–~10 scaling you used previously (divide by 5)
+    return max(0.0, round(scaled / 5.0, 3))
+
+w["PI"] = w.apply(pi_row, axis=1)
 
     def pi_raw_row(row):
         parts, weights = [], []
