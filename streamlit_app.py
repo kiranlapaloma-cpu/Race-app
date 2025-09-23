@@ -325,19 +325,36 @@ for c in show_cols:
 st.dataframe(metrics[show_cols].sort_values(["PI","Finish_Pos"], ascending=[False, True]),
              use_container_width=True)
 
-# ===================== Sectional Shape Map — Accel vs Grind (full drop-in) =====================
-# Expects columns in `metrics`: ["Horse","Accel","Grind","tsSPI","PI"]
-# Accel & Grind are in "index points" (100 = field average). tsSPI is also index (100 = field avg).
-
-from matplotlib.patches import Rectangle
-from matplotlib.colors import TwoSlopeNorm
-from matplotlib.lines import Line2D
-
+# ===================== Sectional Shape Map — Accel vs Grind =====================
 st.markdown("## Sectional Shape Map — Accel (600→200) vs Grind (200→Finish)")
 
 needed_cols = {"Horse","Accel","Grind","tsSPI","PI"}
 if not needed_cols.issubset(metrics.columns):
     st.warning("Shape Map: required columns missing: " + ", ".join(sorted(needed_cols - set(metrics.columns))))
+else:
+    dfm = metrics.copy()
+    dfm = dfm[["Horse","Accel","Grind","tsSPI","PI"]].dropna(subset=["Accel","Grind","tsSPI"])
+    if dfm.empty:
+        st.info("Not enough data to draw the shape map.")
+    else:
+        xv = (dfm["Accel"] - 100.0).to_numpy()
+        yv = (dfm["Grind"] - 100.0).to_numpy()
+        cv = (dfm["tsSPI"] - 100.0).to_numpy()
+        piv = dfm["PI"].fillna(0).to_numpy()
+        names = dfm["Horse"].astype(str).to_list()
+
+        # guard: avoid crash if all NaN or empty
+        if not np.isfinite(xv).any() or not np.isfinite(yv).any():
+            st.info("No valid sectional differentials available for this race.")
+        else:
+            lim = np.nanmax([np.nanmax(np.abs(xv)), np.nanmax(np.abs(yv))])
+            if not np.isfinite(lim) or lim <= 0:
+                st.info("Insufficient spread to plot the shape map.")
+            else:
+                # scale limits safely
+                lim = max(4.5, np.ceil(lim / 1.5) * 1.5)
+
+                # (the rest of your plotting code follows here…)
 else:
     # Prepare data
     dfm = metrics.copy()
