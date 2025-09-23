@@ -216,20 +216,42 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int):
         w["_grind_spd"] = np.nan
         w["Grind"] = np.nan
 
-    # ---------- PI v3.1 (reweighting; baseline 100 -> 0) ----------
-    PI_W = {"F200_idx":0.08, "tsSPI":0.37, "Accel":0.30, "Grind":0.25}
-    def pi_row(row):
+    # ---------- PI v3.1 (robust 0–10 display; baseline = 5) ----------
+    # 1) Compute raw sectional advantage in "points vs field"
+    PI_W = {"F200_idx": 0.08, "tsSPI": 0.37, "Accel": 0.30, "Grind": 0.25}
+
+    def pi_raw_row(row):
         parts, weights = [], []
         for k, wgt in PI_W.items():
             v = row.get(k, np.nan)
             if pd.notna(v):
-                parts.append(wgt * (v - 100.0))
+                parts.append(wgt * (v - 100.0))   # index points above/below par
                 weights.append(wgt)
         if not weights:
             return np.nan
-        scaled = sum(parts) / sum(weights)
-        return max(0.0, round(scaled / 5.0, 3))  # ~0–10 range
-    w["PI"] = w.apply(pi_row, axis=1)
+        # weighted average of (index - 100)
+        return sum(parts) / sum(weights)
+
+    w["PI_pts"] = w.apply(pi_raw_row, axis=1)  # keep as debug: “points vs field”
+
+    # 2) Robust race-by-race scaling to 0–10 using MAD (center ≈ 5)
+    def robust_sigma(series):
+        s = pd.to_numeric(series, errors="coerce")
+        s = s[np.isfinite(s)]
+        if s.empty:
+            return np.nan
+        med = float(np.median(s))
+        mad = float(np.median(np.abs(s - med)))
+        sigma = 1.4826 * mad                           # MAD -> robust σ
+        return max(1.0, sigma)                         # floor so flat races don’t collapse
+
+    _sigma = robust_sigma(w["PI_pts"])
+    if np.isfinite(_sigma):
+        # z = PI_pts / sigma. Map z to 0..10 with center 5; ±2σ ~ [0..10]
+        PI_display = 5.0 + 2.2 * (w["PI_pts"] / _sigma)
+        w["PI"] = PI_display.clip(lower=0.0, upper=10.0).round(2)
+    else:
+        w["PI"] = np.nan
 
     # ---------- GCI (0–10) ----------
     def bucket(dm):
