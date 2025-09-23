@@ -719,114 +719,142 @@ def uei_row(r):
     return round(val, 3)
 hh["UEI"] = hh.apply(uei_row, axis=1)
 
-# ======================= Hidden Horses v2 — styled table =================
+# ======================= Hidden Horses v2 =================
 st.markdown("## Hidden Horses (v2)")
 
-# Make sure hh exists (built earlier). Recompute Tier/Note if needed.
-def _tier_label(s):
-    if pd.isna(s): return ""
-    if s >= 1.8:   return "🔥 Top Hidden"
-    if s >= 1.2:   return "🟡 Notable Hidden"
+hh = metrics.copy()
+
+# --- SOS (winsorized + robust z) ---
+if {"tsSPI","Accel","Grind"}.issubset(hh.columns):
+    ts_w = winsorize(hh["tsSPI"])
+    ac_w = winsorize(hh["Accel"])
+    gr_w = winsorize(hh["Grind"])
+
+    def rz(s):
+        mu = np.nanmedian(s)
+        sd = mad_std(s)
+        if not np.isfinite(sd) or sd == 0:
+            return pd.Series(np.zeros(len(s)), index=s.index)
+        return (s - mu) / sd
+
+    z_ts = rz(ts_w).clip(-2.5, 3.5)
+    z_ac = rz(ac_w).clip(-2.5, 3.5)
+    z_gr = rz(gr_w).clip(-2.5, 3.5)
+
+    hh["SOS_raw"] = 0.45 * z_ts + 0.35 * z_ac + 0.20 * z_gr
+
+    # normalize SOS → ~[0, 2] using robust min/max in-race
+    q5, q95 = hh["SOS_raw"].quantile(0.05), hh["SOS_raw"].quantile(0.95)
+    denom = (q95 - q5) if (pd.notna(q95) and pd.notna(q5) and q95 > q5) else 1.0
+    hh["SOS"] = 2.0 * (hh["SOS_raw"] - q5) / denom
+    hh["SOS"] = hh["SOS"].clip(lower=0.0, upper=2.0)
+else:
+    hh["SOS"] = 0.0
+
+# --- ASI² (against-shape magnitude with bias scaling) ---
+acc_med = hh["Accel"].median(skipna=True)
+grd_med = hh["Grind"].median(skipna=True)
+bias = (acc_med - 100.0) - (grd_med - 100.0)  # >0 = kick-leaning shape
+B = min(1.0, abs(bias) / 4.0)  # 4 pts = strong bias
+S = hh["Accel"] - hh["Grind"]
+if bias >= 0:
+    hh["ASI2"] = B * ((-S).clip(lower=0.0)) / 5.0  # reward grinders vs kick bias
+else:
+    hh["ASI2"] = B * ((S).clip(lower=0.0)) / 5.0   # reward kick vs grind bias
+
+# --- TFS (trip friction) ---
+# last 3 segments (600 m) std normalized by horse mid speed
+last3 = []
+if len(seg_markers) >= 3:
+    last3 = sorted(seg_markers)[0:3]  # e.g., [200,400,600] in ascending by distance covered
+    last3 = sorted(last3, reverse=True)  # [600,400,200] markers (still refer to "m to go" style)
+
+def tfs_row(row):
+    spds = [row.get(f"spd_{m}") for m in last3 if f"spd_{m}" in row.index]
+    spds = [s for s in spds if pd.notna(s)]
+    if len(spds) < 2:
+        return np.nan
+    sigma = float(np.std(spds, ddof=0))
+    mid = float(row.get("_mid_spd", np.nan))
+    if not np.isfinite(mid) or mid <= 0:
+        return np.nan
+    return 100.0 * (sigma / mid)
+
+hh["TFS"] = hh.apply(tfs_row, axis=1)
+
+# distance-aware TFS gate
+if rounded_distance <= 1200:
+    gate = 4.0
+elif rounded_distance < 1800:
+    gate = 3.5
+else:
+    gate = 3.0
+def tfs_plus(x):
+    if pd.isna(x) or x < gate:
+        return 0.0
+    return min(0.6, (x - gate) / 3.0)
+hh["TFS_plus"] = hh["TFS"].apply(tfs_plus)
+
+# --- UEI (underused engine) ---
+def uei_row(r):
+    ts, ac, gr = r.get("tsSPI"), r.get("Accel"), r.get("Grind")
+    if pd.isna(ts) or pd.isna(ac) or pd.isna(gr):
+        return 0.0
+    val = 0.0
+    # sprint-home: strong cruise but little late show
+    if ts >= 102 and ac <= 98 and gr <= 98:
+        gap = min((ts - 102) / 3.0, 1.0)
+        val = max(val, 0.3 + 0.3 * gap)
+    # fast-early: strong stay/grind but shape suppressed kick
+    if ts >= 102 and gr >= 102 and ac <= 100:
+        gap = min(((ts - 102) + (gr - 102)) / 6.0, 1.0)
+        val = max(val, 0.3 + 0.3 * gap)
+    return round(val, 3)
+hh["UEI"] = hh.apply(uei_row, axis=1)
+
+# --- HiddenScore v2 (0..3) with guards ---
+hidden = 0.55 * hh["SOS"].fillna(0) + 0.30 * hh["ASI2"].fillna(0) + 0.10 * hh["TFS_plus"].fillna(0) + 0.05 * hh["UEI"].fillna(0)
+# field-size guard
+N = int(hh.shape[0])
+if N <= 6:
+    hidden *= 0.9
+hh["HiddenScore"] = hidden.clip(lower=0.0, upper=3.0)
+
+# tiers
+def hh_tier(s):
+    if pd.isna(s):
+        return ""
+    if s >= 1.8:
+        return "🔥 Top Hidden"
+    if s >= 1.2:
+        return "🟡 Notable Hidden"
     return ""
+hh["Tier"] = hh["HiddenScore"].apply(hh_tier)
 
-if "Tier" not in hh.columns:
-    hh["Tier"] = hh["HiddenScore"].apply(_tier_label)
+# notes
+def hh_note(r):
+    bits = []
+    if r.get("Tier","") != "":
+        if r["SOS"] >= 1.2:
+            bits.append("sectionals superior")
+        if r["ASI2"] >= 0.8:
+            bits.append("ran against strong bias")
+        elif r["ASI2"] >= 0.4:
+            bits.append("ran against bias")
+        if r["TFS_plus"] > 0:
+            bits.append("trip friction late")
+        if r["UEI"] >= 0.5:
+            bits.append("latent potential if shape flips")
+    return "; ".join(bits).capitalize() + ("." if bits else "")
+hh["Note"] = hh.apply(hh_note, axis=1)
 
-if "Note" not in hh.columns:
-    def _note_fallback(r):
-        bits = []
-        if r.get("SOS", 0) >= 1.2: bits.append("sectionals superior")
-        if r.get("ASI2", 0) >= 0.8: bits.append("ran against strong bias")
-        elif r.get("ASI2", 0) >= 0.4: bits.append("ran against bias")
-        if r.get("TFS_plus", 0) > 0: bits.append("trip friction late")
-        if r.get("UEI", 0) >= 0.5: bits.append("latent potential if shape flips")
-        return "; ".join(bits).capitalize() + ("." if bits else "")
-    hh["Note"] = hh.apply(_note_fallback, axis=1)
+cols_hh = ["Horse", "Finish_Pos", "PI", "GCI", "tsSPI", "Accel", "Grind", "SOS", "ASI2", "TFS", "UEI", "HiddenScore", "Tier", "Note"]
+for c in cols_hh:
+    if c not in hh.columns:
+        hh[c] = np.nan
 
-# Display frame (clean order & names)
-disp_cols = [
-    "Horse","Finish_Pos","PI","GCI","tsSPI","Accel","Grind",
-    "SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"
-]
-for c in disp_cols:
-    if c not in hh.columns: hh[c] = np.nan
-
-df_disp = (
-    hh.loc[:, disp_cols]
-      .copy()
-      .sort_values(["Tier","HiddenScore","PI"], ascending=[True, False, False])
-      .reset_index(drop=True)
-)
-
-# Nicely named headers
-df_disp = df_disp.rename(columns={
-    "Finish_Pos":"Fin",
-    "tsSPI":"tsSPI",
-    "HiddenScore":"Hidden",
-    "Note":"Why"
-})
-
-# Winner star in name (optional)
-if "Finish_Pos" in hh.columns:
-    mask_win = hh["Finish_Pos"].eq(1)
-    name_map = {}
-    for i, r in hh.iterrows():
-        nm = str(r.get("Horse",""))
-        if pd.notna(r.get("Finish_Pos")) and int(r["Finish_Pos"]) == 1:
-            nm = f"★ {nm}"
-        name_map[str(r.get("Horse",""))] = nm
-    df_disp["Horse"] = df_disp["Horse"].map(lambda x: name_map.get(str(x), str(x)))
-
-# Number formatting
-fmt2 = lambda v: "" if pd.isna(v) else f"{float(v):.2f}"
-for c in ["PI","GCI","tsSPI","Accel","Grind","SOS","ASI2","TFS","UEI","Hidden"]:
-    if c in df_disp.columns:
-        df_disp[c] = df_disp[c].map(fmt2)
-
-# ---- Styling helpers (uses pandas Styler, supported by st.dataframe) ----
-def _row_tier_color(row):
-    t = row.get("Tier","")
-    if "🔥" in t:  # Top Hidden
-        return ['background-color: rgba(212,175,55,0.11)'] * len(row)
-    if "🟡" in t:  # Notable Hidden
-        return ['background-color: rgba(255,193,7,0.10)'] * len(row)
-    return [''] * len(row)
-
-# Gradients on SOS & Hidden (cast back to float)
-g_sos = pd.to_numeric(hh["SOS"], errors="coerce")
-g_hid = pd.to_numeric(hh["HiddenScore"], errors="coerce")
-
-# Build a working frame with real floats for gradients, then show pretty strings
-df_grad = df_disp.copy()
-df_grad["_SOS_val"] = g_sos.reindex(df_disp.index).values
-df_grad["_Hidden_val"] = g_hid.reindex(df_disp.index).values
-
-styler = (
-    df_grad
-    .style
-    .apply(_row_tier_color, axis=1)
-    .background_gradient(subset=["_SOS_val"], cmap="Blues", vmin=max(0, np.nanmin(g_sos)), vmax=np.nanmax(g_sos))
-    .background_gradient(subset=["_Hidden_val"], cmap="Oranges", vmin=0, vmax=max(2.0, np.nanmax(g_hid)))
-    .hide(axis="columns", subset=["_SOS_val","_Hidden_val"])
-    .set_properties(subset=pd.IndexSlice[:, ["Horse","Tier","Why"]], **{"white-space":"nowrap"})
-    .set_table_styles([
-        {"selector":"th", "props":[("text-align","left")]},
-        {"selector":"tbody td", "props":[("vertical-align","middle")]}
-    ])
-)
-
-st.dataframe(
-    styler,
-    use_container_width=True,
-    hide_index=True
-)
-
-st.caption(
-    "Tiering: 🔥 **Top Hidden** (≥1.8), 🟡 **Notable Hidden** (≥1.2). "
-    "**SOS** = sectional outlier (robust); **ASI²** = against-shape magnitude; "
-    "**TFS** = trip friction; **UEI** = underused engine; **Hidden** = combined 0–3. "
-    "★ marks the race winner."
-)
+st.dataframe(hh.sort_values(["Tier","HiddenScore","PI"], ascending=[True, False, False]).loc[:, cols_hh], use_container_width=True)
+st.caption("Hidden Horses v2: SOS = sectional outlier score (robust), ASI² = against-shape magnitude, TFS = trip friction, UEI = underused engine. Tiering: 🔥 ≥1.8, 🟡 ≥1.1.")
 
 # ======================= Footer ===========================
 st.caption(
