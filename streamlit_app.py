@@ -303,43 +303,108 @@ for c in show_cols:
 st.dataframe(metrics[show_cols].sort_values(["PI","Finish_Pos"], ascending=[False, True]),
              use_container_width=True)
 
-# ======================= Visual 1: Shape Map ==============
+# ======================= Visual: Shape Map (improved) =======================
+from matplotlib.patches import Rectangle
+from matplotlib.colors import TwoSlopeNorm
+
 st.markdown("## Sectional Shape Map — Accel (600→200) vs Grind (200→Finish)")
 
-fig, ax = plt.subplots()
-x = metrics["Accel"] - 100.0
-y = metrics["Grind"] - 100.0
-cval = metrics["tsSPI"] - 100.0
-mask = x.notna() & y.notna()
-xv = x[mask].values
-yv = y[mask].values
-cv = cval[mask].values
+# knobs you can tweak
+TOP_LABELS = 8                 # how many runners get arrowed labels
+LABEL_BY   = "both"            # "swing" (|Accel|+|Grind|), "tsspi", or "both"
+DOT_MIN, DOT_MAX = 40, 140     # point-size range for PI bubbles
+TINT = 0.06                    # quadrant tint alpha (0–1)
 
-sc = ax.scatter(xv, yv, c=cv, cmap="coolwarm", s=60, alpha=0.95, edgecolor="k", linewidth=0.4)
+# data
+x = (metrics["Accel"] - 100.0).rename("AccelΔ")     # + = late acceleration
+y = (metrics["Grind"] - 100.0).rename("GrindΔ")     # + = strong last 200
+c = (metrics["tsSPI"] - 100.0).rename("tsSPIΔ")     # colour
+pi = metrics["PI"].fillna(0)
+names = metrics["Horse"].astype(str)
 
-# Arrowed labels to reduce clutter
-names = metrics.loc[mask, "Horse"].astype(str).tolist()
-for (xx, yy, nm) in zip(xv, yv, names):
-    ax.annotate(
-        nm,
-        xy=(xx, yy),
-        xytext=(xx + 2.0, yy + 2.0),
-        textcoords="data",
-        fontsize=8,
-        arrowprops=dict(arrowstyle="->", lw=0.6, alpha=0.8)
+mask = x.notna() & y.notna() & c.notna()
+if mask.sum() == 0:
+    st.info("Not enough data to draw the shape map.")
+else:
+    xv, yv, cv = x[mask].to_numpy(), y[mask].to_numpy(), c[mask].to_numpy()
+    piv = pi[mask].to_numpy()
+    namev = names[mask].tolist()
+
+    # bubble size from PI (safe scaling)
+    if np.isfinite(piv).any():
+        piv_norm = (piv - np.nanmin(piv)) / (np.nanmax(piv) - np.nanmin(piv) + 1e-9)
+        sizes = DOT_MIN + piv_norm * (DOT_MAX - DOT_MIN)
+    else:
+        sizes = np.full_like(xv, DOT_MIN)
+
+    # choose whom to label
+    swing = np.abs(xv) + np.abs(yv)
+    rank_swing = np.argsort(-swing)
+    rank_tsspi = np.argsort(-np.abs(cv))
+    if LABEL_BY == "swing":
+        label_idx = list(rank_swing[:TOP_LABELS])
+    elif LABEL_BY == "tsspi":
+        label_idx = list(rank_tsspi[:TOP_LABELS])
+    else:  # both
+        label_idx = list(dict.fromkeys(list(rank_swing[:TOP_LABELS//2]) + list(rank_tsspi[:TOP_LABELS - TOP_LABELS//2])))
+
+    # figure
+    fig, ax = plt.subplots(figsize=(7.2, 6.0))
+
+    # quadrant tinting (very light)
+    lim = max(4.5, np.ceil(max(np.max(np.abs(xv)), np.max(np.abs(yv))) / 1.5) * 1.5)
+    ax.add_patch(Rectangle((0, 0),  lim,  lim, facecolor="#4daf4a", alpha=TINT, edgecolor="none"))  # +accel +grind
+    ax.add_patch(Rectangle((-lim, 0), lim,  lim, facecolor="#377eb8", alpha=TINT, edgecolor="none")) # -accel +grind
+    ax.add_patch(Rectangle((0, -lim), lim, lim, facecolor="#ff7f00", alpha=TINT, edgecolor="none"))  # +accel -grind
+    ax.add_patch(Rectangle((-lim, -lim), lim, lim, facecolor="#984ea3", alpha=TINT, edgecolor="none"))# -accel -grind
+
+    # zero lines
+    ax.axvline(0, color="gray", lw=1.3, ls=(0,(3,3)))
+    ax.axhline(0, color="gray", lw=1.3, ls=(0,(3,3)))
+
+    # colour centered at 0
+    norm = TwoSlopeNorm(vcenter=0.0, vmin=min(-1.0, float(np.min(cv))), vmax=max(1.0, float(np.max(cv))))
+    sc = ax.scatter(xv, yv, s=sizes, c=cv, cmap="coolwarm", norm=norm,
+                    edgecolor="black", linewidth=0.5, alpha=0.95)
+
+    # arrowed labels for top runners (simple collision-lite offsets)
+    angles = np.linspace(20, 340, num=max(1, len(label_idx)), endpoint=False)
+    for k, i in enumerate(label_idx):
+        dx = 0.85 * np.cos(np.deg2rad(angles[k]))
+        dy = 0.85 * np.sin(np.deg2rad(angles[k]))
+        ax.annotate(
+            namev[i],
+            xy=(xv[i], yv[i]),
+            xytext=(xv[i] + dx, yv[i] + dy),
+            fontsize=8,
+            ha="left", va="center",
+            arrowprops=dict(arrowstyle="->", lw=0.7, shrinkA=0, shrinkB=3, color="black", alpha=0.9),
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.6)
+        )
+
+    ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
+    ax.set_xlabel("Acceleration vs field (points)  →")
+    ax.set_ylabel("Grind vs field (points)  ↑")
+    ax.set_title("Quadrants: +X = late acceleration; +Y = strong last 200. Colour = tsSPI deviation")
+
+    # size legend (PI)
+    from matplotlib.lines import Line2D
+    s_ex = [DOT_MIN, 0.5*(DOT_MIN+DOT_MAX), DOT_MAX]
+    h_ex = [Line2D([0],[0], marker='o', color='w', markerfacecolor='gray',
+                   markersize=np.sqrt(s/np.pi), markeredgecolor='black') for s in s_ex]
+    ax.legend(h_ex, ["PI: low", "PI: mid", "PI: high"],
+              loc="upper left", frameon=False, fontsize=8)
+
+    # colorbar, below plot
+    cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("tsSPI − 100")
+
+    ax.grid(True, linestyle=":", alpha=0.25)
+    st.pyplot(fig)
+    st.caption(
+        "Bubble size = PI (bigger = stronger overall). Red = faster cruise (tsSPI>field), blue = slower. "
+        "Top labels mark the most shape-extreme or cruise-extreme runners."
     )
-
-ax.axvline(0, color="gray", ls="--", lw=1)
-ax.axhline(0, color="gray", ls="--", lw=1)
-ax.set_xlabel("Acceleration vs field (points)")
-ax.set_ylabel("Grind vs field (points)")
-ax.set_title("Quadrants: +X = late acceleration; +Y = strong last 200. Colour = tsSPI deviation")
-cbar = fig.colorbar(sc, ax=ax)
-cbar.set_label("tsSPI − 100")
-# Legend block below the plot
-fig.legend(["Accel axis", "Grind axis"], loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=2, frameon=False)
-st.pyplot(fig)
-st.caption("Tip: top-right = true closers; bottom-right = sharp kick then faded; top-left = on-pace grinders; bottom-left = off-pace & faded.")
 
 # ======================= Visual 2: Pace Curve =============
 st.markdown("## Pace Curve — field average (black) + Top 8 finishers")
