@@ -428,57 +428,56 @@ else:
             "Colour shows cruise strength (tsSPI vs field): red = faster mid-race, blue = slower."
         )
 # ===============================================================================================
-# ======================= Visual 2: Pace Curve =============
-st.markdown("## Pace Curve — field average (black) + Top 8 finishers")
+# ================== Pace Curve — field average + top 8 finishers ==================
+st.markdown("## Pace over 200 m segments (left = early, right = home straight)")
 
-valid_markers = []
-for c in [c for c in work.columns if str(c).endswith("_Time")]:
-    try:
-        valid_markers.append(int(str(c).split("_")[0]))
-    except Exception:
-        pass
-valid_markers = sorted(set(valid_markers), reverse=True)
-valid_markers = [m for m in valid_markers if m >= 200]
-
-if valid_markers:
-    speed_cols = [f"{m}_Time" for m in valid_markers if f"{m}_Time" in work.columns]
-    spd_df = pd.DataFrame({c: 200.0 / as_num(work[c]) for c in speed_cols})
-    field_avg = spd_df.mean(axis=0).values.tolist()
-
-    x_labels = [f"{m-200}–{m}m" for m in valid_markers]
-    x_idx = list(range(len(speed_cols)))
-    fig2, ax2 = plt.subplots()
-    ax2.plot(x_idx, field_avg, linewidth=3, color="black", label="Field average")
-
-    # choose top 8 by finish (else by PI)
-    if "Finish_Pos" in metrics.columns and metrics["Finish_Pos"].notna().any():
-        top8 = metrics.sort_values("Finish_Pos").head(8)
-    else:
-        top8 = metrics.sort_values("PI", ascending=False).head(8)
-
-    cols = color_cycle(8)
-    for i, (_, r) in enumerate(top8.iterrows()):
-        y_vals = []
-        for c in speed_cols:
-            val = r.get(c, np.nan)
-            if pd.isna(val) and "Horse" in metrics.columns and "Horse" in work.columns:
-                row0 = work[work["Horse"] == r.get("Horse")]
-                if not row0.empty:
-                    val = row0.iloc[0].get(c, np.nan)
-            y_vals.append(200.0 / val if pd.notna(val) and val > 0 else np.nan)
-        ax2.plot(x_idx, y_vals, linewidth=2, marker="o", label=str(r.get("Horse", "")), color=cols[i])
-
-    ax2.set_xticks(x_idx)
-    ax2.set_xticklabels(x_labels, rotation=45, ha="right")
-    ax2.set_ylabel("Speed (m/s)")
-    ax2.set_title("Pace over 200 m segments (left = early, right = home straight)")
-    ax2.grid(True, linestyle="--", alpha=0.3)
-    # legend below plot
-    ax2.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=2, frameon=False, fontsize=9)
-    st.pyplot(fig2)
-    st.caption("Black = field average. Coloured lines = Top 8 finishers over the same segments.")
+# Grab time columns
+time_cols = [c for c in df_raw.columns if c.endswith("_Time")]
+if not time_cols:
+    st.warning("No segment times found for pace curve.")
 else:
-    st.info("Not enough 200 m *_Time columns to draw the pace curve.")
+    # Distances in order (descending)
+    seg_markers = sorted([int(c.split("_")[0]) for c in time_cols], reverse=True)
+    # Convert to distance from finish
+    seg_from_finish = [distance_m - d for d in seg_markers]
+
+    fig, ax = plt.subplots(figsize=(8,5))
+
+    # Compute average curve
+    avg_speeds = []
+    for d in seg_markers:
+        tcol = f"{d}_Time"
+        if tcol in df_raw:
+            seg_times = pd.to_numeric(df_raw[tcol], errors="coerce")
+            avg_t = np.nanmean(seg_times)
+            if avg_t > 0:
+                avg_speeds.append(d / avg_t)
+            else:
+                avg_speeds.append(np.nan)
+        else:
+            avg_speeds.append(np.nan)
+
+    ax.plot(seg_from_finish, avg_speeds, color="black", lw=2.2, label="Field average")
+
+    # Top 8 finishers
+    top8 = df_raw.sort_values("Finish_Pos").head(8)
+    for _, row in top8.iterrows():
+        horse = row["Horse"]
+        speeds = []
+        for d in seg_markers:
+            tcol = f"{d}_Time"
+            t = pd.to_numeric(row.get(tcol, np.nan), errors="coerce")
+            speeds.append((d / t) if t > 0 else np.nan)
+
+        ax.plot(seg_from_finish, speeds, lw=1.2, alpha=0.8, label=horse)
+        ax.scatter(seg_from_finish, speeds, s=18, alpha=0.9)
+
+    ax.set_xlabel("Distance from finish (m)")
+    ax.set_ylabel("Speed (m/s)")
+    ax.legend(bbox_to_anchor=(0.5,-0.2), loc="upper center", ncol=3, fontsize=8)
+    ax.grid(True, linestyle=":", alpha=0.4)
+    st.pyplot(fig)
+# ================================================================================
 
 # ======================= Visual 3: Top-8 PI bars ==========
 st.markdown("## Top-8 PI — stacked contributions")
