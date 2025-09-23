@@ -431,36 +431,34 @@ else:
 # ================== Pace Curve — field average + top 8 finishers ==================
 st.markdown("## Pace over 200 m segments (left = early, right = home straight)")
 
-# Grab time columns
-time_cols = [c for c in df_raw.columns if c.endswith("_Time")]
+# Use the main dataframe (adjust name if different in your app)
+df_source = df_raw.copy() if "df_raw" in locals() else metrics.copy()
+
+time_cols = [c for c in df_source.columns if str(c).endswith("_Time")]
 if not time_cols:
     st.warning("No segment times found for pace curve.")
 else:
-    # Distances in order (descending)
+    # Extract numeric distances
     seg_markers = sorted([int(c.split("_")[0]) for c in time_cols], reverse=True)
-    # Convert to distance from finish
     seg_from_finish = [distance_m - d for d in seg_markers]
 
     fig, ax = plt.subplots(figsize=(8,5))
 
-    # Compute average curve
+    # --- Field average ---
     avg_speeds = []
     for d in seg_markers:
         tcol = f"{d}_Time"
-        if tcol in df_raw:
-            seg_times = pd.to_numeric(df_raw[tcol], errors="coerce")
+        if tcol in df_source:
+            seg_times = pd.to_numeric(df_source[tcol], errors="coerce")
             avg_t = np.nanmean(seg_times)
-            if avg_t > 0:
-                avg_speeds.append(d / avg_t)
-            else:
-                avg_speeds.append(np.nan)
+            avg_speeds.append((d / avg_t) if avg_t > 0 else np.nan)
         else:
             avg_speeds.append(np.nan)
 
-    ax.plot(seg_from_finish, avg_speeds, color="black", lw=2.2, label="Field average")
+    ax.plot(seg_from_finish, avg_speeds, color="black", lw=2.2, linestyle="--", label="Field average")
 
-    # Top 8 finishers
-    top8 = df_raw.sort_values("Finish_Pos").head(8)
+    # --- Top 8 finishers ---
+    top8 = df_source.sort_values("Finish_Pos").head(8)
     for _, row in top8.iterrows():
         horse = row["Horse"]
         speeds = []
@@ -469,12 +467,12 @@ else:
             t = pd.to_numeric(row.get(tcol, np.nan), errors="coerce")
             speeds.append((d / t) if t > 0 else np.nan)
 
-        ax.plot(seg_from_finish, speeds, lw=1.2, alpha=0.8, label=horse)
+        ax.plot(seg_from_finish, speeds, lw=1.2, alpha=0.85, label=horse)
         ax.scatter(seg_from_finish, speeds, s=18, alpha=0.9)
 
     ax.set_xlabel("Distance from finish (m)")
     ax.set_ylabel("Speed (m/s)")
-    ax.legend(bbox_to_anchor=(0.5,-0.2), loc="upper center", ncol=3, fontsize=8)
+    ax.legend(bbox_to_anchor=(0.5, -0.2), loc="upper center", ncol=3, fontsize=8)
     ax.grid(True, linestyle=":", alpha=0.4)
     st.pyplot(fig)
 # ================================================================================
