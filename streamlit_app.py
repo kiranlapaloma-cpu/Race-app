@@ -337,16 +337,43 @@ else:
     else:
         sizes = np.full_like(xv, DOT_MIN)
 
-    # choose whom to label
-    swing = np.abs(xv) + np.abs(yv)
-    rank_swing = np.argsort(-swing)
-    rank_tsspi = np.argsort(-np.abs(cv))
-    if LABEL_BY == "swing":
-        label_idx = list(rank_swing[:TOP_LABELS])
-    elif LABEL_BY == "tsspi":
-        label_idx = list(rank_tsspi[:TOP_LABELS])
-    else:  # both
-        label_idx = list(dict.fromkeys(list(rank_swing[:TOP_LABELS//2]) + list(rank_tsspi[:TOP_LABELS - TOP_LABELS//2])))
+# ---- replace the previous "arrowed labels" loop with this (label EVERY runner) ----
+# parameters you can tweak
+LABEL_FONT = 8.5
+ARROW_LEN  = 0.85   # relative axis units for default offset length
+HALO_ALPHA = 0.70
+
+# helper: quadrant-aware base angle so labels fan out in different directions
+def base_angle(xi, yi):
+    if   xi >= 0 and yi >= 0:  # Q1
+        return 35
+    elif xi < 0 and yi >= 0:   # Q2
+        return 145
+    elif xi < 0 and yi < 0:    # Q3
+        return 215
+    else:                      # Q4
+        return 325
+
+# spiral offsets to reduce overlaps without extra libs
+# we sort by (biggest bubbles first) so smaller ones adjust around them
+order = np.argsort(-sizes)
+for k, i in enumerate(order):
+    # spiral step grows slowly with k to spread labels
+    step = 0.12 + 0.055 * k
+    ang  = np.deg2rad(base_angle(xv[i], yv[i]) + (k * 19) % 360)  # rotate a bit each label
+    dx   = (ARROW_LEN * step) * np.cos(ang)
+    dy   = (ARROW_LEN * step) * np.sin(ang)
+
+    ax.annotate(
+        namev[i],
+        xy=(xv[i], yv[i]),
+        xytext=(xv[i] + dx, yv[i] + dy),
+        fontsize=LABEL_FONT,
+        ha="left", va="center",
+        arrowprops=dict(arrowstyle="->", lw=0.7, shrinkA=0, shrinkB=3, color="black", alpha=0.9),
+        bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=HALO_ALPHA)
+    )
+# -------------------------------------------------------------------------------
 
     # figure
     fig, ax = plt.subplots(figsize=(7.2, 6.0))
