@@ -309,24 +309,35 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int, actual_distance_m: float
     else:
         w["Grind"] = np.nan
 
-    # ---------- PI v3.1 (distance-aware + context-aware weights) ----------
+    # ---------- PI v3.1 (distance- & context-aware weights, robust 0–10 scaling) ----------
     acc_med = w["Accel"].median(skipna=True)
     grd_med = w["Grind"].median(skipna=True)
     PI_W = pi_weights_distance_and_context(float(actual_distance_m), acc_med, grd_med)
 
-    def pi_row(row):
+    def pi_pts_row(row):
         parts, weights = [], []
         for k, wgt in PI_W.items():
             v = row.get(k, np.nan)
             if pd.notna(v):
-                parts.append(wgt * (v - 100.0))
+                parts.append(wgt * (v - 100.0))  # index points above/below par
                 weights.append(wgt)
         if not weights:
             return np.nan
-        scaled = sum(parts) / sum(weights)     # index points above/below 100
-        return max(0.0, round(scaled / 5.0, 3))  # map to ~0–10
+        return sum(parts) / sum(weights)       # weighted delta in "points"
+    w["PI_pts"] = w.apply(pi_pts_row, axis=1)
 
-    w["PI"] = w.apply(pi_row, axis=1)
+    # robust race-by-race scaling: median -> 5, ±~2σ -> [~0..10]
+    pts = pd.to_numeric(w["PI_pts"], errors="coerce")
+    med = float(np.nanmedian(pts)) if np.isfinite(np.nanmedian(pts)) else 0.0
+    centered = pts - med
+
+    # robust sigma via MAD; add a small floor so ultra-flat races don't collapse
+    sigma = mad_std(centered)
+    if not np.isfinite(sigma) or sigma < 0.75:
+        sigma = 0.75
+
+    # map to 0..10 (tune 2.2 if you want a slightly wider/narrower spread)
+    w["PI"] = (5.0 + 2.2 * (centered / sigma)).clip(0.0, 10.0).round(2)
 
     # ---------- GCI (0–10) ----------
     def bucket(dm):
