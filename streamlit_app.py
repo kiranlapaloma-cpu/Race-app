@@ -92,7 +92,7 @@ try:
         work = pd.read_csv(up) if up.name.lower().endswith(".csv") else pd.read_excel(up)
         st.success("File loaded.")
     else:
-        # Build manual grid: 1200, 1000, ..., 200 (counts down)
+        # Build manual grid: e.g., 1200, 1000, ..., 200 (counts down)
         segs = list(range(rounded_distance, 0, -200))
         cols = ["Horse", "Finish_Pos"]
         for m in segs:
@@ -339,19 +339,18 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int, actual_distance_m: float
     # map to 0..10 (tune 2.2 if you want a slightly wider/narrower spread)
     w["PI"] = (5.0 + 2.2 * (centered / sigma)).clip(0.0, 10.0).round(2)
 
-    # ---------- GCI (0–10) ----------
-    def bucket(dm):
-        if dm <= 1400: return "SPRINT"
-        if dm < 1800:  return "MILE"
-        if dm < 2200:  return "MIDDLE"
-        return "STAY"
+    # ---------- GCI (0–10) — aligned with distance+context weights ----------
+    # Use the same weighting worldview as PI, then map components to GCI factors.
+    acc_med_g = w["Accel"].median(skipna=True)
+    grd_med_g = w["Grind"].median(skipna=True)
+    Wg = pi_weights_distance_and_context(float(actual_distance_m), acc_med_g, grd_med_g)
 
-    profile = {
-        "SPRINT": dict(wT=0.20, wPACE=0.45, wSS=0.25, wEFF=0.10),
-        "MILE":   dict(wT=0.24, wPACE=0.40, wSS=0.26, wEFF=0.10),
-        "MIDDLE": dict(wT=0.26, wPACE=0.38, wSS=0.26, wEFF=0.10),
-        "STAY":   dict(wT=0.28, wPACE=0.35, wSS=0.27, wEFF=0.10),
-    }[bucket(distance_m)]
+    # Convert PI-style weights to GCI profile:
+    # T (time vs winner) gets a fixed base; Pace = Accel+Grind; SS = tsSPI; EFF = remainder.
+    wT   = 0.25
+    wPACE= Wg["Accel"] + Wg["Grind"]
+    wSS  = Wg["tsSPI"]
+    wEFF = max(0.0, 1.0 - (wT + wPACE + wSS))
 
     winner_time = None
     if "RaceTime_s" in w.columns and w["RaceTime_s"].notna().any():
@@ -375,9 +374,13 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int, actual_distance_m: float
             elif d <= 1.00: T = 0.4
             else:           T = 0.2
 
+        # Late quality: blend Accel & Grind as the "pace" component
         LQ = 0.6 * map_pct(r.get("Accel")) + 0.4 * map_pct(r.get("Grind"))
+
+        # Sustained speed (mid-race)
         SS = map_pct(r.get("tsSPI"))
 
+        # Efficiency: reward balance between Accel & Grind (closer to 100)
         acc, grd = r.get("Accel"), r.get("Grind")
         if pd.isna(acc) or pd.isna(grd):
             EFF = 0.0
@@ -385,10 +388,7 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int, actual_distance_m: float
             dev = (abs(acc - 100.0) + abs(grd - 100.0)) / 2.0
             EFF = clamp(1.0 - dev / 8.0, 0.0, 1.0)
 
-        score01 = (profile["wT"] * T +
-                   profile["wPACE"] * LQ +
-                   profile["wSS"] * SS +
-                   profile["wEFF"] * EFF)
+        score01 = (wT * T) + (wPACE * LQ) + (wSS * SS) + (wEFF * EFF)
         gci_vals.append(round(10.0 * score01, 3))
 
     w["GCI"] = gci_vals
@@ -457,7 +457,7 @@ def _repel_labels_builtin(ax, x, y, labels, *,
                     continue
                 # push apart in display coords
                 ci = ((bbs[i].x0+bbs[i].x1)/2, (bbs[i].y0+bbs[i].y1)/2)
-                cj = ((bbs[j].x0+bbs[j].x1)/2, (bbs[j].y0+bbs[j].y1)/2)
+                cj = ((bbs[j].x0+ bbs[j].x1)/2, (bbs[j].y0+bbs[j].y1)/2)
                 vx, vy = ci[0]-cj[0], ci[1]-cj[1]
                 if vx == 0 and vy == 0: vx = 1.0
                 n = (vx**2 + vy**2)**0.5
@@ -610,7 +610,7 @@ else:
             )
 # =======================================================================================================
 
-# ======================= Visual 2: Pace Curve — accurate segments & thin lines =================
+# ======================= Visual 2: Pace Curve — field average (black) + Top 8 finishers =================
 st.markdown("## Pace Curve — field average (black) + Top 8 finishers")
 
 # Collect all *_Time markers present
@@ -765,8 +765,6 @@ st.markdown("## Hidden Horses (v2)")
 hh = metrics.copy()
 
 # ---------- 1) SOS = sectional outlier score (robust) ----------
-# Winsorise each component to mute single outliers,
-# then convert to robust z-scores using MAD.
 need_cols = {"tsSPI", "Accel", "Grind"}
 if need_cols.issubset(hh.columns) and len(hh) > 0:
     ts_w = winsorize(pd.to_numeric(hh["tsSPI"], errors="coerce"))
@@ -786,7 +784,6 @@ if need_cols.issubset(hh.columns) and len(hh) > 0:
 
     hh["SOS_raw"] = 0.45 * z_ts + 0.35 * z_ac + 0.20 * z_gr
 
-    # Normalize SOS into ~[0, 2] range using robust in-race 5–95% window
     q5, q95 = hh["SOS_raw"].quantile(0.05), hh["SOS_raw"].quantile(0.95)
     denom = (q95 - q5) if (pd.notna(q95) and pd.notna(q5) and (q95 > q5)) else 1.0
     hh["SOS"] = (2.0 * (hh["SOS_raw"] - q5) / denom).clip(lower=0.0, upper=2.0)
@@ -797,7 +794,7 @@ else:
 acc_med = pd.to_numeric(hh.get("Accel"), errors="coerce").median(skipna=True)
 grd_med = pd.to_numeric(hh.get("Grind"), errors="coerce").median(skipna=True)
 bias = (acc_med - 100.0) - (grd_med - 100.0)  # >0 → kick-leaning; <0 → grind-leaning
-B = min(1.0, abs(bias) / 4.0)                  # scale by strength of bias (4 pts ≈ strong)
+B = min(1.0, abs(bias) / 4.0)                  # 4 pts ≈ strong bias
 S = pd.to_numeric(hh.get("Accel"), errors="coerce") - pd.to_numeric(hh.get("Grind"), errors="coerce")
 if bias >= 0:
     # race favoured kick → reward grinders
@@ -807,11 +804,10 @@ else:
     hh["ASI2"] = (B * (S).clip(lower=0.0) / 5.0).fillna(0.0)
 
 # ---------- 3) TFS = trip friction (late variability vs mid pace) ----------
-# Use last 3 segments available (e.g., 600, 400, 200) relative to finish.
 last3 = []
 if len(seg_markers) >= 3:
-    last3 = sorted(seg_markers)[0:3]          # smallest markers (closest to finish)
-    last3 = sorted(last3, reverse=True)       # ensure [600, 400, 200] style ordering
+    last3 = sorted(seg_markers)[0:3]          # closest to finish
+    last3 = sorted(last3, reverse=True)       # [600, 400, 200] style if available
 
 def tfs_row(row):
     spds = [row.get(f"spd_{m}") for m in last3 if f"spd_{m}" in row.index]
@@ -826,7 +822,7 @@ def tfs_row(row):
 
 hh["TFS"] = hh.apply(tfs_row, axis=1)
 
-# Distance-aware TFS gate (more forgiving as distance increases)
+# Distance-aware TFS gate
 if rounded_distance <= 1200:
     gate = 4.0
 elif rounded_distance < 1800:
@@ -862,7 +858,6 @@ def uei_row(r):
 hh["UEI"] = hh.apply(uei_row, axis=1)
 
 # ---------- 5) HiddenScore v2 (0..3) ----------
-# Base weighted blend
 hidden = (
     0.55 * pd.to_numeric(hh["SOS"], errors="coerce").fillna(0.0) +
     0.30 * pd.to_numeric(hh["ASI2"], errors="coerce").fillna(0.0) +
@@ -870,16 +865,13 @@ hidden = (
     0.05 * pd.to_numeric(hh["UEI"], errors="coerce").fillna(0.0)
 )
 
-# Field-size guard (very small races → slightly softer)
 if int(hh.shape[0]) <= 6:
     hidden = hidden * 0.90
 
-# Robust race-by-race normalization to keep tiers consistent
 h_med = float(np.nanmedian(hidden))
 h_mad = float(np.nanmedian(np.abs(hidden - h_med)))
-h_sigma = max(1e-6, 1.4826 * h_mad)                # robust sigma
+h_sigma = max(1e-6, 1.4826 * h_mad)
 
-# Vectorised scaling + clamping (fixes the previous clamp(Series) error)
 hh["HiddenScore"] = (1.2 + (hidden - h_med) / (2.5 * h_sigma)).clip(lower=0.0, upper=3.0)
 
 # ---------- 6) Tiering & Notes ----------
@@ -929,11 +921,12 @@ st.caption(
     "Hidden Horses v2: SOS = sectional outlier (robust), ASI² = against-shape magnitude (bias-aware), "
     "TFS = trip friction, UEI = underused engine. Tiering: 🔥 ≥ 1.8, 🟡 ≥ 1.2."
 )
+
 # ======================= Footer ===========================
 st.caption(
     "Definitions — F200_idx: first 200 m vs field (100 = par). "
     "tsSPI: sustained mid-race pace (excl. first 200 & last 600; adaptive). "
     "Accel: 600→200 window (adaptive); Grind: last 200. "
     "PI v3.1: blended sectional performance with distance- & context-aware weights; small-field stabilized. "
-    "GCI: distance-aware class index (0–10)."
+    "GCI: distance-aware class index (0–10) aligned to the same weights."
 )
