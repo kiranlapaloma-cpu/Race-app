@@ -339,66 +339,69 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int, actual_distance_m: float
     # map to 0..10 (tune 2.2 if you want a slightly wider/narrower spread)
     w["PI"] = (5.0 + 2.2 * (centered / sigma)).clip(0.0, 10.0).round(2)
 
-    # ---------- GCI (0–10) ----------
-    def bucket(dm):
-        if dm <= 1400: return "SPRINT"
-        if dm < 1800:  return "MILE"
-        if dm < 2200:  return "MIDDLE"
-        return "STAY"
+# ---------- GCI (distance-aware, 0–10) ----------
+def gci_weights(dm: int):
+    # Base weights for the four pillars: T (time), LQ (late quality), SS (sustained pace), EFF (efficiency)
+    # Start from your current profile and add gentle distance shaping.
+    if dm <= 1300:   # SPRINT
+        wT, wLQ, wSS, wEFF = 0.20, 0.46, 0.24, 0.10   # a touch more LQ (Accel)
+        lq_acc, lq_gr = 0.65, 0.35
+    elif dm <= 1700: # MILE
+        wT, wLQ, wSS, wEFF = 0.24, 0.40, 0.26, 0.10
+        lq_acc, lq_gr = 0.55, 0.45
+    elif dm <= 2200: # MIDDLE
+        wT, wLQ, wSS, wEFF = 0.26, 0.38, 0.26, 0.10
+        lq_acc, lq_gr = 0.45, 0.55
+    else:            # STAY
+        wT, wLQ, wSS, wEFF = 0.28, 0.36, 0.26, 0.10   # slightly less LQ overall
+        lq_acc, lq_gr = 0.35, 0.65
+    return (wT, wLQ, wSS, wEFF, lq_acc, lq_gr)
 
-    profile = {
-        "SPRINT": dict(wT=0.20, wPACE=0.45, wSS=0.25, wEFF=0.10),
-        "MILE":   dict(wT=0.24, wPACE=0.40, wSS=0.26, wEFF=0.10),
-        "MIDDLE": dict(wT=0.26, wPACE=0.38, wSS=0.26, wEFF=0.10),
-        "STAY":   dict(wT=0.28, wPACE=0.35, wSS=0.27, wEFF=0.10),
-    }[bucket(distance_m)]
+winner_time = None
+if "RaceTime_s" in w.columns and w["RaceTime_s"].notna().any():
+    try:
+        winner_time = float(w["RaceTime_s"].min())
+    except Exception:
+        winner_time = None
 
-    winner_time = None
-    if "RaceTime_s" in w.columns and w["RaceTime_s"].notna().any():
-        try:
-            winner_time = float(w["RaceTime_s"].min())
-        except Exception:
-            winner_time = None
+def pct_01(x, lo=98.0, hi=104.0):
+    # map index around 100 to [0,1]
+    if pd.isna(x): return 0.0
+    return float(np.clip((float(x) - lo) / (hi - lo), 0.0, 1.0))
 
-    def map_pct(x, lo=98.0, hi=104.0):
-        if pd.isna(x): return 0.0
-        return clamp((float(x) - lo) / (hi - lo), 0.0, 1.0)
+wT, wLQ, wSS, wEFF, lq_acc_w, lq_gr_w = gci_weights(distance_m)
 
-    gci_vals = []
-    for _, r in w.iterrows():
-        # T = closeness to winner on raw race time
-        T = 0.0
-        if winner_time is not None and pd.notna(r.get("RaceTime_s")):
-            d = float(r["RaceTime_s"]) - winner_time
-            if d <= 0.30:   T = 1.0
-            elif d <= 0.60: T = 0.7
-            elif d <= 1.00: T = 0.4
-            else:           T = 0.2
+gci_vals = []
+for _, r in w.iterrows():
+    # T: percentage behind winner (distance-normalised)
+    T = 0.0
+    if winner_time and pd.notna(r.get("RaceTime_s")):
+        gap_pct = max(0.0, (float(r["RaceTime_s"]) - winner_time) / winner_time)  # e.g. 0.003 = 0.3%
+        if gap_pct <= 0.003:      T = 1.0
+        elif gap_pct <= 0.008:    T = 0.7
+        elif gap_pct <= 0.016:    T = 0.4
+        else:                     T = 0.2
 
-        LQ = 0.6 * map_pct(r.get("Accel")) + 0.4 * map_pct(r.get("Grind"))
-        SS = map_pct(r.get("tsSPI"))
+    # LQ: distance-aware blend of Accel & Grind (index → [0,1])
+    A = pct_01(r.get("Accel"))
+    G = pct_01(r.get("Grind"))
+    LQ = lq_acc_w * A + lq_gr_w * G
 
-        acc, grd = r.get("Accel"), r.get("Grind")
-        if pd.isna(acc) or pd.isna(grd):
-            EFF = 0.0
-        else:
-            dev = (abs(acc - 100.0) + abs(grd - 100.0)) / 2.0
-            EFF = clamp(1.0 - dev / 8.0, 0.0, 1.0)
+    # SS: tsSPI mapped to [0,1] with gentle distance drift already handled in PI (we keep constant here)
+    SS = pct_01(r.get("tsSPI"))
 
-        score01 = (profile["wT"] * T +
-                   profile["wPACE"] * LQ +
-                   profile["wSS"] * SS +
-                   profile["wEFF"] * EFF)
-        gci_vals.append(round(10.0 * score01, 3))
+    # EFF: favour balance between Accel and Grind
+    acc, grd = r.get("Accel"), r.get("Grind")
+    if pd.isna(acc) or pd.isna(grd):
+        EFF = 0.0
+    else:
+        dev = (abs(acc - 100.0) + abs(grd - 100.0)) / 2.0
+        EFF = float(np.clip(1.0 - dev / 8.0, 0.0, 1.0))
 
-    w["GCI"] = gci_vals
+    score01 = wT*T + wLQ*LQ + wSS*SS + wEFF*EFF
+    gci_vals.append(round(10.0 * score01, 3))
 
-    # tidy rounding
-    for c in ["F200_idx", "tsSPI", "Accel", "Grind", "PI", "GCI", "RaceTime_s"]:
-        if c in w.columns:
-            w[c] = w[c].round(3)
-
-    return w, seg_markers
+w["GCI"] = gci_vals
 
 # ---- compute metrics safely
 try:
