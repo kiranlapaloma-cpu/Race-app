@@ -758,196 +758,176 @@ if not top8_pi.empty:
 else:
     st.info("No PI values available to plot the stacked contributions.")
 
-# ======================= Hidden Horses v2 — distance aware ====================
+# ======================= Hidden Horses (v2) =================
 st.markdown("## Hidden Horses (v2)")
 
+# Work on a copy so we don't mutate `metrics`
 hh = metrics.copy()
 
-# --- distance-aware weights for the SOS core (tsSPI / Accel / Grind) ---
-def hh_sos_weights(dm: int):
-    # Baseline near 1200m
-    w_ts, w_ac, w_gr = 0.45, 0.35, 0.20
-    dm = 1200 if pd.isna(dm) else int(dm)
-    if dm < 1100:                   # sharp sprints
-        w_ts, w_ac, w_gr = 0.40, 0.45, 0.15
-    elif 1100 <= dm < 1400:         # sprints
-        w_ts, w_ac, w_gr = 0.43, 0.37, 0.20
-    elif 1400 <= dm < 1800:         # mile-ish
-        w_ts, w_ac, w_gr = 0.42, 0.33, 0.25
-    elif 1800 <= dm < 2400:         # middle
-        w_ts, w_ac, w_gr = 0.40, 0.28, 0.32
-    else:                            # staying trips
-        w_ts, w_ac, w_gr = 0.38, 0.22, 0.40
-    # tidy normalization
-    s = w_ts + w_ac + w_gr
-    return (w_ts/s, w_ac/s, w_gr/s)
+# ---------- 1) SOS = sectional outlier score (robust) ----------
+# Winsorise each component to mute single outliers,
+# then convert to robust z-scores using MAD.
+need_cols = {"tsSPI", "Accel", "Grind"}
+if need_cols.issubset(hh.columns) and len(hh) > 0:
+    ts_w = winsorize(pd.to_numeric(hh["tsSPI"], errors="coerce"))
+    ac_w = winsorize(pd.to_numeric(hh["Accel"], errors="coerce"))
+    gr_w = winsorize(pd.to_numeric(hh["Grind"], errors="coerce"))
 
-w_ts, w_ac, w_gr = hh_sos_weights(rounded_distance)
+    def rz(s: pd.Series) -> pd.Series:
+        mu = np.nanmedian(s)
+        sd = mad_std(s)
+        if not np.isfinite(sd) or sd == 0:
+            return pd.Series(np.zeros(len(s)), index=s.index)
+        return (s - mu) / sd
 
-# --- robust transforms for each index ---
-def rz(series: pd.Series):
-    s = winsorize(series)
-    mu = np.nanmedian(s)
-    sd = mad_std(s)
-    if not np.isfinite(sd) or sd == 0:
-        return pd.Series(np.zeros(len(s)), index=s.index)
-    return (s - mu) / sd
+    z_ts = rz(ts_w).clip(-2.5, 3.5)
+    z_ac = rz(ac_w).clip(-2.5, 3.5)
+    z_gr = rz(gr_w).clip(-2.5, 3.5)
 
-z_ts = rz(hh["tsSPI"]) if "tsSPI" in hh else pd.Series(0, index=hh.index)
-z_ac = rz(hh["Accel"]) if "Accel" in hh else pd.Series(0, index=hh.index)
-z_gr = rz(hh["Grind"]) if "Grind" in hh else pd.Series(0, index=hh.index)
+    hh["SOS_raw"] = 0.45 * z_ts + 0.35 * z_ac + 0.20 * z_gr
 
-# --- SOS: sectional outlier score (distance-aware blend) ---
-hh["SOS_raw"] = w_ts * z_ts + w_ac * z_ac + w_gr * z_gr
-# map SOS_raw to [0..2] robustly so scale is consistent across races
-q5, q95 = hh["SOS_raw"].quantile(0.05), hh["SOS_raw"].quantile(0.95)
-den = (q95 - q5) if (pd.notna(q95) and pd.notna(q5) and q95 > q5) else 1.0
-hh["SOS"] = ((hh["SOS_raw"] - q5) / den).clip(0, 1.0) * 2.0
-
-# --- ASI²: against-shape magnitude (respects observed race bias) ---
-acc_med = hh["Accel"].median(skipna=True)
-grd_med = hh["Grind"].median(skipna=True)
-bias = (acc_med - 100.0) - (grd_med - 100.0)  # >0 = “kick bias”, <0 = “grind bias”
-
-# distance-aware sensitivity (staying trips: bias matters more)
-if rounded_distance < 1400:
-    bias_unit = 5.0  # need ~5 pts to be "strong" in sprints
-elif rounded_distance < 2000:
-    bias_unit = 4.0
+    # Normalize SOS into ~[0, 2] range using robust in-race 5–95% window
+    q5, q95 = hh["SOS_raw"].quantile(0.05), hh["SOS_raw"].quantile(0.95)
+    denom = (q95 - q5) if (pd.notna(q95) and pd.notna(q5) and (q95 > q5)) else 1.0
+    hh["SOS"] = (2.0 * (hh["SOS_raw"] - q5) / denom).clip(lower=0.0, upper=2.0)
 else:
-    bias_unit = 3.0
+    hh["SOS"] = 0.0
 
-B = min(1.0, abs(bias) / bias_unit)  # 0..1
-shape_contra = (hh["Grind"] - hh["Accel"]) if bias > 0 else (hh["Accel"] - hh["Grind"])
-# scale 0..1 roughly per 5 pts against the bias
-hh["ASI2"] = (B * (shape_contra.clip(lower=0.0) / 5.0)).fillna(0.0)
+# ---------- 2) ASI² = against-shape magnitude (bias-aware) ----------
+acc_med = pd.to_numeric(hh.get("Accel"), errors="coerce").median(skipna=True)
+grd_med = pd.to_numeric(hh.get("Grind"), errors="coerce").median(skipna=True)
+bias = (acc_med - 100.0) - (grd_med - 100.0)  # >0 → kick-leaning; <0 → grind-leaning
+B = min(1.0, abs(bias) / 4.0)                  # scale by strength of bias (4 pts ≈ strong)
+S = pd.to_numeric(hh.get("Accel"), errors="coerce") - pd.to_numeric(hh.get("Grind"), errors="coerce")
+if bias >= 0:
+    # race favoured kick → reward grinders
+    hh["ASI2"] = (B * (-S).clip(lower=0.0) / 5.0).fillna(0.0)
+else:
+    # race favoured grind → reward kickers
+    hh["ASI2"] = (B * (S).clip(lower=0.0) / 5.0).fillna(0.0)
 
-# --- TFS: trip friction (late variability vs mid pace), distance-aware gate ---
-# compute last-3 segment speeds std / mid-speed
+# ---------- 3) TFS = trip friction (late variability vs mid pace) ----------
+# Use last 3 segments available (e.g., 600, 400, 200) relative to finish.
 last3 = []
 if len(seg_markers) >= 3:
-    last3 = sorted(seg_markers)[0:3]        # smallest markers by "m to go" => last segments
-    last3 = sorted(last3, reverse=True)     # [600, 400, 200] style if available
+    last3 = sorted(seg_markers)[0:3]          # smallest markers (closest to finish)
+    last3 = sorted(last3, reverse=True)       # ensure [600, 400, 200] style ordering
 
-def tfs_row(r):
-    spds = [r.get(f"spd_{m}") for m in last3 if f"spd_{m}" in r.index]
+def tfs_row(row):
+    spds = [row.get(f"spd_{m}") for m in last3 if f"spd_{m}" in row.index]
     spds = [s for s in spds if pd.notna(s)]
     if len(spds) < 2:
         return np.nan
     sigma = float(np.std(spds, ddof=0))
-    mid = float(r.get("_mid_spd", np.nan))
+    mid = float(row.get("_mid_spd", np.nan))
     if not np.isfinite(mid) or mid <= 0:
         return np.nan
     return 100.0 * (sigma / mid)
 
 hh["TFS"] = hh.apply(tfs_row, axis=1)
 
-# gate rises slightly for longer trips (more stretching expected)
+# Distance-aware TFS gate (more forgiving as distance increases)
 if rounded_distance <= 1200:
-    gate = 4.25
-elif rounded_distance < 1600:
     gate = 4.0
-elif rounded_distance < 2000:
-    gate = 3.6
+elif rounded_distance < 1800:
+    gate = 3.5
 else:
-    gate = 3.2
+    gate = 3.0
 
 def tfs_plus(x):
     if pd.isna(x) or x < gate:
         return 0.0
-    # cap contribution; the further above gate, the more credit (soft)
-    return min(0.7, (x - gate) / 3.0)
+    return min(0.6, (x - gate) / 3.0)
 
 hh["TFS_plus"] = hh["TFS"].apply(tfs_plus)
 
-# --- UEI: underused engine (distance-aware triggers) ---
+# ---------- 4) UEI = underused engine indicators ----------
 def uei_row(r):
-    ts, ac, gr = r.get("tsSPI"), r.get("Accel"), r.get("Grind")
+    ts = pd.to_numeric(r.get("tsSPI"), errors="coerce")
+    ac = pd.to_numeric(r.get("Accel"), errors="coerce")
+    gr = pd.to_numeric(r.get("Grind"), errors="coerce")
     if pd.isna(ts) or pd.isna(ac) or pd.isna(gr):
         return 0.0
-
-    if rounded_distance <= 1200:
-        # sprint: hot cruise (tsSPI high) but no late show
-        cond1 = ts >= 102 and ac <= 98 and gr <= 98
-        cond2 = ts >= 103 and min(ac, gr) <= 99
-    elif rounded_distance <= 1800:
-        cond1 = ts >= 102 and (ac <= 99 or gr <= 99)
-        cond2 = (ts >= 101 and gr >= 101 and ac <= 100)
-    else:
-        # staying: stamina hinted (grind↑) yet speed not deployed
-        cond1 = (ts >= 101 and gr >= 102 and ac <= 100)
-        cond2 = (ts >= 102 and ac <= 99)
-
     val = 0.0
-    if cond1:
-        val = max(val, 0.35)
-    if cond2:
-        val = max(val, 0.55)
-    # light scaling by how strong the underlying signals are
-    strength = (max(0.0, ts - 100) + max(0.0, gr - 100)) / 10.0
-    return clamp(val + 0.2 * strength, 0.0, 1.0)
+    # Sprint-home: strong cruise but little late show
+    if ts >= 102 and ac <= 98 and gr <= 98:
+        gap = min((ts - 102) / 3.0, 1.0)
+        val = max(val, 0.3 + 0.3 * gap)
+    # Fast-early: strong stay/grind but shape suppressed kick
+    if ts >= 102 and gr >= 102 and ac <= 100:
+        gap = min(((ts - 102) + (gr - 102)) / 6.0, 1.0)
+        val = max(val, 0.3 + 0.3 * gap)
+    return round(val, 3)
 
 hh["UEI"] = hh.apply(uei_row, axis=1)
 
-# --- HiddenScore & tiers (stable across races) ---
-# distance-aware component weights (SOS dominates; bias & trip add nuance)
-if rounded_distance < 1400:
-    a_sos, a_asi, a_tfs, a_uei = 0.55, 0.20, 0.15, 0.10
-elif rounded_distance < 2000:
-    a_sos, a_asi, a_tfs, a_uei = 0.55, 0.25, 0.12, 0.08
-else:
-    a_sos, a_asi, a_tfs, a_uei = 0.50, 0.28, 0.15, 0.07
+# ---------- 5) HiddenScore v2 (0..3) ----------
+# Base weighted blend
+hidden = (
+    0.55 * pd.to_numeric(hh["SOS"], errors="coerce").fillna(0.0) +
+    0.30 * pd.to_numeric(hh["ASI2"], errors="coerce").fillna(0.0) +
+    0.10 * pd.to_numeric(hh["TFS_plus"], errors="coerce").fillna(0.0) +
+    0.05 * pd.to_numeric(hh["UEI"], errors="coerce").fillna(0.0)
+)
 
-hidden = (a_sos * hh["SOS"].fillna(0.0) +
-          a_asi * hh["ASI2"].fillna(0.0) +
-          a_tfs * hh["TFS_plus"].fillna(0.0) +
-          a_uei * hh["UEI"].fillna(0.0))
+# Field-size guard (very small races → slightly softer)
+if int(hh.shape[0]) <= 6:
+    hidden = hidden * 0.90
 
-# small-field dampener
-if hh.shape[0] <= 6:
-    hidden *= 0.9
-
-# normalize to 0..3 using robust spread so tiers are consistent
+# Robust race-by-race normalization to keep tiers consistent
 h_med = float(np.nanmedian(hidden))
 h_mad = float(np.nanmedian(np.abs(hidden - h_med)))
-h_sigma = max(1e-6, 1.4826 * h_mad)
-hh["HiddenScore"] = clamp(1.2 + (hidden - h_med) / (2.5 * h_sigma), 0.0, 3.0)
+h_sigma = max(1e-6, 1.4826 * h_mad)                # robust sigma
 
+# Vectorised scaling + clamping (fixes the previous clamp(Series) error)
+hh["HiddenScore"] = (1.2 + (hidden - h_med) / (2.5 * h_sigma)).clip(lower=0.0, upper=3.0)
+
+# ---------- 6) Tiering & Notes ----------
 def hh_tier(s):
     if pd.isna(s): return ""
     if s >= 1.8:   return "🔥 Top Hidden"
-    if s >= 1.1:   return "🟡 Notable Hidden"
+    if s >= 1.2:   return "🟡 Notable Hidden"
     return ""
 
 hh["Tier"] = hh["HiddenScore"].apply(hh_tier)
 
-# Notes
 def hh_note(r):
     bits = []
-    if r.get("Tier", ""):
-        if r.get("SOS", 0) >= 1.2:     bits.append("sectionals superior")
-        if r.get("ASI2", 0) >= 0.8:     bits.append("ran against strong bias")
-        elif r.get("ASI2", 0) >= 0.4:   bits.append("ran against bias")
-        if r.get("TFS_plus", 0) > 0:    bits.append("trip friction late")
-        if r.get("UEI", 0) >= 0.5:      bits.append("latent potential if shape flips")
+    if r.get("Tier", "") != "":
+        if pd.to_numeric(r.get("SOS"), errors="coerce") >= 1.2:
+            bits.append("sectionals superior")
+        asi2 = pd.to_numeric(r.get("ASI2"), errors="coerce")
+        if asi2 >= 0.8:
+            bits.append("ran against strong bias")
+        elif asi2 >= 0.4:
+            bits.append("ran against bias")
+        if pd.to_numeric(r.get("TFS_plus"), errors="coerce") > 0:
+            bits.append("trip friction late")
+        if pd.to_numeric(r.get("UEI"), errors="coerce") >= 0.5:
+            bits.append("latent potential if shape flips")
     return ("; ".join(bits).capitalize() + ".") if bits else ""
 
 hh["Note"] = hh.apply(hh_note, axis=1)
 
-# Output table (stable column order)
-cols_hh = ["Horse","Finish_Pos","PI","GCI","tsSPI","Accel","Grind",
-           "SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"]
+# ---------- 7) Display ----------
+cols_hh = [
+    "Horse", "Finish_Pos", "PI", "GCI",
+    "tsSPI", "Accel", "Grind",
+    "SOS", "ASI2", "TFS", "UEI",
+    "HiddenScore", "Tier", "Note"
+]
 for c in cols_hh:
-    if c not in hh.columns: hh[c] = np.nan
+    if c not in hh.columns:
+        hh[c] = np.nan
 
 st.dataframe(
-    hh.sort_values(["Tier","HiddenScore","PI"], ascending=[True, False, False])[cols_hh],
+    hh.sort_values(["Tier", "HiddenScore", "PI"], ascending=[True, False, False])[cols_hh],
     use_container_width=True
 )
+
 st.caption(
-    "Hidden Horses v2 (distance-aware). SOS blends tsSPI/Accel/Grind with distance context; "
-    "ASI² rewards running against the race’s observed bias; TFS captures late friction; "
-    "UEI flags unused engine. Scores normalized so tiers are stable across races."
+    "Hidden Horses v2: SOS = sectional outlier (robust), ASI² = against-shape magnitude (bias-aware), "
+    "TFS = trip friction, UEI = underused engine. Tiering: 🔥 ≥ 1.8, 🟡 ≥ 1.2."
 )
 # ======================= Footer ===========================
 st.caption(
