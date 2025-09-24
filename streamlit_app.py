@@ -339,76 +339,84 @@ def build_metrics(df_in: pd.DataFrame, distance_m: int, actual_distance_m: float
     # map to 0..10 (tune 2.2 if you want a slightly wider/narrower spread)
     w["PI"] = (5.0 + 2.2 * (centered / sigma)).clip(0.0, 10.0).round(2)
 
-    # ---------- GCI (0–10) ----------
-    def bucket(dm):
-        if dm <= 1400: return "SPRINT"
-        if dm < 1800:  return "MILE"
-        if dm < 2200:  return "MIDDLE"
-        return "STAY"
+# ---------- GCI (0–10) — distance & context aligned ----------
+def _gci_profile(dm: float) -> dict:
+    # Distance-aware class weighting (Time/ Pace / Sustained / Efficiency)
+    if dm <= 1400:   # SPRINT
+        return dict(wT=0.20, wPACE=0.45, wSS=0.25, wEFF=0.10)
+    elif dm < 1800:  # MILE
+        return dict(wT=0.24, wPACE=0.40, wSS=0.26, wEFF=0.10)
+    elif dm < 2200:  # MIDDLE
+        return dict(wT=0.26, wPACE=0.38, wSS=0.26, wEFF=0.10)
+    else:            # STAY
+        return dict(wT=0.28, wPACE=0.35, wSS=0.27, wEFF=0.10)
 
-    profile = {
-        "SPRINT": dict(wT=0.20, wPACE=0.45, wSS=0.25, wEFF=0.10),
-        "MILE":   dict(wT=0.24, wPACE=0.40, wSS=0.26, wEFF=0.10),
-        "MIDDLE": dict(wT=0.26, wPACE=0.38, wSS=0.26, wEFF=0.10),
-        "STAY":   dict(wT=0.28, wPACE=0.35, wSS=0.27, wEFF=0.10),
-    }[bucket(distance_m)]
+def _map_pct(x, lo=98.0, hi=104.0):
+    if pd.isna(x): return 0.0
+    return clamp((float(x) - lo) / (hi - lo), 0.0, 1.0)
 
+def compute_gci(df: pd.DataFrame, distance_m: float) -> pd.Series:
+    dm = float(distance_m or 1200)
+    prof = _gci_profile(dm)
+
+    # Winner time (in seconds) from summed splits
     winner_time = None
-    if "RaceTime_s" in w.columns and w["RaceTime_s"].notna().any():
+    if "RaceTime_s" in df.columns and df["RaceTime_s"].notna().any():
         try:
-            winner_time = float(w["RaceTime_s"].min())
+            winner_time = float(df["RaceTime_s"].min())
         except Exception:
             winner_time = None
 
-    def map_pct(x, lo=98.0, hi=104.0):
-        if pd.isna(x): return 0.0
-        return clamp((float(x) - lo) / (hi - lo), 0.0, 1.0)
+    # Context bias (same idea as PI): +ve → kick-leaning; −ve → grind-leaning
+    acc_med = pd.to_numeric(df.get("Accel"), errors="coerce").median(skipna=True)
+    grd_med = pd.to_numeric(df.get("Grind"), errors="coerce").median(skipna=True)
+    bias = (acc_med - grd_med) if np.isfinite(acc_med) and np.isfinite(grd_med) else 0.0
+    # Tiny nudge of the late-quality blend using tanh scaling (≤ ±0.10 total shift)
+    shift = 0.10 * math.tanh(abs(bias) / 6.0)
+    wA, wG = 0.60, 0.40  # baseline inside LQ
+    if bias > 0:   # kick-biased → emphasise Grind inside LQ
+        wA, wG = max(0.40, wA - shift), min(0.60, wG + shift)
+    elif bias < 0: # grind-biased → emphasise Accel inside LQ
+        wA, wG = min(0.70, wA + shift), max(0.30, wG - shift)
 
-    gci_vals = []
-    for _, r in w.iterrows():
-        # T = closeness to winner on raw race time
+    # Distance-scaled time tolerance (bigger distances → bigger margins reasonable)
+    # Base thresholds: 0.30 / 0.60 / 1.00s @1200m, scale ~ sqrt(dm/1200)
+    tol_scale = math.sqrt(max(0.5, dm / 1200.0))
+    t1, t2, t3 = 0.30*tol_scale, 0.60*tol_scale, 1.00*tol_scale
+
+    out = []
+    for _, r in df.iterrows():
+        # T: closeness to winner on raw race time
         T = 0.0
-        if winner_time is not None and pd.notna(r.get("RaceTime_s")):
+        if (winner_time is not None) and pd.notna(r.get("RaceTime_s")):
             d = float(r["RaceTime_s"]) - winner_time
-            if d <= 0.30:   T = 1.0
-            elif d <= 0.60: T = 0.7
-            elif d <= 1.00: T = 0.4
-            else:           T = 0.2
+            if d <= t1:   T = 1.0
+            elif d <= t2: T = 0.7
+            elif d <= t3: T = 0.4
+            else:         T = 0.2
 
-        LQ = 0.6 * map_pct(r.get("Accel")) + 0.4 * map_pct(r.get("Grind"))
-        SS = map_pct(r.get("tsSPI"))
+        # LQ: bias-aware blend of Accel & Grind as class signal
+        A = _map_pct(r.get("Accel"))
+        G = _map_pct(r.get("Grind"))
+        LQ = wA*A + wG*G
 
-        acc, grd = r.get("Accel"), r.get("Grind")
+        # SS: sustained mid-race class (already distance-consistent via tsSPI definition)
+        SS = _map_pct(r.get("tsSPI"))
+
+        # EFF: balance of late profile (penalise lopsidedness)
+        acc = r.get("Accel"); grd = r.get("Grind")
         if pd.isna(acc) or pd.isna(grd):
             EFF = 0.0
         else:
             dev = (abs(acc - 100.0) + abs(grd - 100.0)) / 2.0
             EFF = clamp(1.0 - dev / 8.0, 0.0, 1.0)
 
-        score01 = (profile["wT"] * T +
-                   profile["wPACE"] * LQ +
-                   profile["wSS"] * SS +
-                   profile["wEFF"] * EFF)
-        gci_vals.append(round(10.0 * score01, 3))
+        score01 = (prof["wT"]*T + prof["wPACE"]*LQ + prof["wSS"]*SS + prof["wEFF"]*EFF)
+        out.append(round(10.0 * score01, 3))
+    return pd.Series(out, index=df.index)
 
-    w["GCI"] = gci_vals
-
-    # tidy rounding
-    for c in ["F200_idx", "tsSPI", "Accel", "Grind", "PI", "GCI", "RaceTime_s"]:
-        if c in w.columns:
-            w[c] = w[c].round(3)
-
-    return w, seg_markers
-
-# ---- compute metrics safely
-try:
-    metrics, seg_markers = build_metrics(work, int(rounded_distance), float(race_distance_input))
-except Exception as e:
-    st.error("Metric computation failed.")
-    if DEBUG:
-        st.exception(e)
-    st.stop()
-
+# ---- apply (replace your old GCI block with this call) ----
+metrics["GCI"] = compute_gci(metrics, float(race_distance_input))
 # ======================= Metrics table =====================
 st.markdown("## Sectional Metrics (PI v3.1 & GCI)")
 show_cols = ["Horse", "Finish_Pos", "RaceTime_s", "F200_idx", "tsSPI", "Accel", "Grind", "PI", "GCI"]
