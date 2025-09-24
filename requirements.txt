@@ -3,3 +3,4 @@ pandas
 numpy
 matplotlib
 openpyxl
+adjustText>=0.8
