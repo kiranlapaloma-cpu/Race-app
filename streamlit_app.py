@@ -419,17 +419,99 @@ st.dataframe(metrics[show_cols].sort_values(["PI","Finish_Pos"], ascending=[Fals
              use_container_width=True)
 
 # ===================== Sectional Shape Map — Accel (600→200) vs Grind (200→Finish) =====================
+from matplotlib.patches import Rectangle
+from matplotlib.colors import TwoSlopeNorm
+from matplotlib.lines import Line2D
+import io
+
+# --- neat labeling helpers (uses adjustText if available; otherwise a built-in repeller) ---
+def _repel_labels_builtin(ax, x, y, labels, *,
+                          init_shift=0.18, k_attract=0.006, k_repel=0.012,
+                          max_iter=250):
+    import numpy as np
+    from matplotlib.lines import Line2D
+    trans = ax.transData
+    renderer = ax.figure.canvas.get_renderer()
+    xy = np.column_stack([x, y]).astype(float)
+    offs = np.zeros_like(xy)
+    for i, (xi, yi) in enumerate(xy):
+        offs[i] = [init_shift if xi >= 0 else -init_shift,
+                   init_shift if yi >= 0 else -init_shift]
+
+    texts, lines = [], []
+    for (xi, yi), (dx, dy), lab in zip(xy, offs, labels):
+        t = ax.text(xi+dx, yi+dy, lab, fontsize=8.6,
+                    va="center", ha="left",
+                    bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.70))
+        texts.append(t)
+        ln = Line2D([xi, xi+dx], [yi, yi+dy], lw=0.75, color="black", alpha=0.9)
+        ax.add_line(ln); lines.append(ln)
+
+    inv = ax.transData.inverted()
+    for _ in range(max_iter):
+        moved = False
+        bbs = [t.get_window_extent(renderer=renderer).expanded(1.02, 1.15) for t in texts]
+        for i in range(len(texts)):
+            for j in range(i+1, len(texts)):
+                if not bbs[i].overlaps(bbs[j]): 
+                    continue
+                # push apart in display coords
+                ci = ((bbs[i].x0+bbs[i].x1)/2, (bbs[i].y0+bbs[i].y1)/2)
+                cj = ((bbs[j].x0+bbs[j].x1)/2, (bbs[j].y0+bbs[j].y1)/2)
+                vx, vy = ci[0]-cj[0], ci[1]-cj[1]
+                if vx == 0 and vy == 0: vx = 1.0
+                n = (vx**2 + vy**2)**0.5
+                dx, dy = (vx/n)*k_repel*72, (vy/n)*k_repel*72  # ~points
+                for t, s in ((texts[i], +1), (texts[j], -1)):
+                    tx, ty = t.get_position()
+                    px = trans.transform((tx, ty)) + s*np.array([dx, dy])
+                    t.set_position(inv.transform(px)); moved = True
+        # spring toward ~25 px leader length
+        for t, (xi, yi) in zip(texts, xy):
+            tx, ty = t.get_position()
+            pt = trans.transform((tx, ty)); pp = trans.transform((xi, yi))
+            d = ((pt[0]-pp[0])**2 + (pt[1]-pp[1])**2)**0.5
+            tgt = 25.0
+            if abs(d - tgt) > 1.0:
+                v = (pt - pp) / (d + 1e-9)
+                pt2 = pt + v * (0.6 * (tgt - d))
+                t.set_position(inv.transform(pt2)); moved = True
+        if not moved:
+            break
+    # update leader lines
+    for t, ln, (xi, yi) in zip(texts, lines, xy):
+        tx, ty = t.get_position()
+        ln.set_data([xi, tx], [yi, ty])
+
+def label_points_neatly(ax, x, y, names):
+    """Prefer adjustText if present; fall back to built-in repeller."""
+    try:
+        from adjustText import adjust_text
+        texts = []
+        for xi, yi, nm in zip(x, y, names):
+            texts.append(ax.text(xi, yi, nm, fontsize=8.6,
+                                 bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.70)))
+        adjust_text(
+            texts, x=x, y=y, ax=ax,
+            only_move={'points': 'y', 'text': 'xy'},
+            force_points=0.6, force_text=0.7,
+            expand_text=(1.05, 1.15), expand_points=(1.05, 1.15),
+            arrowprops=dict(arrowstyle="->", lw=0.75, color="black", alpha=0.9, shrinkA=0, shrinkB=3)
+        )
+    except Exception:
+        _repel_labels_builtin(ax, x, y, names)
+
 st.markdown("## Sectional Shape Map — Accel (600→200) vs Grind (200→Finish)")
 
-needed_cols = {"Horse","Accel","Grind","tsSPI","PI"}
+needed_cols = {"Horse", "Accel", "Grind", "tsSPI", "PI"}
 if not needed_cols.issubset(metrics.columns):
     st.warning("Shape Map: required columns missing: " + ", ".join(sorted(needed_cols - set(metrics.columns))))
 else:
-    # slice, coerce numerics, and clean
-    dfm = metrics.loc[:, ["Horse","Accel","Grind","tsSPI","PI"]].copy()
-    for c in ["Accel","Grind","tsSPI","PI"]:
+    # slice & clean
+    dfm = metrics.loc[:, ["Horse", "Accel", "Grind", "tsSPI", "PI"]].copy()
+    for c in ["Accel", "Grind", "tsSPI", "PI"]:
         dfm[c] = pd.to_numeric(dfm[c], errors="coerce")
-    dfm = dfm.dropna(subset=["Accel","Grind","tsSPI"])
+    dfm = dfm.dropna(subset=["Accel", "Grind", "tsSPI"])
 
     if dfm.empty:
         st.info("Not enough data to draw the shape map.")
@@ -445,11 +527,15 @@ else:
         cv = dfm["tsSPIΔ"].to_numpy()
         piv = dfm["PI"].fillna(0).to_numpy()
 
-        # guards & span
+        # guards
         if not np.isfinite(xv).any() or not np.isfinite(yv).any():
             st.info("No valid sectional differentials available for this race.")
         else:
-            span = np.nanmax([np.nanmax(np.abs(xv)), np.nanmax(np.abs(yv))])
+            # axis span (safe default if tiny)
+            try:
+                span = float(np.nanmax([np.nanmax(np.abs(xv)), np.nanmax(np.abs(yv))]))
+            except Exception:
+                span = 1.0
             if not np.isfinite(span) or span <= 0:
                 span = 1.0
             lim = max(4.5, float(np.ceil(span / 1.5) * 1.5))
@@ -465,51 +551,33 @@ else:
             # figure
             fig, ax = plt.subplots(figsize=(7.6, 6.4))
 
-            # quadrants
+            # quadrant tint
             TINT = 0.06
             ax.add_patch(Rectangle((0, 0),  lim,  lim, facecolor="#4daf4a", alpha=TINT, edgecolor="none"))   # +accel +grind
             ax.add_patch(Rectangle((-lim,0), lim,  lim, facecolor="#377eb8", alpha=TINT, edgecolor="none"))   # -accel +grind
             ax.add_patch(Rectangle((0,-lim), lim, lim, facecolor="#ff7f00", alpha=TINT, edgecolor="none"))    # +accel -grind
             ax.add_patch(Rectangle((-lim,-lim),lim, lim, facecolor="#984ea3", alpha=TINT, edgecolor="none"))  # -accel -grind
 
-            # axes lines
-            ax.axvline(0, color="gray", lw=1.3, ls=(0,(3,3)))
-            ax.axhline(0, color="gray", lw=1.3, ls=(0,(3,3)))
+            # zero axes
+            ax.axvline(0, color="gray", lw=1.3, ls=(0, (3, 3)))
+            ax.axhline(0, color="gray", lw=1.3, ls=(0, (3, 3)))
 
-            # colour (tsSPI deviation)
+            # colour map centered at 0 (tsSPI deviation)
             vmin = float(np.nanmin(cv)) if np.isfinite(cv).any() else -1.0
-            vmax = float(np.nanmax(cv)) if np.isfinite(cv).any() else 1.0
+            vmax = float(np.nanmax(cv)) if np.isfinite(cv).any() else  1.0
             if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
                 vmin, vmax = -1.0, 1.0
             norm = TwoSlopeNorm(vcenter=0.0, vmin=vmin, vmax=vmax)
 
-            sc = ax.scatter(xv, yv, s=sizes, c=cv, cmap="coolwarm", norm=norm,
-                            edgecolor="black", linewidth=0.6, alpha=0.95)
+            sc = ax.scatter(
+                xv, yv, s=sizes, c=cv, cmap="coolwarm", norm=norm,
+                edgecolor="black", linewidth=0.6, alpha=0.95
+            )
 
-            # labels with arrow offsets
-            def base_angle(xi, yi):
-                if   xi >= 0 and yi >= 0:  return 35    # Q1
-                elif xi < 0 and yi >= 0:   return 145   # Q2
-                elif xi < 0 and yi < 0:    return 215   # Q3
-                else:                       return 325   # Q4
+            # neat labels (adjustText if installed; else fallback)
+            label_points_neatly(ax, xv, yv, names)
 
-            order = np.argsort(-sizes)  # big first
-            for k, i in enumerate(order):
-                step = 0.12 + 0.055 * k
-                ang  = np.deg2rad(base_angle(xv[i], yv[i]) + (k * 19) % 360)
-                dx   = (0.85 * step) * np.cos(ang)
-                dy   = (0.85 * step) * np.sin(ang)
-
-                ax.annotate(
-                    names[i],
-                    xy=(xv[i], yv[i]),
-                    xytext=(xv[i] + dx, yv[i] + dy),
-                    fontsize=8.6, ha="left", va="center",
-                    arrowprops=dict(arrowstyle="->", lw=0.7, shrinkA=0, shrinkB=3, color="black", alpha=0.9),
-                    bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.70)
-                )
-
-            # cosmetics
+            # limits & labels
             ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
             ax.set_xlabel("Acceleration vs field (points)  →")
             ax.set_ylabel("Grind vs field (points)  ↑")
@@ -522,28 +590,25 @@ else:
             ax.legend(h_ex, ["PI: low", "PI: mid", "PI: high"],
                       loc="upper left", frameon=False, fontsize=8)
 
+            # colorbar
             cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
             cbar.set_label("tsSPI − 100")
 
             ax.grid(True, linestyle=":", alpha=0.25)
             st.pyplot(fig)
 
-            # optional: download PNG
+            # download
             buf = io.BytesIO()
             fig.savefig(buf, format="png", dpi=200, bbox_inches="tight")
-            st.download_button(
-                "Download shape map (PNG)",
-                data=buf.getvalue(),
-                file_name="shape_map.png",
-                mime="image/png",
-                use_container_width=False
-            )
+            st.download_button("Download shape map (PNG)", buf.getvalue(),
+                               file_name="shape_map.png", mime="image/png")
 
             st.caption(
                 "Each bubble is a runner. Size = PI (bigger = stronger overall). "
                 "X: late acceleration (600→200) vs field; Y: last-200 grind vs field. "
                 "Colour shows cruise strength (tsSPI vs field): red = faster mid-race, blue = slower."
             )
+# =======================================================================================================
 
 # ======================= Visual 2: Pace Curve — accurate segments & thin lines =================
 st.markdown("## Pace Curve — field average (black) + Top 8 finishers")
