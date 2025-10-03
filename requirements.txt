@@ -4,3 +4,4 @@ numpy
 matplotlib
 openpyxl
 adjustText>=0.8
+reportlab==3.6.13
