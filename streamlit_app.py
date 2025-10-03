@@ -7,6 +7,7 @@ from matplotlib.colors import TwoSlopeNorm
 from matplotlib.lines import Line2D
 import io
 import math
+import re
 
 # ======================= Page config =======================
 st.set_page_config(page_title="Race Edge — PI v3.1 (distance+context) + Hidden Horses v2", layout="wide")
@@ -65,25 +66,65 @@ with st.sidebar:
         type=["csv","xlsx","xls"]
     )
     race_distance_input = st.number_input("Race Distance (m) — used for weighting", min_value=800, max_value=4000, step=50, value=1600)
+    SHOW_WARNINGS = st.toggle("Show data warnings", value=True)
     DEBUG = st.toggle("Debug info", value=False)
 
 if not up:
     st.stop()
 
+# ======================= Header normalization / Aliases ===================
+def normalize_headers(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Accept both snake_case and CamelCase time headers.
+    Adds camel-case aliases used by the app (does NOT drop original).
+    Returns (df_with_aliases, alias_notes)
+    """
+    notes = []
+    cols = list(df.columns)
+    lower_map = {c.lower(): c for c in cols}
+
+    def ensure_alias(src_col, alias_col):
+        nonlocal df, notes
+        if src_col in df.columns and alias_col not in df.columns:
+            df[alias_col] = df[src_col]
+            notes.append(f"Aliased `{src_col}` → `{alias_col}`")
+
+    # finish_split → Finish_Time
+    if "finish_split" in lower_map:
+        ensure_alias(lower_map["finish_split"], "Finish_Time")
+
+    # finish_pos → Finish_Pos
+    if "finish_pos" in lower_map:
+        ensure_alias(lower_map["finish_pos"], "Finish_Pos")
+
+    # (\d+)_time → \1_Time
+    pat = re.compile(r"^(\d{2,4})_time$")
+    for lc, orig in lower_map.items():
+        m = pat.match(lc)
+        if m:
+            alias = f"{m.group(1)}_Time"
+            ensure_alias(orig, alias)
+
+    return df, notes
+
 # ======================= Input handling ====================
 try:
-    work = pd.read_csv(up) if up.name.lower().endswith(".csv") else pd.read_excel(up)
+    raw = pd.read_csv(up) if up.name.lower().endswith(".csv") else pd.read_excel(up)
+    work, alias_notes = normalize_headers(raw.copy())
     st.success("File loaded.")
 except Exception as e:
     st.error("Failed to read file.")
+    st.exception(e)
     st.stop()
 
 st.markdown("### Raw Table")
 st.dataframe(work.head(12), use_container_width=True)
 _dbg(DEBUG, "Columns", list(work.columns))
+if alias_notes and SHOW_WARNINGS:
+    st.info("Header aliases applied: " + "; ".join(alias_notes))
 
 # ======================= Stage windows on 100 m splits ====================
-# Convention (agreed):
+# Convention:
 #   X_Time  = time from (X+100) → X    (for X ∈ {distance-100, distance-200, …, 100})
 #   Finish_Time = time from 100 → 0
 #
@@ -93,8 +134,7 @@ _dbg(DEBUG, "Columns", list(work.columns))
 #   Accel  : 500 + 400 + 300 + 200
 #   Grind  : 100 + Finish_Time
 #
-# We’ll compute composite speeds for each stage as:  distance_sum / time_sum.
-# (distance_sum is 100 m * count of included splits, except Grind which is 200 m when both parts present.)
+# Composite speeds: distance_sum / time_sum.
 
 def collect_markers(df):
     marks = []
@@ -108,7 +148,7 @@ def collect_markers(df):
 
 def sum_times(row, cols):
     vals = [as_num(row.get(c)).item() if hasattr(as_num(row.get(c)), "item") else as_num(row.get(c)) for c in cols]
-    vals = [v for v in vals if pd.notna(v)]
+    vals = [v for v in vals if pd.notna(v) and v > 0]
     return np.sum(vals) if len(vals) else np.nan
 
 def stage_block_cols(D, start_m, end_m_inclusive):
@@ -122,7 +162,8 @@ def stage_speed(row, cols, meters_per_split=100.0):
     if not cols: return np.nan
     tsum = sum_times(row, cols)
     if pd.isna(tsum) or tsum <= 0: return np.nan
-    dist = meters_per_split * len([c for c in cols if pd.notna(row.get(c))])
+    valid_count = sum(1 for c in cols if pd.notna(row.get(c)) and as_num(row.get(c)) > 0)
+    dist = meters_per_split * valid_count
     if dist <= 0: return np.nan
     return dist / tsum
 
@@ -148,8 +189,6 @@ def pi_weights_distance_and_context(distance_m: float,
       - 1100m anchor: F200=0.10, tsSPI=0.36, Accel=0.34, Grind=0.20
       - 1200m anchor: F200=0.08, tsSPI=0.37, Accel=0.30, Grind=0.25
       - >1200m: shift 0.01 per +100m from tsSPI → Grind, cap Grind at 0.40
-                (F200 stays 0.08, Accel stays 0.30; tsSPI = 1 - F200 - Accel - Grind)
-
     Context nudge (±0.02 max total) based on (median Accel − median Grind).
     """
     dm = float(distance_m or 1200)
@@ -186,10 +225,10 @@ def pi_weights_distance_and_context(distance_m: float,
 
         F200 = base["F200_idx"]; ts = base["tsSPI"]; ACC = base["Accel"]; GR = base["Grind"]
         if bias > 0:
-            delta = min(max_shift, ACC - 0.26)  # keep a floor
+            delta = min(max_shift, ACC - 0.26)
             ACC -= delta; GR += delta
         elif bias < 0:
-            delta = min(max_shift, GR - 0.18)  # keep a floor
+            delta = min(max_shift, GR - 0.18)
             GR  -= delta; ACC += delta
         GR = min(GR, 0.40)
         ts = max(0.0, 1.0 - F200 - ACC - GR)
@@ -200,7 +239,7 @@ def pi_weights_distance_and_context(distance_m: float,
         base = {k: v / s for k, v in base.items()}
     return base
 
-# ======================= Core metric build (100 m logic) ===================
+# ======================= Core metric build (UNCHANGED) =====================
 def build_metrics(df_in: pd.DataFrame, D_actual_m: float):
     w = df_in.copy()
 
@@ -210,7 +249,6 @@ def build_metrics(df_in: pd.DataFrame, D_actual_m: float):
 
     # discover available *_Time markers (100 m convention)
     seg_markers = collect_markers(w)  # e.g. [1600, 1500, ..., 100]
-    _dbg(DEBUG, "Markers (100m)", seg_markers)
 
     # per-segment speeds (100 m / time); include Finish as its own 100 m split
     for m in seg_markers:
@@ -219,12 +257,11 @@ def build_metrics(df_in: pd.DataFrame, D_actual_m: float):
 
     # race time = sum of all 100 m splits present (D-100 → 100) + Finish_Time
     if len(seg_markers) > 0:
-        # Only include markers between (D-100) down to 100 that actually exist
         wanted = list(range(int(D_actual_m) - 100, 99, -100))
         cols = [f"{m}_Time" for m in wanted if f"{m}_Time" in w.columns]
         if "Finish_Time" in w.columns:
             cols = cols + ["Finish_Time"]
-        w["RaceTime_s"] = w[cols].apply(pd.to_numeric, errors="coerce").sum(axis=1)
+        w["RaceTime_s"] = w[cols].apply(pd.to_numeric, errors="coerce").clip(lower=0).replace(0, np.nan).sum(axis=1)
     else:
         w["RaceTime_s"] = as_num(w.get("Race Time", np.nan))
 
@@ -252,7 +289,7 @@ def build_metrics(df_in: pd.DataFrame, D_actual_m: float):
             return 100.0 + deltas * factor
         return idx_series
 
-    # ---------- Build stage composite speeds (distance-aware lists) ----------
+    # ---------- Build stage composite speeds ----------
     D = float(D_actual_m)
 
     # F200: (D-100) + (D-200)
@@ -269,13 +306,11 @@ def build_metrics(df_in: pd.DataFrame, D_actual_m: float):
     # handled by grind_speed(row)
 
     # ---------- Convert to indices vs field (100 = par) ----------
-    # Compute per-horse composite speeds
     w["_F200_spd"]  = w.apply(lambda r: (200.0 / sum_times(r, f200_cols)) if len(f200_cols)>=1 and pd.notna(sum_times(r, f200_cols)) and sum_times(r, f200_cols)>0 else np.nan, axis=1)
     w["_MID_spd"]   = w.apply(lambda r: stage_speed(r, tssp_cols, meters_per_split=100.0), axis=1)
     w["_ACC_spd"]   = w.apply(lambda r: stage_speed(r, accel_cols, meters_per_split=100.0), axis=1)
     w["_GR_spd"]    = w.apply(grind_speed, axis=1)
 
-    # Helper to index-ify a speed vector with stabilizers
     def speed_to_index(spd_series):
         med = spd_series.median(skipna=True)
         idx_raw = 100.0 * (spd_series / med)
@@ -290,7 +325,7 @@ def build_metrics(df_in: pd.DataFrame, D_actual_m: float):
     w["Accel"]    = speed_to_index(pd.to_numeric(w["_ACC_spd"],  errors="coerce"))
     w["Grind"]    = speed_to_index(pd.to_numeric(w["_GR_spd"],   errors="coerce"))
 
-    # ---------- PI v3.1 (distance- & context-aware weights, robust 0–10 scaling) ----------
+    # ---------- PI v3.1 ----------
     acc_med = w["Accel"].median(skipna=True)
     grd_med = w["Grind"].median(skipna=True)
     PI_W = pi_weights_distance_and_context(float(D), acc_med, grd_med)
@@ -315,7 +350,7 @@ def build_metrics(df_in: pd.DataFrame, D_actual_m: float):
         sigma = 0.75
     w["PI"] = (5.0 + 2.2 * (centered / sigma)).clip(0.0, 10.0).round(2)
 
-    # ---------- GCI (0–10) — aligned with distance+context weights ----------
+    # ---------- GCI (0–10) ----------
     acc_med_g = w["Accel"].median(skipna=True)
     grd_med_g = w["Grind"].median(skipna=True)
     Wg = pi_weights_distance_and_context(float(D), acc_med_g, grd_med_g)
@@ -376,17 +411,49 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
-# ======================= Metrics table =====================
+# ======================= Data Integrity (expected vs present) ==============
+def expected_segments(distance_m: float) -> list[str]:
+    want = [f"{m}_Time" for m in range(int(distance_m) - 100, 99, -100)]
+    want.append("Finish_Time")
+    return want
+
+exp_cols = expected_segments(race_distance_input)
+missing_cols = [c for c in exp_cols if c not in work.columns]
+invalid_counts = {}
+for c in exp_cols:
+    if c in work.columns:
+        s = pd.to_numeric(work[c], errors="coerce")
+        invalid_counts[c] = int(((s <= 0) | s.isna()).sum())
+
+def integrity_line():
+    msgs = []
+    if missing_cols:
+        msgs.append("Missing: " + ", ".join(missing_cols))
+    bads = [f"{k} ({v} rows)" for k,v in invalid_counts.items() if v > 0]
+    if bads:
+        msgs.append("Invalid/zero times → treated as missing: " + ", ".join(bads))
+    return " • ".join(msgs)
+
+# ======================= Minimal Header (distance only) ====================
+st.markdown(f"## Race Distance: **{int(race_distance_input)}m**")
+if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values())):
+    st.markdown(f"*(⚠ {integrity_line()})*")
+
+# ======================= Metrics table (UNCHANGED) ========================
 st.markdown("## Sectional Metrics (PI v3.1 & GCI)")
 show_cols = ["Horse", "Finish_Pos", "RaceTime_s", "F200_idx", "tsSPI", "Accel", "Grind", "PI", "GCI"]
 for c in show_cols:
     if c not in metrics.columns:
         metrics[c] = np.nan
-st.dataframe(metrics[show_cols].sort_values(["PI","Finish_Pos"], ascending=[False, True]),
-             use_container_width=True)
 
-# ===================== Sectional Shape Map — Accel vs Grind =====================
-# (unchanged visual, but fed by corrected stages)
+# stable sort: treat NaN Finish_Pos as large
+display_df = metrics[show_cols].copy()
+_finish_sort = display_df["Finish_Pos"].fillna(1e9)
+display_df = display_df.assign(_FinishSort=_finish_sort)
+display_df = display_df.sort_values(["PI","_FinishSort"], ascending=[False, True]).drop(columns=["_FinishSort"])
+st.dataframe(display_df, use_container_width=True)
+
+# ===================== Sectional Shape Map — Accel vs Grind ===============
 def _repel_labels_builtin(ax, x, y, labels, *,
                           init_shift=0.18, k_attract=0.006, k_repel=0.012,
                           max_iter=250):
@@ -415,6 +482,9 @@ def _repel_labels_builtin(ax, x, y, labels, *,
             for j in range(i+1, len(texts)):
                 if not bbs[i].overlaps(bbs[j]): 
                     continue
+                ci = ((bbs[i].x0+bbs[i].x1)/2, (bbs[i].y0+bbs[i].y1)/2)
+                cj = ((bbs[j].x0+cj if False else bbs[j].x1)/2 if False else ((bbs[j].x0+bbs[j].x1)/2), (bbs[j].y0+bbs[j].y1)/2)
+                # simplified: use vector between centers
                 ci = ((bbs[i].x0+bbs[i].x1)/2, (bbs[i].y0+bbs[i].y1)/2)
                 cj = ((bbs[j].x0+bbs[j].x1)/2, (bbs[j].y0+bbs[j].y1)/2)
                 vx, vy = ci[0]-cj[0], ci[1]-cj[1]
@@ -458,8 +528,8 @@ def label_points_neatly(ax, x, y, names):
         _repel_labels_builtin(ax, x, y, names)
 
 st.markdown("## Sectional Shape Map — Accel (600→200) vs Grind (200→Finish)")
-
 needed_cols = {"Horse", "Accel", "Grind", "tsSPI", "PI"}
+shape_map_buf = None
 if not needed_cols.issubset(metrics.columns):
     st.warning("Shape Map: required columns missing: " + ", ".join(sorted(needed_cols - set(metrics.columns))))
 else:
@@ -532,9 +602,10 @@ else:
         ax.grid(True, linestyle=":", alpha=0.25)
         st.pyplot(fig)
 
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=200, bbox_inches="tight")
-        st.download_button("Download shape map (PNG)", buf.getvalue(),
+        shape_map_buf = io.BytesIO()
+        fig.savefig(shape_map_buf, format="png", dpi=300, bbox_inches="tight")
+        shape_map_png = shape_map_buf.getvalue()
+        st.download_button("Download shape map (PNG)", shape_map_png,
                            file_name="shape_map.png", mime="image/png")
 
         st.caption(
@@ -543,14 +614,13 @@ else:
             "Colour shows cruise strength (tsSPI vs field): red = faster mid-race, blue = slower."
         )
 
-# ======================= Visual 2: Pace Curve — now includes Finish =================
+# ======================= Visual 2: Pace Curve (with Finish) ================
 st.markdown("## Pace Curve — field average (black) + Top 8 finishers")
+pace_buf = None
 
-# Build 100 m segments left→right including Finish
 if len(seg_markers) == 0 and "Finish_Time" not in work.columns:
     st.info("Not enough *_Time columns to draw the pace curve.")
 else:
-    # Determine ordered 100 m segments from (D-100)→...→100 plus Finish
     wanted = [m for m in range(int(race_distance_input) - 100, 99, -100)]
     segs = []
     for m in wanted:
@@ -563,19 +633,19 @@ else:
     if len(segs) == 0:
         st.info("Could not infer segment lengths.")
     else:
-        # Speeds for field (m/s)
-        times_df = work[[c for (_,_,_,c) in segs]].apply(pd.to_numeric, errors="coerce")
+        times_df = work[[c for (_,_,_,c) in segs]].apply(pd.to_numeric, errors="coerce").clip(lower=0).replace(0, np.nan)
         speed_df = pd.DataFrame(index=work.index)
         for (s, e, L, c) in segs:
             speed_df[c] = L / times_df[c]
 
         field_avg = speed_df.mean(axis=0).to_numpy()
 
-        # choose top 8: finish pos if present, else PI
         if "Finish_Pos" in metrics.columns and metrics["Finish_Pos"].notna().any():
             top8 = metrics.sort_values("Finish_Pos").head(8)
+            top8_rule = "Top-8 by Finish_Pos"
         else:
             top8 = metrics.sort_values("PI", ascending=False).head(8)
+            top8_rule = "Top-8 by PI"
 
         x_idx = list(range(len(segs)))
         def seg_label(s, e, c):
@@ -587,18 +657,15 @@ else:
 
         palette = color_cycle(len(top8))
         for i, (_, r) in enumerate(top8.iterrows()):
-            # match row in raw table by horse if available
             if "Horse" in work.columns and "Horse" in metrics.columns:
                 row0 = work[work["Horse"] == r.get("Horse")]
                 row_times = row0.iloc[0] if not row0.empty else r
             else:
                 row_times = r
-
             y_vals = []
             for (_, _, L, c) in segs:
                 t = pd.to_numeric(row_times.get(c, np.nan), errors="coerce")
                 y_vals.append(L / t if pd.notna(t) and t > 0 else np.nan)
-
             ax2.plot(x_idx, y_vals, linewidth=1.1, marker="o", markersize=2.5,
                      label=str(r.get("Horse", "")), color=palette[i])
 
@@ -610,11 +677,20 @@ else:
         ax2.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=3, frameon=False, fontsize=9)
         st.pyplot(fig2)
 
+        pace_buf = io.BytesIO()
+        fig2.savefig(pace_buf, format="png", dpi=300, bbox_inches="tight")
+        pace_png = pace_buf.getvalue()
+        st.download_button("Download pace curve (PNG)", pace_png,
+                           file_name="pace_curve.png", mime="image/png")
+
+        st.caption(f"Top-8 plotted: {top8_rule}. Finish segment included explicitly.")
+
 # ======================= Visual 3: Top-8 PI — stacked contributions =========
 st.markdown("## Top-8 PI — stacked contributions")
 acc_med_for_bars = metrics["Accel"].median(skipna=True)
 grd_med_for_bars = metrics["Grind"].median(skipna=True)
 PI_W_BARS = pi_weights_distance_and_context(float(race_distance_input), acc_med_for_bars, grd_med_for_bars)
+bars_buf = None
 
 def parts_scaled_to_total(row, total_pi, weights, zero_floor=True):
     raw = {
@@ -666,6 +742,12 @@ if not top8_pi.empty:
     ax3.grid(axis="y", linestyle="--", alpha=0.3)
     ax3.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=4, frameon=False)
     st.pyplot(fig3)
+
+    bars_buf = io.BytesIO()
+    fig3.savefig(bars_buf, format="png", dpi=300, bbox_inches="tight")
+    bars_png = bars_buf.getvalue()
+    st.download_button("Download PI stacks (PNG)", bars_png,
+                       file_name="pi_stacks.png", mime="image/png")
     st.caption("Slices are rescaled to sum exactly to each horse’s PI. ★ = race winner.")
 else:
     st.info("No PI values available to plot the stacked contributions.")
@@ -712,7 +794,6 @@ else:
     hh["ASI2"] = (B * (S).clip(lower=0.0) / 5.0).fillna(0.0)
 
 # ---------- 3) TFS (late variability vs mid pace) ----------
-# Use last three 100 m segments before the line: 300, 200, 100 (if present).
 def tfs_row(row):
     last3_cols = [c for c in ["300_Time","200_Time","100_Time"] if c in row.index]
     spds = []
@@ -730,7 +811,7 @@ def tfs_row(row):
 
 hh["TFS"] = hh.apply(tfs_row, axis=1)
 
-# Distance-aware TFS gate (kept as-is; adjust later if you want)
+# Distance-aware TFS gate
 D_rounded = int(np.ceil(float(race_distance_input) / 200.0) * 200)
 if D_rounded <= 1200:
     gate = 4.0
@@ -779,7 +860,6 @@ h_mad = float(np.nanmedian(np.abs(hidden - h_med)))
 h_sigma = max(1e-6, 1.4826 * h_mad)
 hh["HiddenScore"] = (1.2 + (hidden - h_med) / (2.5 * h_sigma)).clip(lower=0.0, upper=3.0)
 
-# ---------- 6) Tiering & Notes ----------
 def hh_tier(s):
     if pd.isna(s): return ""
     if s >= 1.8:   return "🔥 Top Hidden"
@@ -802,7 +882,6 @@ def hh_note(r):
     return ("; ".join(bits).capitalize() + ".") if bits else ""
 hh["Note"] = hh.apply(hh_note, axis=1)
 
-# ---------- 7) Display ----------
 cols_hh = [
     "Horse", "Finish_Pos", "PI", "GCI",
     "tsSPI", "Accel", "Grind",
@@ -813,20 +892,127 @@ for c in cols_hh:
     if c not in hh.columns:
         hh[c] = np.nan
 
-st.dataframe(
-    hh.sort_values(["Tier", "HiddenScore", "PI"], ascending=[True, False, False])[cols_hh],
-    use_container_width=True
-)
+hh_view = hh.sort_values(["Tier", "HiddenScore", "PI"], ascending=[True, False, False])[cols_hh]
+st.dataframe(hh_view, use_container_width=True)
 st.caption(
     "Hidden Horses v2: SOS = sectional outlier (robust), ASI² = against-shape magnitude (bias-aware), "
     "TFS = trip friction (late variability vs mid pace), UEI = underused engine. "
     "Tiering: 🔥 ≥ 1.8, 🟡 ≥ 1.2."
 )
 
-# ======================= Footer ===========================
-st.caption(
-    "Conventions — `X_Time` is the time from (X+100)→X. `Finish_Time` is 100→0. "
-    "Stages: F200=(D-100)+(D-200); tsSPI=(D-300)…600; Accel=500+400+300+200; Grind=100+Finish. "
-    "Indices are vs-field (100=par) with small-field stabilizers. "
-    "PI v3.1 uses distance+context weights; GCI aligns to the same worldview."
-)
+# ======================= PDF Report Builder ===============================
+st.markdown("---")
+st.markdown("### 📥 Download Comprehensive Report (PDF)")
+
+def make_pdf_report():
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+        from reportlab.lib.units import cm
+    except Exception as e:
+        st.error("`reportlab` is required to create the PDF. Install with: `pip install reportlab`")
+        return None
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
+    story = []
+    styles = getSampleStyleSheet()
+    H = styles["Heading1"]
+    H.fontSize = 18
+    H.leading = 22
+    H.spaceAfter = 6
+    P = styles["BodyText"]
+    P.fontSize = 9
+    P.leading = 12
+
+    # Header: Distance (bold & large)
+    story.append(Paragraph(f"Race Distance: <b>{int(race_distance_input)}m</b>", H))
+    if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values())):
+        story.append(Paragraph(f"<font color='#b36b00'>⚠ {integrity_line()}</font>", P))
+    story.append(Spacer(0, 6))
+
+    # 1) Sectional Metrics table
+    story.append(Paragraph("Sectional Metrics (PI v3.1 & GCI)", styles["Heading3"]))
+    table_df = display_df.copy()
+    # format numbers
+    for col in ["RaceTime_s","F200_idx","tsSPI","Accel","Grind","PI","GCI"]:
+        if col in table_df.columns:
+            table_df[col] = pd.to_numeric(table_df[col], errors="coerce").map(lambda x: "" if pd.isna(x) else f"{x:.3f}")
+    data = [list(table_df.columns)] + table_df.fillna("").astype(str).values.tolist()
+    t = Table(data, repeatRows=1)
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0,0), (-1,0), 9),
+        ('FONTSIZE', (0,1), (-1,-1), 8),
+        ('ALIGN', (2,1), (-1,-1), 'RIGHT'),
+        ('GRID', (0,0), (-1,-1), 0.25, colors.whitesmoke),
+        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.whitesmoke, colors.white])
+    ]))
+    story.append(t)
+    story.append(Spacer(0, 10))
+
+    # 2) Shape Map image
+    if 'shape_map_png' in locals():
+        story.append(Paragraph("Sectional Shape Map — Accel vs Grind (colour = tsSPIΔ)", styles["Heading3"]))
+        story.append(Image(io.BytesIO(shape_map_png), width=24*cm, height=18*cm, kind="proportional"))
+        story.append(Spacer(0, 8))
+
+    # 3) Pace Curve image
+    if 'pace_png' in locals():
+        story.append(Paragraph("Pace Curve — field average + Top-8", styles["Heading3"]))
+        story.append(Image(io.BytesIO(pace_png), width=24*cm, height=15*cm, kind="proportional"))
+        story.append(Spacer(0, 8))
+
+    # 4) Top-8 PI stacks
+    if 'bars_png' in locals():
+        story.append(Paragraph("Top-8 PI — stacked contributions", styles["Heading3"]))
+        story.append(Image(io.BytesIO(bars_png), width=24*cm, height=12*cm, kind="proportional"))
+        story.append(Spacer(0, 8))
+
+    # 5) Hidden Horses v2 table (only flagged)
+    flagged = hh_view[hh_view["Tier"] != ""].copy()
+    if not flagged.empty:
+        story.append(Paragraph("Hidden Horses v2 (flagged)", styles["Heading3"]))
+        # Limit row count to keep page tidy; split if long
+        fh = flagged.copy()
+        for col in ["PI","GCI","tsSPI","Accel","Grind","SOS","ASI2","TFS","UEI","HiddenScore"]:
+            if col in fh.columns:
+                fh[col] = pd.to_numeric(fh[col], errors="coerce").map(lambda x: "" if pd.isna(x) else f"{x:.3f}")
+        data_hh = [list(fh.columns)] + fh.fillna("").astype(str).values.tolist()
+        t2 = Table(data_hh, repeatRows=1)
+        t2.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
+            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0,0), (-1,0), 9),
+            ('FONTSIZE', (0,1), (-1,-1), 8),
+            ('ALIGN', (2,1), (-1,-1), 'RIGHT'),
+            ('GRID', (0,0), (-1,-1), 0.25, colors.whitesmoke),
+            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.whitesmoke, colors.white])
+        ]))
+        story.append(t2)
+        story.append(Spacer(0, 10))
+
+    # 6) Footnotes / conventions
+    story.append(Paragraph("<b>Conventions</b>", styles["Heading3"]))
+    story.append(Paragraph(
+        "X_Time = time from (X+100)→X. Finish_Time = 100→0. "
+        "Stages: F200=(D-100)+(D-200); tsSPI=(D-300)…600; Accel=500+400+300+200; Grind=100+Finish. "
+        "Indices are vs-field (100=par) with small-field stabilizers. "
+        "PI v3.1 uses distance+context weights; GCI aligns to the same worldview.", P
+    ))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf
+
+pdf_buf = make_pdf_report()
+if pdf_buf is not None:
+    st.download_button(
+        "📥 Download PDF report",
+        data=pdf_buf.getvalue(),
+        file_name=f"RaceEdge_Report_{int(race_distance_input)}m.pdf",
+        mime="application/pdf"
+    )
