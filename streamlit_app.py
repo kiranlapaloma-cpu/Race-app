@@ -904,9 +904,7 @@ st.caption(
 st.markdown("---")
 st.markdown("### 📥 Download Comprehensive Report (PDF)")
 
-def make_pdf_report(distance_m: int, metrics_df: pd.DataFrame,
-                    shape_png: bytes|None, pace_png: bytes|None, bars_png_: bytes|None,
-                    hh_flagged_df: pd.DataFrame, integrity_text: str|None):
+def make_pdf_report():
     try:
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import A4, landscape
@@ -914,27 +912,31 @@ def make_pdf_report(distance_m: int, metrics_df: pd.DataFrame,
         from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
         from reportlab.lib.units import cm
     except Exception as e:
-        st.error("`reportlab` is required to create the PDF. Install with: `pip install reportlab>=4.2.0`")
+        st.error("`reportlab` is required to create the PDF. Install with: `pip install reportlab`")
         return None
 
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=landscape(A4),
-                            leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
     story = []
     styles = getSampleStyleSheet()
-    H = styles["Heading1"]; H.fontSize = 18; H.leading = 22; H.spaceAfter = 6
-    H3 = styles["Heading3"]
-    P = styles["BodyText"]; P.fontSize = 9; P.leading = 12
+    H = styles["Heading1"]
+    H.fontSize = 18
+    H.leading = 22
+    H.spaceAfter = 6
+    P = styles["BodyText"]
+    P.fontSize = 9
+    P.leading = 12
 
     # Header: Distance (bold & large)
-    story.append(Paragraph(f"Race Distance: <b>{int(distance_m)}m</b>", H))
-    if integrity_text:
-        story.append(Paragraph(f"<font color='#b36b00'>⚠ {integrity_text}</font>", P))
+    story.append(Paragraph(f"Race Distance: <b>{int(race_distance_input)}m</b>", H))
+    if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values())):
+        story.append(Paragraph(f"<font color='#b36b00'>⚠ {integrity_line()}</font>", P))
     story.append(Spacer(0, 6))
 
     # 1) Sectional Metrics table
-    story.append(Paragraph("Sectional Metrics (PI v3.1 & GCI)", H3))
-    table_df = metrics_df.copy()
+    story.append(Paragraph("Sectional Metrics (PI v3.1 & GCI)", styles["Heading3"]))
+    table_df = display_df.copy()
+    # format numbers
     for col in ["RaceTime_s","F200_idx","tsSPI","Accel","Grind","PI","GCI"]:
         if col in table_df.columns:
             table_df[col] = pd.to_numeric(table_df[col], errors="coerce").map(lambda x: "" if pd.isna(x) else f"{x:.3f}")
@@ -953,27 +955,28 @@ def make_pdf_report(distance_m: int, metrics_df: pd.DataFrame,
     story.append(Spacer(0, 10))
 
     # 2) Shape Map image
-    if shape_png is not None:
-        story.append(Paragraph("Sectional Shape Map — Accel vs Grind (colour = tsSPIΔ)", H3))
-        story.append(Image(io.BytesIO(shape_png), width=24*cm, height=18*cm, kind="proportional"))
+    if 'shape_map_png' in locals():
+        story.append(Paragraph("Sectional Shape Map — Accel vs Grind (colour = tsSPIΔ)", styles["Heading3"]))
+        story.append(Image(io.BytesIO(shape_map_png), width=24*cm, height=18*cm, kind="proportional"))
         story.append(Spacer(0, 8))
 
     # 3) Pace Curve image
-    if pace_png is not None:
-        story.append(Paragraph("Pace Curve — field average + Top-8", H3))
+    if 'pace_png' in locals():
+        story.append(Paragraph("Pace Curve — field average + Top-8", styles["Heading3"]))
         story.append(Image(io.BytesIO(pace_png), width=24*cm, height=15*cm, kind="proportional"))
         story.append(Spacer(0, 8))
 
     # 4) Top-8 PI stacks
-    if bars_png_ is not None:
-        story.append(Paragraph("Top-8 PI — stacked contributions", H3))
-        story.append(Image(io.BytesIO(bars_png_), width=24*cm, height=12*cm, kind="proportional"))
+    if 'bars_png' in locals():
+        story.append(Paragraph("Top-8 PI — stacked contributions", styles["Heading3"]))
+        story.append(Image(io.BytesIO(bars_png), width=24*cm, height=12*cm, kind="proportional"))
         story.append(Spacer(0, 8))
 
     # 5) Hidden Horses v2 table (only flagged)
-    flagged = hh_flagged_df.copy()
+    flagged = hh_view[hh_view["Tier"] != ""].copy()
     if not flagged.empty:
-        story.append(Paragraph("Hidden Horses v2 (flagged)", H3))
+        story.append(Paragraph("Hidden Horses v2 (flagged)", styles["Heading3"]))
+        # Limit row count to keep page tidy; split if long
         fh = flagged.copy()
         for col in ["PI","GCI","tsSPI","Accel","Grind","SOS","ASI2","TFS","UEI","HiddenScore"]:
             if col in fh.columns:
@@ -993,42 +996,23 @@ def make_pdf_report(distance_m: int, metrics_df: pd.DataFrame,
         story.append(Spacer(0, 10))
 
     # 6) Footnotes / conventions
-    story.append(Paragraph("<b>Conventions</b>", H3))
+    story.append(Paragraph("<b>Conventions</b>", styles["Heading3"]))
     story.append(Paragraph(
-        "Grid uses 200 m blocks with an optional initial stub if distance % 200 ≠ 0. "
-        "X_Time = time from (X+Δ)→X, where Δ = stub length for the first split, else 200. "
-        "Finish_Time is 200→0. If only a race total is uploaded, the app derives the last-200 as "
-        "Finish_Time = total − sum(other splits). Indices are vs-field (100=par) with small-field stabilizers. "
-        "PI v3.1 uses distance+context weights; GCI aligns to the same worldview.",
-        P
+        "X_Time = time from (X+100)→X. Finish_Time = 100→0. "
+        "Stages: F200=(D-100)+(D-200); tsSPI=(D-300)…600; Accel=500+400+300+200; Grind=100+Finish. "
+        "Indices are vs-field (100=par) with small-field stabilizers. "
+        "PI v3.1 uses distance+context weights; GCI aligns to the same worldview.", P
     ))
 
     doc.build(story)
     buf.seek(0)
     return buf
 
-# Build flagged HH view (text tier already safe for PDF fonts)
-hh_flagged = hh_view[hh_view["Tier"] != ""].copy()
-
-# Compose PDF metrics table exactly like UI table
-pdf_table_df = display_df.copy()
-
-# Integrity line (only if warnings enabled & something wrong)
-integrity_text = integrity_line() if (SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values()))) else None
-
-pdf_buf = make_pdf_report(
-    distance_m=D,
-    metrics_df=pdf_table_df,
-    shape_png=shape_map_png,
-    pace_png=pace_png,
-    bars_png_=bars_png,
-    hh_flagged_df=hh_flagged,
-    integrity_text=integrity_text
-)
+pdf_buf = make_pdf_report()
 if pdf_buf is not None:
     st.download_button(
         "📥 Download PDF report",
         data=pdf_buf.getvalue(),
-        file_name=f"RaceEdge_Report_{D}m.pdf",
+        file_name=f"RaceEdge_Report_{int(race_distance_input)}m.pdf",
         mime="application/pdf"
     )
