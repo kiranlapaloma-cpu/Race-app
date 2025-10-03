@@ -10,7 +10,10 @@ import math
 import re
 
 # ======================= Page config =======================
-st.set_page_config(page_title="Race Edge — PI v3.1 (distance+context) + Hidden Horses v2", layout="wide")
+st.set_page_config(
+    page_title="Race Edge — PI v3.1 (distance+context) + Hidden Horses v2",
+    layout="wide"
+)
 
 # ======================= Small helpers =====================
 def as_num(x):
@@ -58,6 +61,11 @@ def _dbg(enabled, label, obj=None):
         if obj is not None:
             st.write(obj)
 
+# --- report image placeholders (so PDF builder always has variables) ---
+shape_map_png = None
+pace_png = None
+bars_png = None
+
 # ======================= Sidebar (Upload-only) ===========================
 with st.sidebar:
     st.markdown("### Upload")
@@ -76,7 +84,7 @@ if not up:
 def normalize_headers(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     """
     Accept both snake_case and CamelCase time headers.
-    Adds camel-case aliases used by the app (does NOT drop original).
+    Adds canonical aliases used by the app (does NOT drop original).
     Returns (df_with_aliases, alias_notes)
     """
     notes = []
@@ -482,9 +490,7 @@ def _repel_labels_builtin(ax, x, y, labels, *,
             for j in range(i+1, len(texts)):
                 if not bbs[i].overlaps(bbs[j]): 
                     continue
-                ci = ((bbs[i].x0+bbs[i].x1)/2, (bbs[i].y0+bbs[i].y1)/2)
-                cj = ((bbs[j].x0+cj if False else bbs[j].x1)/2 if False else ((bbs[j].x0+bbs[j].x1)/2), (bbs[j].y0+bbs[j].y1)/2)
-                # simplified: use vector between centers
+                # centers
                 ci = ((bbs[i].x0+bbs[i].x1)/2, (bbs[i].y0+bbs[i].y1)/2)
                 cj = ((bbs[j].x0+bbs[j].x1)/2, (bbs[j].y0+bbs[j].y1)/2)
                 vx, vy = ci[0]-cj[0], ci[1]-cj[1]
@@ -528,11 +534,7 @@ def label_points_neatly(ax, x, y, names):
         _repel_labels_builtin(ax, x, y, names)
 
 st.markdown("## Sectional Shape Map — Accel (600→200) vs Grind (200→Finish)")
-needed_cols = {"Horse", "Accel", "Grind", "tsSPI", "PI"}
-shape_map_buf = None
-if not needed_cols.issubset(metrics.columns):
-    st.warning("Shape Map: required columns missing: " + ", ".join(sorted(needed_cols - set(metrics.columns))))
-else:
+if {"Horse", "Accel", "Grind", "tsSPI", "PI"}.issubset(metrics.columns):
     dfm = metrics.loc[:, ["Horse", "Accel", "Grind", "tsSPI", "PI"]].copy()
     for c in ["Accel", "Grind", "tsSPI", "PI"]:
         dfm[c] = pd.to_numeric(dfm[c], errors="coerce")
@@ -602,21 +604,24 @@ else:
         ax.grid(True, linestyle=":", alpha=0.25)
         st.pyplot(fig)
 
-        shape_map_buf = io.BytesIO()
-        fig.savefig(shape_map_buf, format="png", dpi=300, bbox_inches="tight")
-        shape_map_png = shape_map_buf.getvalue()
+        # Save (high DPI, tight) and close to free memory
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=300, bbox_inches="tight")
+        shape_map_png = buf.getvalue()
         st.download_button("Download shape map (PNG)", shape_map_png,
                            file_name="shape_map.png", mime="image/png")
+        plt.close(fig)
 
         st.caption(
             "Each bubble is a runner. Size = PI (bigger = stronger overall). "
             "X: late acceleration (600→200) vs field; Y: last-200 grind vs field. "
             "Colour shows cruise strength (tsSPI vs field): red = faster mid-race, blue = slower."
         )
+else:
+    st.warning("Shape Map: required columns missing.")
 
 # ======================= Visual 2: Pace Curve (with Finish) ================
 st.markdown("## Pace Curve — field average (black) + Top 8 finishers")
-pace_buf = None
 
 if len(seg_markers) == 0 and "Finish_Time" not in work.columns:
     st.info("Not enough *_Time columns to draw the pace curve.")
@@ -677,11 +682,12 @@ else:
         ax2.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=3, frameon=False, fontsize=9)
         st.pyplot(fig2)
 
-        pace_buf = io.BytesIO()
-        fig2.savefig(pace_buf, format="png", dpi=300, bbox_inches="tight")
-        pace_png = pace_buf.getvalue()
+        buf2 = io.BytesIO()
+        fig2.savefig(buf2, format="png", dpi=300, bbox_inches="tight")
+        pace_png = buf2.getvalue()
         st.download_button("Download pace curve (PNG)", pace_png,
                            file_name="pace_curve.png", mime="image/png")
+        plt.close(fig2)
 
         st.caption(f"Top-8 plotted: {top8_rule}. Finish segment included explicitly.")
 
@@ -690,7 +696,6 @@ st.markdown("## Top-8 PI — stacked contributions")
 acc_med_for_bars = metrics["Accel"].median(skipna=True)
 grd_med_for_bars = metrics["Grind"].median(skipna=True)
 PI_W_BARS = pi_weights_distance_and_context(float(race_distance_input), acc_med_for_bars, grd_med_for_bars)
-bars_buf = None
 
 def parts_scaled_to_total(row, total_pi, weights, zero_floor=True):
     raw = {
@@ -743,11 +748,13 @@ if not top8_pi.empty:
     ax3.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=4, frameon=False)
     st.pyplot(fig3)
 
-    bars_buf = io.BytesIO()
-    fig3.savefig(bars_buf, format="png", dpi=300, bbox_inches="tight")
-    bars_png = bars_buf.getvalue()
+    buf3 = io.BytesIO()
+    fig3.savefig(buf3, format="png", dpi=300, bbox_inches="tight")
+    bars_png = buf3.getvalue()
     st.download_button("Download PI stacks (PNG)", bars_png,
                        file_name="pi_stacks.png", mime="image/png")
+    plt.close(fig3)
+
     st.caption("Slices are rescaled to sum exactly to each horse’s PI. ★ = race winner.")
 else:
     st.info("No PI values available to plot the stacked contributions.")
@@ -904,42 +911,52 @@ st.caption(
 st.markdown("---")
 st.markdown("### 📥 Download Comprehensive Report (PDF)")
 
-def make_pdf_report():
+def make_pdf_report(
+    distance_m: int,
+    metrics_table_df: pd.DataFrame,
+    hh_view_df: pd.DataFrame,
+    integrity_text: str = "",
+    shape_png: bytes | None = None,
+    pace_png: bytes | None = None,
+    bars_png: bytes | None = None,
+):
     try:
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import A4, landscape
         from reportlab.lib.styles import getSampleStyleSheet
         from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
         from reportlab.lib.units import cm
-    except Exception as e:
+    except Exception:
         st.error("`reportlab` is required to create the PDF. Install with: `pip install reportlab`")
         return None
 
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
-    story = []
-    styles = getSampleStyleSheet()
-    H = styles["Heading1"]
-    H.fontSize = 18
-    H.leading = 22
-    H.spaceAfter = 6
-    P = styles["BodyText"]
-    P.fontSize = 9
-    P.leading = 12
+    doc = SimpleDocTemplate(
+        buf, pagesize=landscape(A4),
+        leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18
+    )
 
-    # Header: Distance (bold & large)
-    story.append(Paragraph(f"Race Distance: <b>{int(race_distance_input)}m</b>", H))
-    if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values())):
-        story.append(Paragraph(f"<font color='#b36b00'>⚠ {integrity_line()}</font>", P))
+    styles = getSampleStyleSheet()
+    H  = styles["Heading1"]; H.fontSize = 18; H.leading = 22; H.spaceAfter = 6
+    H3 = styles["Heading3"]
+    P  = styles["BodyText"]; P.fontSize = 9; P.leading = 12
+
+    story = []
+
+    # Header — distance only (per your requirement)
+    story.append(Paragraph(f"Race Distance: <b>{int(distance_m)}m</b>", H))
+    if integrity_text:
+        story.append(Paragraph(f"<font color='#b36b00'>⚠ {integrity_text}</font>", P))
     story.append(Spacer(0, 6))
 
     # 1) Sectional Metrics table
-    story.append(Paragraph("Sectional Metrics (PI v3.1 & GCI)", styles["Heading3"]))
-    table_df = display_df.copy()
-    # format numbers
+    story.append(Paragraph("Sectional Metrics (PI v3.1 & GCI)", H3))
+    table_df = metrics_table_df.copy()
     for col in ["RaceTime_s","F200_idx","tsSPI","Accel","Grind","PI","GCI"]:
         if col in table_df.columns:
-            table_df[col] = pd.to_numeric(table_df[col], errors="coerce").map(lambda x: "" if pd.isna(x) else f"{x:.3f}")
+            table_df[col] = pd.to_numeric(table_df[col], errors="coerce").map(
+                lambda x: "" if pd.isna(x) else f"{x:.3f}"
+            )
     data = [list(table_df.columns)] + table_df.fillna("").astype(str).values.tolist()
     t = Table(data, repeatRows=1)
     t.setStyle(TableStyle([
@@ -949,34 +966,31 @@ def make_pdf_report():
         ('FONTSIZE', (0,1), (-1,-1), 8),
         ('ALIGN', (2,1), (-1,-1), 'RIGHT'),
         ('GRID', (0,0), (-1,-1), 0.25, colors.whitesmoke),
-        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.whitesmoke, colors.white])
+        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.whitesmoke, colors.white]),
     ]))
     story.append(t)
     story.append(Spacer(0, 10))
 
-    # 2) Shape Map image
-    if 'shape_map_png' in locals():
-        story.append(Paragraph("Sectional Shape Map — Accel vs Grind (colour = tsSPIΔ)", styles["Heading3"]))
-        story.append(Image(io.BytesIO(shape_map_png), width=24*cm, height=18*cm, kind="proportional"))
+    # 2) Images — add if bytes are present; keep aspect by setting width only
+    if shape_png:
+        story.append(Paragraph("Sectional Shape Map — Accel vs Grind (colour = tsSPIΔ)", H3))
+        story.append(Image(io.BytesIO(shape_png), width=24*cm, kind="proportional"))
         story.append(Spacer(0, 8))
 
-    # 3) Pace Curve image
-    if 'pace_png' in locals():
-        story.append(Paragraph("Pace Curve — field average + Top-8", styles["Heading3"]))
-        story.append(Image(io.BytesIO(pace_png), width=24*cm, height=15*cm, kind="proportional"))
+    if pace_png:
+        story.append(Paragraph("Pace Curve — field average + Top-8", H3))
+        story.append(Image(io.BytesIO(pace_png), width=24*cm, kind="proportional"))
         story.append(Spacer(0, 8))
 
-    # 4) Top-8 PI stacks
-    if 'bars_png' in locals():
-        story.append(Paragraph("Top-8 PI — stacked contributions", styles["Heading3"]))
-        story.append(Image(io.BytesIO(bars_png), width=24*cm, height=12*cm, kind="proportional"))
+    if bars_png:
+        story.append(Paragraph("Top-8 PI — stacked contributions", H3))
+        story.append(Image(io.BytesIO(bars_png), width=24*cm, kind="proportional"))
         story.append(Spacer(0, 8))
 
-    # 5) Hidden Horses v2 table (only flagged)
-    flagged = hh_view[hh_view["Tier"] != ""].copy()
+    # 3) Hidden Horses (flagged only)
+    flagged = hh_view_df[hh_view_df["Tier"] != ""].copy()
     if not flagged.empty:
-        story.append(Paragraph("Hidden Horses v2 (flagged)", styles["Heading3"]))
-        # Limit row count to keep page tidy; split if long
+        story.append(Paragraph("Hidden Horses v2 (flagged)", H3))
         fh = flagged.copy()
         for col in ["PI","GCI","tsSPI","Accel","Grind","SOS","ASI2","TFS","UEI","HiddenScore"]:
             if col in fh.columns:
@@ -990,25 +1004,38 @@ def make_pdf_report():
             ('FONTSIZE', (0,1), (-1,-1), 8),
             ('ALIGN', (2,1), (-1,-1), 'RIGHT'),
             ('GRID', (0,0), (-1,-1), 0.25, colors.whitesmoke),
-            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.whitesmoke, colors.white])
+            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.whitesmoke, colors.white]),
         ]))
         story.append(t2)
         story.append(Spacer(0, 10))
 
-    # 6) Footnotes / conventions
-    story.append(Paragraph("<b>Conventions</b>", styles["Heading3"]))
+    # Footnotes / conventions
+    story.append(Paragraph("<b>Conventions</b>", H3))
     story.append(Paragraph(
         "X_Time = time from (X+100)→X. Finish_Time = 100→0. "
         "Stages: F200=(D-100)+(D-200); tsSPI=(D-300)…600; Accel=500+400+300+200; Grind=100+Finish. "
         "Indices are vs-field (100=par) with small-field stabilizers. "
-        "PI v3.1 uses distance+context weights; GCI aligns to the same worldview.", P
+        "PI v3.1 uses distance+context weights; GCI aligns to the same worldview.",
+        P
     ))
 
     doc.build(story)
     buf.seek(0)
     return buf
 
-pdf_buf = make_pdf_report()
+# Build a single integrity line for the PDF header
+integrity_text = integrity_line() if (SHOW_WARNINGS and (missing_cols or any(v > 0 for v in invalid_counts.values()))) else ""
+
+pdf_buf = make_pdf_report(
+    distance_m=int(race_distance_input),
+    metrics_table_df=display_df,
+    hh_view_df=hh_view,
+    integrity_text=integrity_text,
+    shape_png=shape_map_png,
+    pace_png=pace_png,
+    bars_png=bars_png,
+)
+
 if pdf_buf is not None:
     st.download_button(
         "📥 Download PDF report",
