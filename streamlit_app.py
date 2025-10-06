@@ -470,57 +470,98 @@ def label_points_neatly(ax, x, y, names):
         _repel_labels_builtin(ax, x, y, names)
 
 # ======================= Visual 1: Shape Map ===============================
-st.markdown("## Sectional Shape Map — Accel (600→200) vs Grind (200→Finish)")
-needed_cols = {"Horse", "Accel", "Grind", "tsSPI", "PI"}
-shape_map_png = None
-if not needed_cols.issubset(metrics.columns):
-    st.warning("Shape Map: required columns missing: " + ", ".join(sorted(needed_cols - set(metrics.columns))))
-else:
-    dfm = metrics.loc[:, ["Horse", "Accel", "Grind", "tsSPI", "PI"]].copy()
-    for c in ["Accel", "Grind", "tsSPI", "PI"]:
-        dfm[c] = pd.to_numeric(dfm[c], errors="coerce")
-    dfm = dfm.dropna(subset=["Accel", "Grind", "tsSPI"])
+def _repel_labels_builtin(ax, x, y, labels, *,
+                          init_shift=0.18, k_attract=0.006, k_repel=0.012,
+                          max_iter=250):
+    trans=ax.transData; renderer=ax.figure.canvas.get_renderer()
+    xy=np.column_stack([x,y]).astype(float); offs=np.zeros_like(xy)
+    for i,(xi,yi) in enumerate(xy):
+        offs[i]=[init_shift if xi>=0 else -init_shift, init_shift if yi>=0 else -init_shift]
+    texts,lines=[],[]
+    for (xi,yi),(dx,dy),lab in zip(xy,offs,labels):
+        t=ax.text(xi+dx, yi+dy, lab, fontsize=8.6, va="center", ha="left",
+                  bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.70))
+        texts.append(t)
+        ln=Line2D([xi,xi+dx],[yi,yi+dy], lw=0.75, color="black", alpha=0.9)
+        ax.add_line(ln); lines.append(ln)
+    inv=ax.transData.inverted()
+    for _ in range(max_iter):
+        moved=False
+        bbs=[t.get_window_extent(renderer=renderer).expanded(1.02,1.15) for t in texts]
+        for i in range(len(texts)):
+            for j in range(i+1,len(texts)):
+                if not bbs[i].overlaps(bbs[j]): continue
+                ci=((bbs[i].x0+bbs[i].x1)/2,(bbs[i].y0+bbs[i].y1)/2)
+                cj=((bbs[j].x0+bbs[j].x1)/2,(bbs[j].y0+bbs[j].y1)/2)
+                vx,vy=ci[0]-cj[0],ci[1]-cj[1]
+                if vx==0 and vy==0: vx=1.0
+                n=(vx**2+vy**2)**0.5; dx,dy=(vx/n)*k_repel*72,(vy/n)*k_repel*72
+                for t,s in ((texts[i],+1),(texts[j],-1)):
+                    tx,ty=t.get_position()
+                    px=trans.transform((tx,ty))+s*np.array([dx,dy])
+                    t.set_position(inv.transform(px)); moved=True
+        for t,(xi,yi) in zip(texts,xy):
+            tx,ty=t.get_position(); pt=trans.transform((tx,ty)); pp=trans.transform((xi,yi))
+            d=((pt[0]-pp[0])**2+(pt[1]-pp[1])**2)**0.5; tgt=25.0
+            if abs(d-tgt)>1.0:
+                v=(pt-pp)/(d+1e-9); pt2=pt+v*(0.6*(tgt-d)); t.set_position(inv.transform(pt2)); moved=True
+        if not moved: break
+    for t,ln,(xi,yi) in zip(texts,lines,xy):
+        tx,ty=t.get_position(); ln.set_data([xi,tx],[yi,ty])
 
+def label_points_neatly(ax, x, y, names):
+    try:
+        from adjustText import adjust_text
+        texts=[ax.text(xi,yi,nm,fontsize=8.6,
+                       bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.70))
+               for xi,yi,nm in zip(x,y,names)]
+        adjust_text(texts, x=x, y=y, ax=ax,
+                    only_move={'points':'y','text':'xy'},
+                    force_points=0.6, force_text=0.7,
+                    expand_text=(1.05,1.15), expand_points=(1.05,1.15),
+                    arrowprops=dict(arrowstyle="->", lw=0.75, color="black", alpha=0.9,
+                                    shrinkA=0, shrinkB=3))
+    except Exception:
+        _repel_labels_builtin(ax, x, y, names)
+
+st.markdown("## Sectional Shape Map — Accel (400+200) vs Grind (Finish)")
+shape_map_png = None
+need_cols={"Horse","Accel","Grind","tsSPI","PI"}
+if not need_cols.issubset(metrics.columns):
+    st.warning("Shape Map: required columns missing: " + ", ".join(sorted(need_cols - set(metrics.columns))))
+else:
+    dfm = metrics.loc[:, ["Horse","Accel","Grind","tsSPI","PI"]].copy()
+    for c in ["Accel","Grind","tsSPI","PI"]:
+        dfm[c] = pd.to_numeric(dfm[c], errors="coerce")
+    dfm = dfm.dropna(subset=["Accel","Grind","tsSPI"])
     if dfm.empty:
         st.info("Not enough data to draw the shape map.")
     else:
-        dfm["AccelΔ"] = dfm["Accel"] - 100.0
-        dfm["GrindΔ"] = dfm["Grind"] - 100.0
-        dfm["tsSPIΔ"] = dfm["tsSPI"] - 100.0
+        dfm["AccelΔ"]=dfm["Accel"]-100.0; dfm["GrindΔ"]=dfm["Grind"]-100.0; dfm["tsSPIΔ"]=dfm["tsSPI"]-100.0
+        names=dfm["Horse"].astype(str).to_list()
+        xv=dfm["AccelΔ"].to_numpy(); yv=dfm["GrindΔ"].to_numpy(); cv=dfm["tsSPIΔ"].to_numpy(); piv=dfm["PI"].fillna(0).to_numpy()
 
-        names = dfm["Horse"].astype(str).to_list()
-        xv = dfm["AccelΔ"].to_numpy()
-        yv = dfm["GrindΔ"].to_numpy()
-        cv = dfm["tsSPIΔ"].to_numpy()
-        piv = dfm["PI"].fillna(0).to_numpy()
-
-        try:
-            span = float(np.nanmax([np.nanmax(np.abs(xv)), np.nanmax(np.abs(yv))]))
-        except Exception:
-            span = 1.0
+        span = np.nanmax([np.nanmax(np.abs(xv)), np.nanmax(np.abs(yv))]) if np.isfinite(xv).any() and np.isfinite(yv).any() else 1.0
         if not np.isfinite(span) or span <= 0: span = 1.0
-        lim = max(4.5, float(np.ceil(span / 1.5) * 1.5))
+        lim = max(4.5, float(np.ceil(span/1.5)*1.5))
 
         DOT_MIN, DOT_MAX = 40.0, 140.0
         pmin, pmax = float(np.nanmin(piv)), float(np.nanmax(piv))
-        if not np.isfinite(pmin) or not np.isfinite(pmax) or abs(pmax - pmin) < 1e-9:
-            sizes = np.full_like(xv, DOT_MIN)
-        else:
-            sizes = DOT_MIN + (piv - pmin) / (pmax - pmin) * (DOT_MAX - DOT_MIN)
+        sizes = np.full_like(xv, DOT_MIN) if (not np.isfinite(pmin) or not np.isfinite(pmax) or abs(pmax-pmin)<1e-9) \
+                else DOT_MIN + (piv - pmin) / (pmax - pmin) * (DOT_MAX - DOT_MIN)
 
-        fig, ax = plt.subplots(figsize=(7.6, 6.4), layout="constrained")
+        fig, ax = plt.subplots(figsize=(7.6, 6.4))
         TINT = 0.06
-        ax.add_patch(Rectangle((0, 0),  lim,  lim, facecolor="#4daf4a", alpha=TINT, edgecolor="none"))
+        ax.add_patch(Rectangle((0,0),  lim,  lim, facecolor="#4daf4a", alpha=TINT, edgecolor="none"))
         ax.add_patch(Rectangle((-lim,0), lim,  lim, facecolor="#377eb8", alpha=TINT, edgecolor="none"))
         ax.add_patch(Rectangle((0,-lim), lim, lim, facecolor="#ff7f00", alpha=TINT, edgecolor="none"))
         ax.add_patch(Rectangle((-lim,-lim),lim, lim, facecolor="#984ea3", alpha=TINT, edgecolor="none"))
-        ax.axvline(0, color="gray", lw=1.3, ls=(0, (3, 3)))
-        ax.axhline(0, color="gray", lw=1.3, ls=(0, (3, 3)))
+        ax.axvline(0, color="gray", lw=1.3, ls=(0,(3,3)))
+        ax.axhline(0, color="gray", lw=1.3, ls=(0,(3,3)))
 
         vmin = float(np.nanmin(cv)) if np.isfinite(cv).any() else -1.0
         vmax = float(np.nanmax(cv)) if np.isfinite(cv).any() else  1.0
-        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
-            vmin, vmax = -1.0, 1.0
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin==vmax: vmin, vmax = -1.0, 1.0
         norm = TwoSlopeNorm(vcenter=0.0, vmin=vmin, vmax=vmax)
 
         sc = ax.scatter(xv, yv, s=sizes, c=cv, cmap="coolwarm", norm=norm,
@@ -531,31 +572,21 @@ else:
         ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
         ax.set_xlabel("Acceleration vs field (points)  →")
         ax.set_ylabel("Grind vs field (points)  ↑")
-        ax.set_title("Quadrants: +X = late acceleration; +Y = strong last 200. Colour = tsSPI deviation")
-        ax.grid(True, linestyle=":", alpha=0.25)
+        ax.set_title("Quadrants: +X = Accel (400+200); +Y = Grind (Finish). Colour = tsSPI deviation")
 
         s_ex = [DOT_MIN, 0.5*(DOT_MIN+DOT_MAX), DOT_MAX]
         h_ex = [Line2D([0],[0], marker='o', color='w', markerfacecolor='gray',
                        markersize=np.sqrt(s/np.pi), markeredgecolor='black') for s in s_ex]
-        ax.legend(h_ex, ["PI: low", "PI: mid", "PI: high"],
-                  loc="upper left", frameon=False, fontsize=8)
-
-        cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label("tsSPI − 100")
-
+        ax.legend(h_ex, ["PI: low","PI: mid","PI: high"], loc="upper left", frameon=False, fontsize=8)
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04); cbar.set_label("tsSPI − 100")
+        ax.grid(True, linestyle=":", alpha=0.25)
         st.pyplot(fig)
 
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=300, bbox_inches="tight", facecolor="white")
+        buf = io.BytesIO(); fig.savefig(buf, format="png", dpi=300, bbox_inches="tight")
         shape_map_png = buf.getvalue()
-        st.download_button("Download shape map (PNG)", shape_map_png,
-                           file_name="shape_map.png", mime="image/png")
+        st.download_button("Download shape map (PNG)", shape_map_png, file_name="shape_map.png", mime="image/png")
+        st.caption("Size = PI. X: Accel (400+200). Y: Finish (200→0). Colour = tsSPIΔ.")
 
-        st.caption(
-            "Each bubble is a runner. Size = PI (bigger = stronger overall). "
-            "X: late acceleration (600→200) vs field; Y: last-200 grind vs field. "
-            "Colour shows cruise strength (tsSPI vs field): red = faster mid-race, blue = slower."
-        )
 
 # ======================= Visual 2: Pace Curve ==============================
 st.markdown("## Pace Curve — field average (black) + Top 8 finishers")
